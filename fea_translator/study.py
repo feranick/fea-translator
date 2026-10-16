@@ -1,0 +1,336 @@
+"""study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
+Version: 2026.10.16.1
+
+A study file is {name: study}; a study is one FEA run on one solid part:
+
+    {"part": {"step": "bracket.step"} or {"goal": <build123d-translator goal>},
+     "material": "steel" or {"E": ..., "nu": ..., ...},
+     "analysis": "static" | "modal" | "buckling" | "thermal",
+     "modes": 6,                                   (modal, buckling)
+     "mesh": {"size": 3, "order": 2, "refine": [{"at": [x, y, z], "r": 5, "size": 0.5}]},
+     "bcs": [{"kind": "fixed", "faces": {"nx": -1}}, {"kind": "force", "faces": {...}, "fz": -500}, ...],
+     "probes": [{"name": "tip", "faces": {...}}],
+     "expect": [{"quantity": "max_displacement", "value": 0.19, "tol": 0.03}]}
+
+Units the caller writes: mm, N, MPa, kg/m3, W/(m K), W/(m2 K), W/m2, W, degrees C, m/s2.
+The deck uses mm, N, s, t (tonne), mW: conversions are in `to_deck_units`.
+"""
+from __future__ import annotations
+
+ANALYSES = ("static", "modal", "buckling", "thermal")
+
+# typical room-temperature values; give your own for design work
+MATERIALS = {
+    "steel": {"E": 210000, "nu": 0.30, "density": 7850, "k": 50, "alpha": 1.2e-5, "yield": 250},
+    "stainless_304": {"E": 193000, "nu": 0.29, "density": 8000, "k": 16.2, "alpha": 1.73e-5, "yield": 215},
+    "aluminium_6061_t6": {"E": 68900, "nu": 0.33, "density": 2700, "k": 167, "alpha": 2.36e-5, "yield": 276},
+    "titanium_ti6al4v": {"E": 113800, "nu": 0.342, "density": 4430, "k": 6.7, "alpha": 8.6e-6, "yield": 880},
+    "copper": {"E": 117000, "nu": 0.34, "density": 8940, "k": 390, "alpha": 1.7e-5, "yield": 70},
+    "brass": {"E": 100000, "nu": 0.34, "density": 8500, "k": 110, "alpha": 1.9e-5, "yield": 200},
+    "cast_iron": {"E": 110000, "nu": 0.26, "density": 7200, "k": 52, "alpha": 1.1e-5, "yield": 200},
+    "abs": {"E": 2300, "nu": 0.35, "density": 1050, "k": 0.17, "alpha": 9.0e-5, "yield": 40},
+    "pla": {"E": 3500, "nu": 0.36, "density": 1240, "k": 0.13, "alpha": 6.8e-5, "yield": 50},
+    "nylon_pa6": {"E": 2800, "nu": 0.39, "density": 1140, "k": 0.25, "alpha": 8.5e-5, "yield": 70},
+}
+MATERIAL_KEYS = {"E": "Young's modulus, MPa", "nu": "Poisson's ratio", "density": "kg/m3 (modal, gravity)",
+                 "k": "thermal conductivity, W/(m K) (thermal)", "alpha": "thermal expansion, 1/K",
+                 "yield": "yield strength, MPa (safety factor)"}
+
+# ---- face selectors ----------------------------------------------------------------------
+SELECTOR_DOC = {
+    "nx, ny, nz": "a planar face with this outward normal (any direction; the others default to 0): the largest, "
+                  "then the farthest along the normal; with at = [x, y, z] the one nearest to that point",
+    "pts": "[[x, y, z], ...]: the face nearest to each point (a point on the face, away from its edges)",
+    "cyl_r": "every cylindrical face of this radius (bolt holes, shafts); with at, only the nearest",
+    "all": "true: every boundary face (convection everywhere)",
+}
+
+# ---- boundary conditions -----------------------------------------------------------------
+# kind: (analyses, required, optional, description)
+BC_KINDS = {
+    "fixed": (("static", "modal", "buckling"), {"faces": ""}, {}, "All displacements zero on the faces (clamped)."),
+    "slider": (("static", "modal", "buckling"), {"faces": "planar faces normal to X, Y or Z"}, {},
+               "Displacement normal to the face zero, free in its plane (symmetry planes, rollers)."),
+    "displacement": (("static", "modal", "buckling"), {"faces": ""},
+                     {"ux": "mm", "uy": "mm", "uz": "mm (each given component is prescribed; others free)"},
+                     "Prescribed displacement components."),
+    "force": (("static", "buckling"), {"faces": ""}, {"fx": "N", "fy": "N", "fz": "N (total force, spread uniformly over the faces' area)"},
+              "Total force on the faces (bearing loads, bolt loads, tip loads)."),
+    "pressure": (("static", "buckling"), {"faces": "", "p": "MPa; positive pushes into the faces"}, {},
+                 "Uniform pressure normal to the faces."),
+    "gravity": (("static", "buckling"), {}, {"gx": "", "gy": "", "gz": "m/s2 (default 0, 0, -9.81)"},
+                "Body weight (needs density)."),
+    "temperature": (("thermal",), {"faces": "", "T": "degrees C"}, {}, "Fixed temperature on the faces."),
+    "heat_flux": (("thermal",), {"faces": "", "q": "W/m2 into the part (negative: out)"}, {}, "Uniform heat flux."),
+    "heat": (("thermal",), {"faces": "", "power": "W into the part, spread uniformly over the faces' area"}, {},
+             "Total heat input on the faces (a heater, a chip)."),
+    "convection": (("thermal",), {"faces": "", "h": "film coefficient, W/(m2 K)", "T_inf": "ambient, degrees C"}, {},
+                   "Convection to an ambient temperature."),
+}
+
+CONVENTIONS = [
+    "Units: mm, N, MPa; density kg/m3; conductivity W/(m K); film coefficient W/(m2 K); heat flux W/m2; "
+    "heat W; temperature degrees C; gravity m/s2. Coordinates are the part's (build123d-translator: Z up, base on z = 0).",
+    "One study is one analysis of one solid part. The part is a STEP file (mm) or a build123d-translator goal.",
+    "Faces are chosen like build123d-translator faces: by outward normal (nx, ny, nz; the largest such planar face, "
+    "or the one nearest to at), by points on them (pts), by cylinder radius (cyl_r), or all. 'faces' may also be a "
+    "list of selectors (their union).",
+    "static and buckling need supports that stop every rigid-body motion (fixed, or sliders on three faces normal "
+    "to X, Y and Z, ...). modal needs supports too (a free part has zero-frequency modes). thermal needs at least "
+    "one temperature or convection.",
+    "force is a total force spread uniformly over the faces' area; pressure acts normal to the faces (positive "
+    "into the part); gravity uses the material density.",
+    "buckling: the loads are a reference; the results are load factors (critical load = factor x reference load).",
+    "Results: static: maximum displacement and von Mises stress (at integration points and at nodes), reaction "
+    "force of each support, mean displacement of each load face and probe, safety factor (with yield), "
+    "equilibrium check. modal: frequencies in Hz. buckling: load factors. thermal: temperature range, heat "
+    "flow through each temperature boundary, heat balance.",
+    "mesh.size is the element size in mm (default: 1/20 of the part's bounding-box diagonal); order 2 "
+    "(10-node tetrahedra, default) is accurate for bending and curved faces; refine adds finer spheres "
+    "{at, r, size} at stress concentrations. Rerun with a smaller size to check convergence (converge: true does it).",
+    "expect: [{quantity, value, tol}] turns the run into a check: quantity is a dotted path into the results "
+    "(max_displacement, max_von_mises, frequencies.0, buckling_factors.0, reactions.<bc name>.fz, "
+    "probes.<name>.mean_u.uz, T_max, heat_flow.<bc name>); tol is relative (default 0.02).",
+]
+
+EXAMPLE = {"bracket_static": {
+    "part": {"goal": {"features": [
+        {"kind": "base_box", "params": {"w": 100, "d": 20, "h": 10}},
+        {"kind": "hole", "params": {"r": 4, "x": 35, "y": 0}}]}},
+    "material": "aluminium_6061_t6",
+    "analysis": "static",
+    "mesh": {"size": 3},
+    "bcs": [{"kind": "fixed", "name": "wall", "faces": {"nx": -1}},
+            {"kind": "force", "name": "load", "faces": {"cyl_r": 4}, "fz": -200}],
+    "probes": [{"name": "tip", "faces": {"nx": 1}}]}}
+
+
+def study_format() -> dict:
+    bcs = {k: {"analyses": list(a), "required": list(r), "optional": list(o) + ["name"], "what": w,
+               "descriptions": {p: d for p, d in {**r, **o}.items() if d}}
+           for k, (a, r, o, w) in BC_KINDS.items()}
+    return {"format": "FEA study (fea-translator)", "analyses": list(ANALYSES), "conventions": CONVENTIONS,
+            "study_keys": {"part": "{'step': path} or {'goal': build123d-translator goal}",
+                           "material": f"one of {sorted(MATERIALS)} or {{{', '.join(MATERIAL_KEYS)}}} "
+                                       "(a name plus overrides: {'name': 'steel', 'yield': 355})",
+                           "analysis": "|".join(ANALYSES), "modes": "number of modes or buckling factors (6; 3)",
+                           "mesh": "{size, order (1|2), refine: [{at, r, size}]}", "bcs": "list of boundary conditions",
+                           "probes": "[{name, faces}]: mean and largest displacement (or temperature) there",
+                           "expect": "[{quantity, value, tol}]", "converge": "true: rerun at 0.6 x size and report the change"},
+            "material_keys": MATERIAL_KEYS, "materials": MATERIALS, "bc_kinds": bcs, "selectors": SELECTOR_DOC,
+            "example": EXAMPLE}
+
+
+# ---- units -------------------------------------------------------------------------------
+
+def material_of(study: dict) -> dict:
+    m = study.get("material", "steel")
+    if isinstance(m, str):
+        return dict(MATERIALS[m])
+    base = dict(MATERIALS.get(m.get("name"), {})) if isinstance(m.get("name"), str) else {}
+    base.update({k: v for k, v in m.items() if k != "name"})
+    return base
+
+
+def to_deck_units(mat: dict) -> dict:
+    """Material in the deck's units (mm, N, s, t, mW)."""
+    out = {"E": float(mat["E"]), "nu": float(mat["nu"])}
+    if "density" in mat:
+        out["density"] = float(mat["density"]) * 1e-12  # kg/m3 -> t/mm3
+    if "k" in mat:
+        out["k"] = float(mat["k"])  # W/(m K) = mW/(mm K)
+    if "alpha" in mat:
+        out["alpha"] = float(mat["alpha"])
+    return out
+
+
+H_SCALE = 1e-3     # W/(m2 K) -> mW/(mm2 K)
+Q_SCALE = 1e-3     # W/m2 -> mW/mm2
+P_SCALE = 1e3      # W -> mW
+G_SCALE = 1e3      # m/s2 -> mm/s2
+
+
+# ---- validation --------------------------------------------------------------------------
+
+def _num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _point(p) -> bool:
+    return isinstance(p, (list, tuple)) and len(p) == 3 and all(_num(c) for c in p)
+
+
+def _selector(sel) -> str | None:
+    if isinstance(sel, list):
+        if not sel:
+            return "an empty list of selectors"
+        for s in sel:
+            bad = _selector(s)
+            if bad:
+                return bad
+        return None
+    if not isinstance(sel, dict) or not sel:
+        return "a selector must be an object: {nx, ny, nz[, at]}, {pts}, {cyl_r[, at]} or {all: true}"
+    keys = set(sel)
+    if keys & {"nx", "ny", "nz"}:
+        v = [sel.get(k, 0) for k in ("nx", "ny", "nz")]
+        if not all(_num(c) for c in v) or sum(c * c for c in v) < 1e-12:
+            return "nx, ny, nz must be numbers, not all 0"
+    elif "pts" in keys:
+        if not isinstance(sel["pts"], list) or not sel["pts"] or not all(_point(q) for q in sel["pts"]):
+            return "'pts' must be a non-empty list of [x, y, z]"
+    elif "cyl_r" in keys:
+        if not _num(sel["cyl_r"]) or sel["cyl_r"] <= 0:
+            return "'cyl_r' must be a positive number"
+    elif sel.get("all") is not True:
+        return "unknown selector: use {nx, ny, nz[, at]}, {pts}, {cyl_r[, at]} or {all: true}"
+    if "at" in sel and not _point(sel["at"]):
+        return "'at' must be [x, y, z]"
+    extra = keys - {"nx", "ny", "nz", "at", "pts", "cyl_r", "all"}
+    if extra:
+        return f"unknown selector keys {sorted(extra)}"
+    return None
+
+
+def bc_name(i: int, bc: dict) -> str:
+    return str(bc.get("name") or f"{bc.get('kind', 'bc')}{i + 1}")
+
+
+def validate_study(st: dict) -> dict:
+    errors, warnings = [], []
+    if not isinstance(st, dict):
+        return {"ok": False, "errors": ["a study must be an object"], "warnings": []}
+    part = st.get("part")
+    if isinstance(part, dict) and "box" in part:
+        if not (isinstance(part["box"], list) and len(part["box"]) == 3 and all(_num(v) and v > 0 for v in part["box"])):
+            errors.append("part: 'box' must be [lx, ly, lz] (positive)")
+    elif not isinstance(part, dict) or not (isinstance(part.get("step"), str) or isinstance(part.get("goal"), dict)):
+        errors.append("part: needs {'step': path} or {'goal': build123d-translator goal}")
+    elif "goal" in part:
+        try:
+            from build123d_translator.goalformat import validate_goal
+            v = validate_goal(part["goal"])
+            errors += [f"part goal: {e}" for e in v["errors"]]
+        except ImportError:
+            warnings.append("part goal: build123d-translator is not installed here; the goal cannot be built")
+    an = st.get("analysis")
+    if an not in ANALYSES:
+        errors.append(f"analysis: one of {', '.join(ANALYSES)}")
+    m = st.get("material", "steel")
+    if isinstance(m, str):
+        if m not in MATERIALS:
+            errors.append(f"material: unknown '{m}'; known: {', '.join(sorted(MATERIALS))}, or give the values")
+        mat = MATERIALS.get(m, {})
+    elif isinstance(m, dict):
+        if "name" in m and m["name"] not in MATERIALS:
+            errors.append(f"material: unknown name '{m['name']}'")
+        mat = material_of(st) if ("name" not in m or m["name"] in MATERIALS) else m
+        for k, v in m.items():
+            if k != "name" and (k not in MATERIAL_KEYS or not _num(v)):
+                errors.append(f"material: '{k}' {'is not a material key' if k not in MATERIAL_KEYS else 'must be a number'}")
+    else:
+        errors.append("material: a name or an object")
+        mat = {}
+    for k in ("E", "nu"):
+        if k not in mat:
+            errors.append(f"material: needs '{k}'")
+    if _num(mat.get("nu")) and not (-1 < mat["nu"] < 0.5):
+        errors.append("material: 'nu' must be between -1 and 0.5")
+    for k in ("E", "density", "k", "yield"):
+        if _num(mat.get(k)) and mat[k] <= 0:
+            errors.append(f"material: '{k}' must be positive")
+    bcs = st.get("bcs", [])
+    if not isinstance(bcs, list):
+        errors.append("bcs: a list")
+        bcs = []
+    names = set()
+    supports = loads = 0
+    for i, bc in enumerate(bcs):
+        if not isinstance(bc, dict) or bc.get("kind") not in BC_KINDS:
+            errors.append(f"bc {i + 1}: 'kind' one of {', '.join(BC_KINDS)}")
+            continue
+        k = bc["kind"]
+        where = f"bc {i + 1} ({k})"
+        analyses, req, opt, _ = BC_KINDS[k]
+        if an in ANALYSES and an not in analyses:
+            errors.append(f"{where}: not used in a {an} analysis (only {', '.join(analyses)})")
+        for r in req:
+            if r not in bc:
+                errors.append(f"{where}: missing '{r}'")
+            elif r != "faces" and not _num(bc[r]):
+                errors.append(f"{where}: '{r}' must be a number")
+        for o in opt:
+            if o in bc and not _num(bc[o]):
+                errors.append(f"{where}: '{o}' must be a number")
+        extra = set(bc) - set(req) - set(opt) - {"kind", "name"}
+        if extra:
+            errors.append(f"{where}: unknown keys {sorted(extra)}")
+        if "faces" in bc:
+            bad = _selector(bc["faces"])
+            if bad:
+                errors.append(f"{where}: faces: {bad}")
+        n = bc_name(i, bc)
+        if n in names:
+            errors.append(f"{where}: duplicate name '{n}'")
+        names.add(n)
+        if k == "displacement" and not ({"ux", "uy", "uz"} & set(bc)):
+            errors.append(f"{where}: give at least one of ux, uy, uz")
+        if k == "force" and not any(_num(bc.get(c)) and bc[c] != 0 for c in ("fx", "fy", "fz")):
+            errors.append(f"{where}: give a non-zero fx, fy or fz")
+        if k == "convection" and _num(bc.get("h")) and bc["h"] <= 0:
+            errors.append(f"{where}: 'h' must be positive")
+        if k == "gravity" and not _num(mat.get("density")):
+            errors.append(f"{where}: needs the material density")
+        supports += k in (("temperature", "convection") if an == "thermal" else ("fixed", "slider", "displacement"))
+        loads += k in ("force", "pressure", "gravity", "heat_flux", "heat") or (k == "displacement" and any(
+            _num(bc.get(c)) and bc[c] != 0 for c in ("ux", "uy", "uz")))
+    if an in ("static", "buckling", "modal") and not supports:
+        errors.append(f"{an}: needs supports (fixed, slider or displacement); a free part moves as a rigid body")
+    if an in ("static", "buckling") and not loads:
+        errors.append(f"{an}: needs a load (force, pressure, gravity or a non-zero displacement)")
+    if an == "thermal" and not any(isinstance(b, dict) and b.get("kind") in ("temperature", "convection") for b in bcs):
+        errors.append("thermal: needs a temperature or convection boundary (otherwise the temperature is undetermined)")
+    if an == "modal" and not _num(mat.get("density")):
+        errors.append("modal: needs the material density")
+    if an == "thermal" and not _num(mat.get("k")):
+        errors.append("thermal: needs the material conductivity k")
+    if an in ("static", "buckling", "modal"):
+        sl = [b for b in bcs if isinstance(b, dict) and b.get("kind") == "slider"]
+        if sl and not any(isinstance(b, dict) and b.get("kind") in ("fixed", "displacement") for b in bcs) and len(sl) < 3:
+            warnings.append("sliders alone need three faces normal to X, Y and Z (and may still allow rotation)")
+    if "modes" in st and (not _num(st["modes"]) or int(st["modes"]) != st["modes"] or not 1 <= st["modes"] <= 100):
+        errors.append("modes: a whole number from 1 to 100")
+    mesh = st.get("mesh", {})
+    if not isinstance(mesh, dict):
+        errors.append("mesh: an object {size, order, refine}")
+    else:
+        if "size" in mesh and (not _num(mesh["size"]) or mesh["size"] <= 0):
+            errors.append("mesh: 'size' must be positive (mm)")
+        if mesh.get("order", 2) not in (1, 2):
+            errors.append("mesh: 'order' is 1 or 2")
+        if mesh.get("order", 2) == 1 and an in ("static", "modal", "buckling"):
+            warnings.append("mesh: 4-node tetrahedra are much too stiff in bending; use order 2")
+        for j, rf in enumerate(mesh.get("refine", []) if isinstance(mesh.get("refine", []), list) else [None]):
+            if not isinstance(rf, dict) or not _point(rf.get("at")) or not _num(rf.get("r")) or not _num(rf.get("size")) \
+                    or rf["r"] <= 0 or rf["size"] <= 0:
+                errors.append(f"mesh: refine {j + 1} must be {{at: [x, y, z], r: radius > 0, size > 0}}")
+    for j, pr in enumerate(st.get("probes", [])):
+        if not isinstance(pr, dict) or not isinstance(pr.get("name"), str) or "faces" not in pr:
+            errors.append(f"probe {j + 1}: needs 'name' and 'faces'")
+        else:
+            bad = _selector(pr["faces"])
+            if bad:
+                errors.append(f"probe {j + 1}: faces: {bad}")
+    for j, ex in enumerate(st.get("expect", [])):
+        if not isinstance(ex, dict) or not isinstance(ex.get("quantity"), str) or not _num(ex.get("value")):
+            errors.append(f"expect {j + 1}: needs 'quantity' (a results path) and a numeric 'value'")
+        elif "tol" in ex and (not _num(ex["tol"]) or ex["tol"] <= 0):
+            errors.append(f"expect {j + 1}: 'tol' must be positive")
+    extra = set(st) - {"part", "material", "analysis", "modes", "mesh", "bcs", "probes", "expect", "converge", "notes"}
+    if extra:
+        warnings.append(f"unknown study keys ignored: {sorted(extra)}")
+    return {"ok": not errors, "errors": errors, "warnings": warnings}
+
+
+def validate(studies: dict) -> dict:
+    return {name: validate_study(s) for name, s in studies.items()}

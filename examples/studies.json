@@ -1,0 +1,199 @@
+{
+ "bracket_static": {
+  "part": {
+   "goal": {
+    "features": [
+     {
+      "kind": "base_box",
+      "params": {
+       "w": 100,
+       "d": 20,
+       "h": 10
+      }
+     },
+     {
+      "kind": "hole",
+      "params": {
+       "r": 4,
+       "x": 35,
+       "y": 0
+      }
+     }
+    ]
+   }
+  },
+  "material": "aluminium_6061_t6",
+  "analysis": "static",
+  "mesh": {
+   "size": 3
+  },
+  "bcs": [
+   {
+    "kind": "fixed",
+    "name": "wall",
+    "faces": {
+     "nx": -1
+    }
+   },
+   {
+    "kind": "force",
+    "name": "load",
+    "faces": {
+     "cyl_r": 4
+    },
+    "fz": -200
+   }
+  ],
+  "probes": [
+   {
+    "name": "tip",
+    "faces": {
+     "nx": 1
+    }
+   }
+  ]
+ },
+ "bracket_modal": {
+  "part": {
+   "goal": {
+    "features": [
+     {
+      "kind": "base_box",
+      "params": {
+       "w": 100,
+       "d": 20,
+       "h": 10
+      }
+     },
+     {
+      "kind": "hole",
+      "params": {
+       "r": 4,
+       "x": 35,
+       "y": 0
+      }
+     }
+    ]
+   }
+  },
+  "material": "aluminium_6061_t6",
+  "analysis": "modal",
+  "mesh": {
+   "size": 3
+  },
+  "modes": 4,
+  "bcs": [
+   {
+    "kind": "fixed",
+    "name": "wall",
+    "faces": {
+     "nx": -1
+    }
+   }
+  ]
+ },
+ "heatsink_plate": {
+  "part": {
+   "goal": {
+    "features": [
+     {
+      "kind": "base_box",
+      "params": {
+       "w": 60,
+       "d": 40,
+       "h": 4
+      }
+     },
+     {
+      "kind": "boss_box",
+      "params": {
+       "w": 2,
+       "d": 40,
+       "x": -20,
+       "y": 0,
+       "h": 15
+      }
+     },
+     {
+      "kind": "linear_pattern",
+      "params": {
+       "n": 5,
+       "length": 40
+      }
+     }
+    ]
+   }
+  },
+  "material": "aluminium_6061_t6",
+  "analysis": "thermal",
+  "mesh": {
+   "size": 2
+  },
+  "bcs": [
+   {
+    "kind": "heat",
+    "name": "chip",
+    "faces": {
+     "nz": -1
+    },
+    "power": 10
+   },
+   {
+    "kind": "convection",
+    "name": "air",
+    "faces": {
+     "all": true
+    },
+    "h": 25,
+    "T_inf": 25
+   }
+  ],
+  "notes": "'all' also takes the bottom face, where the heat enters; a real study would list the fin faces"
+ },
+ "column_buckling": {
+  "part": {
+   "box": [
+    5.0,
+    5.0,
+    200.0
+   ],
+   "divisions": [
+    2,
+    2,
+    40
+   ],
+   "origin": [
+    -2.5,
+    -2.5,
+    0
+   ]
+  },
+  "material": "steel",
+  "analysis": "buckling",
+  "modes": 2,
+  "bcs": [
+   {
+    "kind": "fixed",
+    "name": "base",
+    "faces": {
+     "nz": -1
+    }
+   },
+   {
+    "kind": "force",
+    "name": "top",
+    "faces": {
+     "nz": 1
+    },
+    "fz": -1
+   }
+  ],
+  "expect": [
+   {
+    "quantity": "critical_factor",
+    "value": 674.6799883557178,
+    "tol": 0.04
+   }
+  ]
+ }
+}
