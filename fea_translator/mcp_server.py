@@ -1,12 +1,12 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.10.16.4
+Version: 2026.10.16.10
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
   validate_studies  static checks of {name: study} (fast; fix errors before running)
   run_studies       meshes, solves and checks {name: study}: results, checks, files (returns within ~45 s;
                     long studies stay pending)
-  study_status      collects the pending studies of a run_studies request
+  study_status      collects the pending studies of a run_studies request (progress, time left, advice)
   get_deck          the CalculiX input deck of one study, as text
   run_benchmarks    the benchmark studies with closed-form answers (is the toolchain right?)
   get_file          a written file as base64 (for callers on another machine)
@@ -34,8 +34,12 @@ build123d-translator goal), the material, the analysis, the supports and loads o
 normal, point or cylinder radius, and optional expected values to check. Gmsh meshes the part,
 CalculiX solves it.
 Workflow: call study_format once and follow its conventions; write one study per analysis;
-validate_studies and fix every error; run_studies (long studies come back as 'pending': poll
-study_status with the request path). Check equilibrium_error, warnings and 'selection' (what each
+validate_studies and fix every error; run_studies (long studies come back as 'pending' with
+'progress' per study and 'time_left': eta_min expected, eta_min_max at most, expected_finish and
+latest_finish as clock times). Polling costs tokens: when a run needs more than about 5 minutes, tell
+the user when it should finish and stop; collect it later with study_status (when the user asks, or
+from a task scheduled after that time). Follow 'next' in the result.
+Check equilibrium_error, warnings and 'selection' (what each
 face selector took), and rerun with converge: true before trusting peak stresses; peaks at supports
 are singular: judge designs on peak_von_mises_off_bc and safety_factor_off_bc.
 Units: mm, N, MPa, kg/m3, W, degrees C."""
@@ -62,15 +66,18 @@ def run_studies(studies: dict, solver: str = "auto", wait_s: float = 45) -> dict
     with and without the support/load regions, safety factors, reactions, frequencies, buckling
     factors, temperatures, heat flows, probes), what each face selector matched, checks against
     'expect', equilibrium, warnings, and files (.inp deck, .frd and .dat results, mesh, STEP).
-    Returns after at most wait_s seconds: studies still running are listed in 'pending'; collect
-    them with study_status(request). Fine meshes and converge: true can take minutes."""
+    Returns after at most wait_s seconds: studies still running are listed in 'pending' with
+    'progress' (step of steps, s per step, eta_min, eta_min_max) and 'time_left' (expected_finish,
+    latest_finish); 'next' says whether to collect them with study_status soon or to tell the user
+    when to come back (runs over about 5 min). Fine meshes and converge: true can take minutes."""
     return api.run(studies, solver, wait=min(max(float(wait_s), 0.0), 50.0))
 
 
 @server.tool()
 def study_status(request: str, wait_s: float = 45) -> dict:
     """The studies of a run_studies request (its 'request' path): finished ones with their results,
-    the others in 'pending'. Waits up to wait_s seconds (at most 50) for them to finish."""
+    the others in 'pending' with progress and time left. Waits up to wait_s seconds (at most 50) for
+    them to finish. Do not poll long runs: follow 'next'."""
     return api.status(request, min(max(float(wait_s), 0.0), 50.0))
 
 

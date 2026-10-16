@@ -1,12 +1,13 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.16.4
+Version: 2026.10.16.10
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
     run(studies, solver, wait)       meshes, solves and checks each study; files in a request folder;
                                      with wait, returns after that many seconds with the rest pending
     start(studies, solver)           the same in the background: returns the request folder
-    status(request, wait)            finished studies with results, the others pending
+    status(request, wait)            finished studies with results, the others pending with their
+                                     progress and time left (expected and at most), and when to look again
     deck(study, name)                the CalculiX input deck of one study, as text (meshes the part)
     bench(names, solver)             the benchmark studies with closed-form answers
     read_file(path)                  a written file as base64 (only under the output folder)
@@ -74,6 +75,8 @@ def validate(studies: dict) -> dict:
 def _run_one(job: dict) -> dict:
     from .runner import run_study
 
+    if job.get("out"):  # the worker may outlive a change of FEAT_OUT: timing records go with the request
+        os.environ["FEAT_OUT"] = job["out"]
     t0 = time.perf_counter()
     r = run_study(job["name"], job["study"], Path(job["folder"]) / job["name"], job["solver"], job.get("timeout", 900))
     r.setdefault("seconds", {})
@@ -134,10 +137,128 @@ def _collect(folder: Path) -> dict:
     res = {"request": str(folder), "translator": __version__, "solver": meta["solver"], "done": not pending,
            "pending": pending, "elapsed_s": round(time.time() - started, 1), "studies": out}
     if pending:
-        res["next"] = f"call study_status(request='{folder}') to collect the rest"
+        studies = json.loads((folder / "studies.json").read_text()) if (folder / "studies.json").is_file() else {}
+        timeout = float(meta.get("timeout", os.environ.get("FEAT_TIMEOUT", "900")))
+        res["progress"] = {n: _progress(folder / n, studies.get(n, {}), meta["solver"], timeout) for n in pending}
+        res["time_left"], res["next"] = _timing(folder, res["progress"])
     else:
         (folder / "results.json").write_text(json.dumps(res, indent=1))
     return res
+
+
+# ----------------------------------------------------------------------------- progress and time left
+
+STAGES = ("mesh", "solve", "mesh_fine", "solve_fine")
+FINE_NODES = 1 / 0.6 ** 3   # the finer mesh of converge: true (size x 0.6) has about 4.6x the nodes
+SOLVE_EXP = 1.5              # solve time ~ nodes^1.5 (sparse direct solver on 3D meshes)
+POLL_LIMIT_MIN = 5.0         # longer than this: tell the user when to come back instead of polling
+
+
+def _rates(analysis: str, solver: str) -> dict | None:
+    """From this machine's finished solves (timing.jsonl): solve s per nodes^1.5, mesh s per node,
+    and typical (median) mesh and solve times; None without records."""
+    from statistics import median
+    from .runner import stats_path
+
+    p = stats_path()
+    if not p.is_file():
+        return None
+    recs = []
+    for line in p.read_text().splitlines()[-500:]:
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if r.get("analysis") == analysis and r.get("solver") == solver and r.get("nodes", 0) > 0:
+            recs.append(r)
+    if not recs:
+        return None
+    return {"solve_k": median(r["solve_s"] / r["nodes"] ** SOLVE_EXP for r in recs),
+            "mesh_k": median(r["mesh_s"] / r["nodes"] for r in recs),
+            "mesh_s": median(r["mesh_s"] for r in recs), "solve_s": median(r["solve_s"] for r in recs),
+            "runs": len(recs)}
+
+
+def _stage_s(stage: str, nodes: int | None, rt: dict | None) -> float | None:
+    """Expected seconds of one stage; `nodes` is the study's (first) mesh, the finer one is scaled."""
+    if rt is None:
+        return None
+    fine = stage.endswith("_fine")
+    if nodes:
+        n = nodes * (FINE_NODES if fine else 1)
+        return rt["mesh_k"] * n if stage.startswith("mesh") else rt["solve_k"] * n ** SOLVE_EXP
+    if stage.startswith("mesh"):
+        return rt["mesh_s"] * (FINE_NODES if fine else 1)
+    return rt["solve_s"] * (FINE_NODES ** SOLVE_EXP if fine else 1)
+
+
+def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
+    """Where a running study is: step k of n (mesh, solve; with converge: true also the finer mesh),
+    seconds per step, and minutes left: expected (from this machine's past solves) and at most (the
+    time limit of each remaining solve)."""
+    steps = 4 if study.get("converge") else 2
+    rt = _rates(study.get("analysis", ""), solver)
+    pf = d / "progress.json"
+    try:
+        p = json.loads(pf.read_text())
+    except (OSError, json.JSONDecodeError):
+        p = None
+    now = time.time()
+    if p is None:  # waiting for a worker
+        exp = sum(_stage_s(s, None, rt) or 0 for s in STAGES[:steps]) if rt else None
+        return {"stage": "queued", "iteration": 0, "max_iterations": steps,
+                "eta_min": None if exp is None else round(exp / 60, 1),
+                "eta_min_max": round(steps / 2 * timeout / 60, 1)}
+    step, stage = int(p["step"]), p["stage"]
+    el_stage = now - p.get("stage_started", now)
+    done = p.get("done_steps_s", [])
+    nodes = p.get("nodes")
+    exp = None
+    if rt:
+        cur = _stage_s(stage, nodes, rt)
+        exp = max((cur or 0) - el_stage, 0.1 * el_stage) + sum(_stage_s(s, nodes, rt) or 0 for s in STAGES[step:steps])
+    solves_left = [s for s in STAGES[step - 1:steps] if s.startswith("solve")]
+    worst = sum(timeout for _ in solves_left) - (el_stage if stage.startswith("solve") else 0)
+    # meshing has no time limit of its own: count its expected time (the rest of the current one too)
+    for s in STAGES[step - 1:steps]:
+        if s.startswith("mesh") and rt:
+            worst += max((_stage_s(s, nodes, rt) or 0) - (el_stage if s == stage else 0), 0)
+    out = {"stage": stage, "iteration": step, "max_iterations": steps,
+           "s_per_iteration": round(sum(done) / len(done), 1) if done else None,
+           "elapsed_min": round((now - p.get("started", now)) / 60, 1), "nodes": nodes,
+           "eta_min": None if exp is None else round(exp / 60, 1), "eta_min_max": round(max(worst, 0) / 60, 1)}
+    if rt is None:
+        out["note"] = "no finished solves on this machine yet: eta_min is unknown until one finishes"
+    return out
+
+
+def _clock(t: float) -> str:
+    return time.strftime("%H:%M", time.localtime(t)) + (" (tomorrow)" if time.localtime(t).tm_yday != time.localtime().tm_yday else "")
+
+
+def _timing(folder: Path, progress: dict) -> tuple[dict, str]:
+    """Request-level time left and the advice for the caller."""
+    workers = max(1, int(os.environ.get("FEAT_WORKERS", "2")))
+    queued = [p for p in progress.values() if p["stage"] == "queued"]
+    running = [p for p in progress.values() if p["stage"] != "queued"]
+    exp = [p["eta_min"] for p in running if p.get("eta_min") is not None]
+    exp_q = [p["eta_min"] for p in queued if p.get("eta_min") is not None]
+    rounds = -(-len(queued) // workers)  # queued studies start as workers free up
+    known = len(exp) == len(running) and len(exp_q) == len(queued)
+    eta = max(exp, default=0) + rounds * max(exp_q, default=0) if known else None
+    eta_max = max((p["eta_min_max"] for p in running), default=0) + rounds * max((p["eta_min_max"] for p in queued), default=0)
+    now = time.time()
+    t = {"eta_min": None if eta is None else round(eta, 1), "eta_min_max": round(eta_max, 1),
+         "expected_finish": None if eta is None else _clock(now + 60 * eta), "latest_finish": _clock(now + 60 * eta_max)}
+    basis = eta if eta is not None else eta_max
+    if basis > POLL_LIMIT_MIN:
+        when = t["expected_finish"] or f"at the latest {t['latest_finish']}"
+        nxt = (f"this run needs about {basis:.0f} more min: tell the user it should finish around {when} "
+               f"(at the latest {t['latest_finish']}) and stop; do not poll. Collect the results later with "
+               f"study_status(request='{folder}') when the user asks, or from a task scheduled after that time.")
+    else:
+        nxt = f"call study_status(request='{folder}', wait_s={min(50, int(60 * basis) + 10)}) to collect the rest"
+    return t, nxt
 
 
 def start(studies: dict, solver: str | None = None) -> Path:
@@ -151,9 +272,10 @@ def start(studies: dict, solver: str | None = None) -> Path:
         if not v["ok"]:
             invalid[n] = {"ok": False, "why": "invalid study", "errors": v["errors"]}
         else:
-            jobs.append({"name": n, "study": st, "folder": str(folder), "solver": s})
+            jobs.append({"name": n, "study": st, "folder": str(folder), "solver": s, "out": str(out_root())})
     (folder / "request.json").write_text(json.dumps({"names": [j["name"] for j in jobs], "invalid": invalid,
-                                                     "solver": s, "started": time.time()}))
+                                                     "solver": s, "started": time.time(),
+                                                     "timeout": float(os.environ.get("FEAT_TIMEOUT", "900"))}))
     if jobs:
         _POOL.submit(folder, jobs)
     return folder

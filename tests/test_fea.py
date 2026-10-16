@@ -310,3 +310,62 @@ def test_buckling_concurrent_runs(tmp_path):
     with ThreadPoolExecutor(4) as ex:
         res = list(ex.map(lambda i: run_study(f"e{i}", st, tmp_path / f"e{i}", solver="ccx"), range(4)))
     assert all(r["ok"] and r["passed"] for r in res), [r.get("critical_factor") for r in res]
+
+
+def test_progress_and_time_left(tmp_path, monkeypatch):
+    """Pending studies report step of steps and minutes left (expected from this machine's past
+    solves, at most from the time limit); long runs tell the caller to stop polling."""
+    import json
+    import time
+
+    from fea_translator import api
+
+    monkeypatch.setenv("FEAT_OUT", str(tmp_path))
+    monkeypatch.setenv("FEAT_WORKERS", "2")
+    # past solves here: 1,000 nodes, mesh 1 s, solve 10 s  ->  solve ~ 10 s x (nodes / 1000)^1.5
+    (tmp_path / "timing.jsonl").write_text("".join(json.dumps(
+        {"analysis": "static", "solver": "ccx", "nodes": 1000, "mesh_s": 1.0, "solve_s": 10.0}) + "\n" for _ in range(3)))
+    st = {"analysis": "static"}
+    d = tmp_path / "req" / "a"
+    d.mkdir(parents=True)
+
+    def at(nodes, stage="solve", step=2, steps=2, ago=5.0):
+        now = time.time()
+        (d / "progress.json").write_text(json.dumps({"stage": stage, "step": step, "steps": steps, "nodes": nodes,
+                                                     "started": now - 60, "stage_started": now - ago,
+                                                     "done_steps_s": [2.0] * (step - 1)}))
+        return api._progress(d, dict(st, converge=steps == 4), "ccx", 900)
+
+    p = at(8000)                                       # 10 x 8^1.5 = 226 s expected, 5 s done
+    assert p["iteration"] == 2 and p["max_iterations"] == 2 and p["s_per_iteration"] == 2.0
+    assert abs(p["eta_min"] - 221 / 60) < 0.1 and abs(p["eta_min_max"] - 895 / 60) < 0.1
+    t, nxt = api._timing(tmp_path / "req", {"a": p})
+    assert t["eta_min"] < 5 and "study_status" in nxt and "stop" not in nxt
+    p = at(40000)                                      # 10 x 40^1.5 = 2530 s: 42 min
+    t, nxt = api._timing(tmp_path / "req", {"a": p})
+    assert t["eta_min"] > 40 and "tell the user" in nxt and t["expected_finish"] in nxt
+    p = at(1000, stage="mesh", step=1, steps=4, ago=0.5)   # converge: mesh, solve, finer mesh, finer solve
+    fine = 10 * (1000 / 0.6 ** 3 / 1000) ** 1.5
+    assert p["max_iterations"] == 4 and abs(p["eta_min"] - (0.5 + 10 + 4.63 + fine) / 60) < 0.05
+    assert abs(p["eta_min_max"] - (2 * 900 + 0.5 + 4.63) / 60) < 0.1     # two solves at most 900 s each, plus meshing
+    q = api._progress(tmp_path / "req" / "b", st, "ccx", 900)    # no progress file yet: waiting for a worker
+    assert q["stage"] == "queued" and q["eta_min_max"] == 15.0
+    (tmp_path / "timing.jsonl").unlink()                            # no history: expected time unknown
+    p = at(8000)
+    assert p["eta_min"] is None and "note" in p
+    t, nxt = api._timing(tmp_path / "req", {"a": p})
+    assert t["expected_finish"] is None and "tell the user" in nxt   # judged on the upper bound (15 min)
+
+
+def test_runs_record_their_timing(tmp_path, monkeypatch):
+    import json
+
+    from fea_translator import api
+
+    monkeypatch.setenv("FEAT_OUT", str(tmp_path))
+    r = api.run({"cant": bench.cases("ref")["cantilever"]}, "ref")
+    assert r["done"] and r["studies"]["cant"]["ok"]
+    recs = [json.loads(x) for x in (tmp_path / "timing.jsonl").read_text().splitlines()]
+    assert recs[-1]["analysis"] == "static" and recs[-1]["nodes"] > 0 and recs[-1]["solve_s"] >= 0
+    prog = json.loads((tmp_path / r["request"].split("/")[-1] / "cant" / "progress.json").read_text())
+    assert prog["step"] == 2 and prog["steps"] == 2 and prog["stage"] == "solve"

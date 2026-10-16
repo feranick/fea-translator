@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.16.8
+Version: 2026.10.16.10
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -7,6 +7,11 @@ Solver "ccx" runs CalculiX (FEAT_CCX, else ccx or ccx_2.* on PATH); "ref" the pa
 solver (static, modal, thermal; small meshes). Checks on every run: static equilibrium (reactions
 balance the loads), heat balance (thermal), the study's `expect` list, and with converge: true the
 change of the main results on a finer mesh.
+
+Progress: while it runs, a study writes <folder>/progress.json (step k of n: mesh, solve, and with
+converge: true mesh and solve again on the finer mesh; nodes; times), and every finished solve
+appends its size and times to timing.jsonl in the output root, from which api.status estimates
+the time left.
 """
 from __future__ import annotations
 
@@ -292,7 +297,48 @@ MAIN = {"static": ("max_displacement", "peak_von_mises", "peak_von_mises_off_bc"
         "buckling": ("critical_factor",), "thermal": ("T_max", "T_min")}
 
 
-def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float, size_factor: float = 1.0) -> dict:
+def stats_path() -> Path:
+    """Timing records of finished solves on this machine (the output root's timing.jsonl)."""
+    return Path(os.environ.get("FEAT_OUT", "~/feat_runs")).expanduser() / "timing.jsonl"
+
+
+def _record_timing(study: dict, solver: str, minfo: dict, mesh_s: float, solve_s: float) -> None:
+    try:
+        p = stats_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"analysis": study["analysis"], "solver": solver, "nodes": int(minfo.get("nodes", 0)),
+               "order": int(minfo.get("order", 2)), "mesh_s": round(mesh_s, 3), "solve_s": round(solve_s, 3),
+               "t": round(time.time(), 1)}
+        with p.open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+class Progress:
+    """Writes <folder>/progress.json as a study goes through its steps (read by api.status)."""
+
+    def __init__(self, folder: Path, study: dict, solver: str, timeout: float):
+        self.path = Path(folder) / "progress.json"
+        self.steps = 4 if study.get("converge") else 2
+        self.info = {"analysis": study["analysis"], "solver": solver, "steps": self.steps, "step": 0,
+                     "stage": "starting", "timeout_s": timeout, "started": time.time(), "done_steps_s": []}
+
+    def stage(self, stage: str, **extra) -> None:
+        now = time.time()
+        if self.info["step"] > 0:
+            self.info["done_steps_s"].append(round(now - self.info["stage_started"], 3))
+        self.info.update(stage=stage, step=self.info["step"] + 1, stage_started=now, **extra)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.info))
+        tmp.replace(self.path)
+
+
+def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float, size_factor: float = 1.0,
+               progress: Progress | None = None) -> dict:
+    fine = size_factor != 1.0
+    if progress:
+        progress.stage("mesh_fine" if fine else "mesh")
     t0 = time.perf_counter()
     mesh, minfo = mesh_part(study, folder, size_factor)
     if size_factor != 1.0 and minfo.get("size"):
@@ -301,12 +347,15 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     text, plan = deck.write(name, study, mesh)
     inp = folder / f"{name}.inp"
     inp.write_text(text)
+    if progress:
+        progress.stage("solve_fine" if fine else "solve", **{("nodes_fine" if fine else "nodes"): int(minfo.get("nodes", 0))})
     if solver == "ref":
         from . import refsolver
         refsolver.run(inp)
     else:
         run_ccx(inp, timeout, serial=study["analysis"] == "buckling")
     t2 = time.perf_counter()
+    _record_timing(study, solver, minfo, t1 - t0, t2 - t1)
     dat = results.parse_dat(inp.with_suffix(".dat").read_text())
     frd_path = inp.with_suffix(".frd")
     frd = results.parse_frd(frd_path.read_text()) if frd_path.is_file() else None
@@ -327,13 +376,14 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
 def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout: float = 600) -> dict:
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
+    prog = Progress(folder, study, solver, timeout)
     try:
-        res = solve_once(name, study, folder, solver, timeout)
+        res = solve_once(name, study, folder, solver, timeout, progress=prog)
         res["ok"] = True
         if study.get("converge"):
             fine_dir = folder / f"{name}_fine"
             fine_dir.mkdir(exist_ok=True)
-            fine = solve_once(name, study, fine_dir, solver, timeout, size_factor=0.6)
+            fine = solve_once(name, study, fine_dir, solver, timeout, size_factor=0.6, progress=prog)
             fine.pop("_selection_warnings", None)
             conv = {}
             for q in MAIN[study["analysis"]]:

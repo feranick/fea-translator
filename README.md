@@ -128,10 +128,18 @@ The reference solver (`refsolver.py`) is independent element code (isoparametric
 | `study_format` | The study format, and which solver and mesher are installed. Read it first. |
 | `validate_studies` | Static checks of `{name: study}`. |
 | `run_studies` | Meshes, solves and checks: results, selections, checks, warnings, files. Returns within `wait_s` (≤ 50 s, under the clients' call time limits); studies still running are listed in `pending` with the `request` path. |
-| `study_status` | The finished and pending studies of a request; waits up to `wait_s` for the rest. |
+| `study_status` | The finished and pending studies of a request; waits up to `wait_s` for the rest. Pending studies come with `progress` and the request with `time_left` and `next` (below). |
 | `get_deck` | The CalculiX deck of one study, as text. |
 | `run_benchmarks` | The closed-form benchmarks: is the toolchain right on this machine? |
 | `get_file` | A written file as base64. |
+
+**Long runs.** Polling costs the calling model tokens on every call, so pending studies say where they are and how long they still need, and long runs are not polled:
+
+- `progress.<study>`: `stage` (`queued`, `mesh`, `solve`, and with `converge: true` `mesh_fine`, `solve_fine`), `iteration` of `max_iterations` (those steps), `s_per_iteration` (finished steps), `elapsed_min`, `nodes`, `eta_min` (expected minutes left) and `eta_min_max` (at most: the time limit `FEAT_TIMEOUT` of each remaining solve).
+- `time_left`: the same for the whole request, with queued studies waiting for a worker; `expected_finish` and `latest_finish` as clock times.
+- `next`: under about 5 minutes, call `study_status` again with a `wait_s` that covers it; over 5 minutes, tell the user when the run should finish and stop; collect it later with `study_status` (when the user asks, or from a task scheduled after that time). The server instructions say the same.
+
+The expected time comes from this machine's own finished solves: each run appends its mesh size and mesh and solve times to `timing.jsonl` in the output folder, and a new solve is estimated as (median seconds per nodes^1.5) x nodes^1.5 (sparse direct solver on a 3D mesh); the finer mesh of `converge: true` has about 4.6x the nodes. Before the first finished solve on a machine `eta_min` is unknown and the advice goes by `eta_min_max`.
 
 In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.json`), next to `b3dt`:
 
@@ -161,7 +169,9 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `pyproject.toml` | 2026.10.16.9 (the `mesh` extra skips Gmsh on Linux ARM, where PyPI has no wheels; README: Ubuntu's python3-gmsh linked into the venv) |
+| Package, `pyproject.toml` | 2026.10.16.10 |
+| `api.py`, `runner.py`, `mcp_server.py` | 2026.10.16.10 (long runs: `progress` per pending study, `time_left` and `next`; `timing.jsonl` of finished solves for the expected time; instructions: tell the user when to come back instead of polling runs over about 5 min) |
+| Package (before) | 2026.10.16.9 (the `mesh` extra skips Gmsh on Linux ARM, where PyPI has no wheels; README: Ubuntu's python3-gmsh linked into the venv) |
 | `runner.py`, `deck.py` | 2026.10.16.8 (buckling: eigenvalue accuracy 1e-6 instead of CalculiX's 0.01, and one thread per buckling job: with one BLAS thread only, 1 of 4 concurrent `euler_column` runs still returned a wrong factor (20.8); a test runs four at once) |
 | `runner.py`, `deck.py` (before) | 2026.10.16.7 (one BLAS thread per CalculiX job: Ubuntu's ccx links OpenBLAS, and a threaded OpenBLAS called from CalculiX's OpenMP code can give wrong eigenvalues; the pump test got a buckling factor of 10.07 for `euler_column`'s 674.7 while several studies ran at once; buckling asks for at least 4 factors and reports the requested number) |
 | `mesher.py`, `meshdata.py`, `runner.py` | 2026.10.16.6 (from the pump test: the DN250 nozzle, with 7-12 mm ligaments around 16 holes at 10-15 mm elements, failed with 'cannot match the mid-edge nodes' or CalculiX's 'nonpositive jacobian'; Gmsh's node order is now used directly instead of matching mid-edge nodes by distance, and inverted curved elements are straightened and reported) |
