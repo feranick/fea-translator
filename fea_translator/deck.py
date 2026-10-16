@@ -1,5 +1,5 @@
 """deck.py — a study and its mesh as a CalculiX input deck (.inp).
-Version: 2026.10.16.4
+Version: 2026.10.16.7
 
     text, plan = write(name, study, mesh)
 
@@ -127,6 +127,8 @@ def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
         L += ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"NALL, {_g(sum(temps) / len(temps))}"]
     L.append("*STEP")
     modes = int(study.get("modes", 6 if an == "modal" else 3))
+    if an == "buckling":
+        modes = max(modes, 4)  # a few more factors than asked: the eigenvalue solver converges more reliably
     method = equation_solver(study, len(mesh.nodes))
     plan["equation_solver"] = method
     opt = ", SOLVER=ITERATIVE CHOLESKY" if method == "iterative" else ""

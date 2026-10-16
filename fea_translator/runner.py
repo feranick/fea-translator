@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.16.6
+Version: 2026.10.16.7
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -52,6 +52,11 @@ def run_ccx(inp: Path, timeout: float) -> str:
     env = dict(os.environ)
     env.setdefault("OMP_NUM_THREADS", str(min(4, os.cpu_count() or 1)))
     env.setdefault("CCX_NPROC_EQUATION_SOLVER", env["OMP_NUM_THREADS"])
+    # CalculiX is OpenMP-parallel and its eigenvalue solver (ARPACK) calls BLAS inside it; a threaded
+    # OpenBLAS called that way can return wrong results (OpenBLAS's own warning), most often when several
+    # jobs run at once: the pump test got a buckling factor of 10.07 for 674.7. One BLAS thread per job.
+    for k in ("OPENBLAS_NUM_THREADS", "GOTO_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
+        env[k] = "1"
     p = subprocess.run([exe, "-i", inp.stem], cwd=inp.parent, capture_output=True, text=True, timeout=timeout, env=env)
     log = p.stdout + p.stderr
     (inp.parent / f"{inp.stem}.log").write_text(log)
@@ -217,7 +222,7 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, b
             raise SolverError("no frequencies in the .dat file")
         out["mass_kg"] = round(float(mat.get("density", 0)) * mesh.volume() * 1e-9, 6)
     elif an == "buckling":
-        f = [round(e["factor"], 6) for e in dat["buckling"]]
+        f = [round(e["factor"], 6) for e in dat["buckling"]][:int(study.get("modes", 3))]
         if not f:
             raise SolverError("no buckling factors in the .dat file")
         out["buckling_factors"] = f
