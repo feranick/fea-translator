@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.16.1
+Version: 2026.10.16.3
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -76,11 +76,8 @@ def _face_mean(mesh: Mesh, tags, values: np.ndarray) -> np.ndarray:
     acc, area = 0.0, 0.0
     for t in tags:
         g = mesh.groups[t]
-        if g.mids is not None:  # quadratic triangle: the integral of N is 0 at corners, A/3 at mid-edge nodes
-            v = values[g.mids].mean(axis=1)
-        else:
-            v = values[g.corners].mean(axis=1)
-        acc = acc + (g.area[:, None] * v.reshape(len(g.area), -1)).sum(axis=0)
+        v = values[g.fnodes]                                  # (T, n, k)
+        acc = acc + np.einsum("ta,tak->k", g.wN, v.reshape(v.shape[0], v.shape[1], -1))
         area += g.total_area
     return np.atleast_1d(acc / area)
 

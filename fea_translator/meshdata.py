@@ -1,5 +1,5 @@
 """meshdata.py — the mesh as CalculiX needs it: node ordering, boundary faces, face selection, loads.
-Version: 2026.10.16.1
+Version: 2026.10.16.3
 
 Pure NumPy (no Gmsh, no CalculiX), so every step from a mesh to the deck is testable on its own.
 
@@ -77,6 +77,49 @@ def _point_triangle_distance(q: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.
 
     dedge = np.minimum(np.minimum(seg(a, b), seg(b, c)), seg(c, a))
     return np.where(inside, dplane, dedge)
+
+
+def _gauss01(n: int):
+    x, w = np.polynomial.legendre.leggauss(n)
+    return (x + 1) / 2, w / 2
+
+
+def tri_quadrature(n: int = 4):
+    """Collapsed Gauss rule on the unit triangle: area coordinates (q, 3), weights summing to 1/2."""
+    x, w = _gauss01(n)
+    a, b = np.meshgrid(x, x, indexing="ij")
+    wa, wb = np.meshgrid(w, w, indexing="ij")
+    s, t = a.ravel(), (b * (1 - a)).ravel()
+    return np.column_stack([1 - s - t, s, t]), (wa * wb * (1 - a)).ravel()
+
+
+def tet_quadrature(n: int = 4):
+    """Collapsed Gauss rule on the unit tetrahedron: barycentric coordinates (q, 4), weights summing to 1/6."""
+    x, w = _gauss01(n)
+    a, b, c = (g.ravel() for g in np.meshgrid(x, x, x, indexing="ij"))
+    wa, wb, wc = (g.ravel() for g in np.meshgrid(w, w, w, indexing="ij"))
+    xi, eta, zeta = a, b * (1 - a), c * (1 - a) * (1 - b)
+    return np.column_stack([1 - xi - eta - zeta, xi, eta, zeta]), wa * wb * wc * (1 - a) ** 2 * (1 - b)
+
+
+def simplex_shape(L: np.ndarray, quad: bool, edges):
+    """Shape functions (q, n) and their derivatives with respect to the area/volume coordinates
+    (q, n, k) of a linear or quadratic simplex (mid-edge nodes in the order of `edges`)."""
+    q, k = L.shape
+    if not quad:
+        return L.copy(), np.broadcast_to(np.eye(k), (q, k, k)).copy()
+    n = k + len(edges)
+    N, dN = np.zeros((q, n)), np.zeros((q, n, k))
+    for i in range(k):
+        N[:, i] = L[:, i] * (2 * L[:, i] - 1)
+        dN[:, i, i] = 4 * L[:, i] - 1
+    for j, (a, b) in enumerate(edges):
+        N[:, k + j] = 4 * L[:, a] * L[:, b]
+        dN[:, k + j, a], dN[:, k + j, b] = 4 * L[:, b], 4 * L[:, a]
+    return N, dN
+
+
+TRI_EDGES = ((0, 1), (1, 2), (2, 0))
 
 
 def fit_cylinder(pts: np.ndarray, normals: np.ndarray, rtol: float = 2e-3):
@@ -213,12 +256,33 @@ class Mesh:
             g = FaceGroup(tag, elem, side_idx + 1, cor, mids, ln / 2, nv / ln[:, None], (pa + pb + pc) / 3,
                           info.get("kind", "unknown"), info.get("radius"))
             g._pts = (pa, pb, pc)
+            self._face_integrals(g)
             if not g.planar:  # STEP cylinders can come as B-spline surfaces: fit every curved face
                 fit = fit_cylinder(self.nodes[np.unique(cor)], g.normal)
                 if fit is not None:
                     g.kind, g.radius, g.axis = "Cylinder", fit[0], fit[1]
             self.groups[tag] = g
         return self
+
+    def _face_integrals(self, g):
+        """Isoparametric integrals on each triangle (curved 6-node ones exactly as the solver does):
+        g.fnodes (T, n) nodes, g.wN = int N dA, g.nN = int N n dA (outward), g.M = int N N dA;
+        g.area becomes the (curved) area."""
+        quad = g.mids is not None
+        g.fnodes = np.concatenate([g.corners, g.mids], axis=1) if quad else g.corners
+        L, w = tri_quadrature(4)
+        N, dN = simplex_shape(L, quad, TRI_EDGES)
+        P = self.nodes[g.fnodes]                                              # (T, n, 3)
+        xs = np.einsum("qn,tnk->tqk", dN[:, :, 1] - dN[:, :, 0], P)
+        xt = np.einsum("qn,tnk->tqk", dN[:, :, 2] - dN[:, :, 0], P)
+        nv = np.cross(xs, xt)                                                 # (T, q, 3) = n dA / (ds dt)
+        sgn = np.sign(np.einsum("tqk,tk->t", nv, g.normal))
+        nv *= np.where(sgn == 0, 1, sgn)[:, None, None]
+        dA = np.linalg.norm(nv, axis=2) * w[None, :]                          # (T, q)
+        g.wN = dA @ N                                                         # (T, n)
+        g.nN = np.einsum("q,qa,tqk->tak", w, N, nv)                            # (T, n, 3)
+        g.M = np.einsum("tq,qa,qb->tab", dA, N, N)
+        g.area = g.wN.sum(axis=1)
 
     # ---- selection ----
     def select(self, sel) -> list[int]:
@@ -282,42 +346,28 @@ class Mesh:
         for 6-node triangles the corners take 0 and the mid-edge nodes A/3 each; for 3-node, A/3 each corner."""
         t = np.asarray(force, float) / self.area_of(tags)
         acc = np.zeros((len(self.nodes), 3))
-        for tag in tags:
-            g = self.groups[tag]
-            share = (g.area / 3)[:, None] * t[None, :]
-            tgt = g.mids if g.mids is not None else g.corners
-            for j in range(3):
-                np.add.at(acc, tgt[:, j], share)
+        for g, nodes, w in self.face_nodes_weights(tags):
+            np.add.at(acc, nodes.ravel(), (w.ravel())[:, None] * t[None, :])
         idx = np.nonzero(np.any(acc != 0, axis=1))[0]
         return {int(i): acc[i] for i in idx}
 
     def face_nodes_weights(self, tags):
-        """Per triangle: its nodes (T, 6|3) and the integrals of the shape functions (T, 6|3) on it
-        (flat triangles: quadratic corners 0, mid-edge nodes A/3; linear corners A/3)."""
+        """Per face: the triangles' nodes (T, 6|3) and the integrals of their shape functions (T, 6|3)
+        (on flat triangles: quadratic corners 0, mid-edge nodes A/3; linear corners A/3)."""
         for tag in tags:
             g = self.groups[tag]
-            if g.mids is not None:
-                nodes = np.concatenate([g.corners, g.mids], axis=1)
-                w = np.concatenate([np.zeros((len(g.area), 3)), np.repeat((g.area / 3)[:, None], 3, axis=1)], axis=1)
-            else:
-                nodes, w = g.corners, np.repeat((g.area / 3)[:, None], 3, axis=1)
-            yield g, nodes, w
+            yield g, g.fnodes, g.wN
 
     def face_mass(self, g) -> np.ndarray:
-        """Integrals of N_a N_b on each triangle (T, n, n), flat triangles."""
-        if g.mids is not None:
-            m = np.array([[6, -1, -1, 0, -4, 0], [-1, 6, -1, 0, 0, -4], [-1, -1, 6, -4, 0, 0],
-                          [0, 0, -4, 32, 16, 16], [-4, 0, 0, 16, 32, 16], [0, -4, 0, 16, 16, 32]]) / 180.0
-        else:
-            m = np.array([[2, 1, 1], [1, 2, 1], [1, 1, 2]]) / 12.0
-        return g.area[:, None, None] * m[None]
+        """Integrals of N_a N_b on each triangle (T, n, n)."""
+        return g.M
 
     def pressure_nodes(self, tags, p: float) -> np.ndarray:
         """Consistent nodal forces (N, 3) of a uniform pressure p (positive into the faces)."""
         acc = np.zeros((len(self.nodes), 3))
-        for g, nodes, w in self.face_nodes_weights(tags):
-            for j in range(nodes.shape[1]):
-                np.add.at(acc, nodes[:, j], -p * w[:, j:j + 1] * g.normal)
+        for tag in tags:
+            g = self.groups[tag]
+            np.add.at(acc, g.fnodes.ravel(), -p * g.nN.reshape(-1, 3))
         return acc
 
     def flux_nodes(self, tags, q: float) -> np.ndarray:
@@ -336,23 +386,21 @@ class Mesh:
         return acc
 
     def body_nodes(self, accel_density: np.ndarray) -> np.ndarray:
-        """Consistent nodal forces (N, 3) of a uniform body force per volume (straight-sided
-        elements: 10-node corners -V/20, mid-edge nodes V/5; 4-node V/4)."""
-        v = tet_volumes(self.nodes, self.tets)
+        """Consistent nodal forces (N, 3) of a uniform body force per volume: the integral of N over
+        each (possibly curved) element (straight 10-node: corners -V/20, mid-edge nodes V/5)."""
+        L, w = tet_quadrature(4)
+        N, dN = simplex_shape(L, self.order == 2, EDGES)
+        X = self.nodes[self.tets]
+        J = np.einsum("qnj,enk->eqjk", dN[:, :, 1:] - dN[:, :, :1], X)
+        wN = np.einsum("eq,qa->ea", np.linalg.det(J) * w[None, :], N)      # (E, n)
         acc = np.zeros((len(self.nodes), 3))
-        if self.order == 2:
-            wts = np.array([-1 / 20] * 4 + [1 / 5] * 6)
-        else:
-            wts = np.full(4, 1 / 4)
-        for j, wj in enumerate(wts):
-            np.add.at(acc, self.tets[:, j], (wj * v)[:, None] * accel_density[None, :])
+        np.add.at(acc, self.tets.ravel(), wN.ravel()[:, None] * accel_density[None, :])
         return acc
 
     def pressure_resultant(self, tags, p: float) -> np.ndarray:
         r = np.zeros(3)
         for tag in tags:
-            g = self.groups[tag]
-            r -= p * (g.area[:, None] * g.normal).sum(axis=0)
+            r -= p * self.groups[tag].nN.sum(axis=(0, 1))
         return r
 
     def axis_normal(self, tags) -> int:

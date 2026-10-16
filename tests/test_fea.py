@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.16.1
+Version: 2026.10.16.3
 """
 import shutil
 from pathlib import Path
@@ -178,3 +178,28 @@ def test_cli_status_runs():
     assert "translator" in s and s["default_solver"] in ("ccx", "ref")
     assert shutil.which("python3") or True
     assert Path(__file__).is_file()
+
+
+def test_curved_quarter_ring_reference_solver(tmp_path):
+    """A box mesh bent into a quarter ring (curved 10-node elements, no Gmsh): Lame bore
+    displacement, and equilibrium with pressure on a curved face whose edges touch the supports."""
+    import math
+
+    from fea_translator.meshdata import Mesh
+    from fea_translator.runner import evaluate
+    from fea_translator import refsolver
+
+    b = box_mesh(20, 1.0, 10, 6, 12, 3, origin=(0, 0, 0))
+    r, th = 20 + b.nodes[:, 0], b.nodes[:, 1] * math.pi / 2
+    m = Mesh(np.column_stack([r * np.cos(th), r * np.sin(th), b.nodes[:, 2]]), b.tets, b.surfaces).build()
+    assert abs(m.groups[1].radius - 20) < 1e-9 and abs(m.groups[1].total_area - 100 * math.pi) < 1e-3
+    assert np.allclose(m.pressure_resultant([1], 10.0)[:2], [2000, 2000])
+    st = dict(bench.cases("ref")["lame_ring"], part={"box": [1, 1, 1]})
+    text, plan = deck.write("ring", st, m)
+    inp = tmp_path / "ring.inp"
+    inp.write_text(text)
+    refsolver.run(inp)
+    res = evaluate(st, m, plan, results.parse_dat(inp.with_suffix(".dat").read_text()), None)
+    want = next(e["value"] for e in st["expect"] if e["quantity"] == "max_displacement")
+    assert abs(res["max_displacement"] - want) < 1e-3 * want
+    assert res["equilibrium_error"] < 1e-6

@@ -24,7 +24,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 27 tests: 15 run anywhere, 12 need ccx (and Gmsh)
+pytest -q                      # 28 tests: 16 run anywhere, 12 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -151,7 +151,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `bench.py` | 2026.10.16.2 (`lame_ring` as a 90-degree revolve; README: results of the first CalculiX run) |
+| Package, `meshdata.py`, `runner.py` | 2026.10.16.3 (face integrals isoparametric, as CalculiX computes them on curved 6-node faces: consistent pressure, traction, flux and film loads, face areas and means; body loads integrated over curved elements. The reaction correction on supports that touch a curved loaded face is now exact: `lame_ring` equilibrium error 1e-3 before) |
+| `bench.py` | 2026.10.16.2 (`lame_ring` as a 90-degree revolve; README: results of the first CalculiX run) |
 | Other modules | 2026.10.16.1 (first version) |
 | Tested with | CalculiX (Ubuntu calculix-ccx), Gmsh 4.15.2, Python 3.14 (carbonio); Python 3.10, NumPy 2.2, SciPy 1.15 (reference solver) |
 
