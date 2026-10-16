@@ -93,13 +93,13 @@ Every run also returns `checks` (the `expect` list, pass or fail), `passed`, `wa
 | `lame_ring` | quarter ring under internal pressure: Lamé bore displacement and von Mises | 2 % (Gmsh) |
 | `plate_hole` | quarter plate with a hole: Kt = 2 + (1 − d/W)³ on the net section | 5 % (Gmsh, CalculiX) |
 
-**Status (2026-10-16):** the 9 cases that need neither Gmsh nor CalculiX pass with the reference solver (the exact ones to rounding; cantilever 1.0 %, frequency 0.13 %, pin fin 0.09 %). The Gmsh and CalculiX paths were written without access to either program (the development sandbox had neither), so `pytest` and `feat bench` on a machine with both are the first real run; the points to confirm are listed below.
+**Status (2026-10-16, carbonio: CalculiX from Ubuntu's calculix-ccx, Gmsh 4.15.2, Python 3.14):** 10 of 11 benchmarks pass with CalculiX on the first run (`euler_column` and `plate_hole` included); `lame_ring` failed only because that machine's build123d-translator predated `split`; it is now a 90-degree revolve, which every version builds. The reference solver passes the 9 cases without Gmsh or CalculiX (the exact ones to rounding; cantilever 1.0 %, frequency 0.13 %, pin fin 0.09 %).
 
-### To confirm on the first CalculiX run
+The first CalculiX run confirmed what the translator assumes about it:
 
-- The `.dat` layout read by `results.py`: block headers `<what> (<components>) for set <SET> and time <t>`, the eigenvalue and buckling tables (the parser looks for `E I G E N V A L U E   O U T P U T` and `B U C K L I N G   F A C T O R   O U T P U T`).
-- Reactions: CalculiX's RF at a node is the external force there (reaction plus applied loads; manual), so the translator subtracts its own equivalent nodal loads and counts each constrained direction of a node once. `gravity_block`, `pressure_cantilever` and `axial_bar` test this; RFL (heat) is assumed to work the same way, which `fin_sides` tests.
-- Face numbers for `*DLOAD P`, `*DFLUX S`, `*FILM F` follow the Abaqus/CalculiX convention for tetrahedra (S1 = 1-2-3, S2 = 1-4-2, S3 = 2-4-3, S4 = 3-4-1).
+- The `.dat` layout: headers `<what> (<components>) for set <SET> and time <t>` (`displacements`, `stresses`, `forces` for RF per node, `temperatures`, `heat generation` for RFL per node).
+- Reactions: CalculiX's RF at a node is the external force there (reaction plus applied loads), so the translator subtracts its own equivalent nodal loads and counts each constrained direction of a node once (`gravity_block`, `pressure_cantilever`, `axial_bar` exact). RFL (heat) works the same way, films included (`slab`, `fin_end` exact, `fin_sides` 1 %).
+- Face numbers for `*DLOAD P`, `*DFLUX S`, `*FILM F`: the Abaqus/CalculiX convention for tetrahedra (S1 = 1-2-3, S2 = 1-4-2, S3 = 2-4-3, S4 = 3-4-1).
 
 ## How it works
 
@@ -151,7 +151,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package and all modules | 2026.10.16.1 (first version) |
-| Tested with | Python 3.10, NumPy 2.2, SciPy 1.15 (Linux, reference solver); Gmsh and CalculiX not yet |
+| Package, `bench.py` | 2026.10.16.2 (`lame_ring` as a 90-degree revolve; README: results of the first CalculiX run) |
+| Other modules | 2026.10.16.1 (first version) |
+| Tested with | CalculiX (Ubuntu calculix-ccx), Gmsh 4.15.2, Python 3.14 (carbonio); Python 3.10, NumPy 2.2, SciPy 1.15 (reference solver) |
 
-Author: Nicola Ferralis <ferralis@generalflash.com>
+Author: Nicola Ferralis <feranick@hotmail.com>

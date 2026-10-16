@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.10.16.1
+Version: 2026.10.16.2
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -15,7 +15,7 @@ build123d-translator goals meshed by Gmsh. Cases (E = 210 GPa, nu = 0.3 unless n
   slab            conduction 100 mm, 100 -> 0 C, k 50: Q = k A dT / L (exact)
   fin_end         conduction + end convection h 1000: Q = dT / (L/kA + 1/hA) (exact)
   fin_sides       square pin fin 100 mm, sides and tip convecting (h 50): 1-D fin with a convecting tip (1 %)
-  lame_ring       quarter ring ri 20, ro 40, 10 MPa inside, plane stress: Lame bore displacement
+  lame_ring       quarter ring (a 90-degree revolve) ri 20, ro 40, 10 MPa inside, plane stress: Lame bore displacement
                   and von Mises (2 %; Gmsh)
   plate_hole      quarter plate 200x50x2 with a 10 mm hole, net-section Kt = 2 + (1 - d/W)^3 (5 %; Gmsh, CalculiX)
 """
@@ -97,10 +97,12 @@ def cases(solver: str = "ccx") -> dict:
                               {"kind": "convection", "name": "air", "faces": [{"nx": 1}, {"ny": 1}, {"ny": -1}, {"nz": 1}, {"nz": -1}],
                                "h": hf, "T_inf": 0}],
                       "expect": [{"quantity": "heat_flow.base", "value": q_fin, "tol": 0.01}]},
+        # quarter ring: the section (r 20..40, z 0..10) revolved 90 degrees about Z, from +X to +Y
         "lame_ring": {"part": {"goal": {"features": [
-                          {"kind": "base_ring", "params": {"ri": ri, "ro": ro, "h": 10}},
-                          {"kind": "split", "params": {"nx": 1, "ny": 0, "nz": 0, "off": 0}},
-                          {"kind": "split", "params": {"nx": 0, "ny": 1, "nz": 0, "off": 0}}]}},
+                          {"kind": "profile_revolve", "params": {
+                              "outline": {"start": [ri, 0], "segs": [["L", ro, 0], ["L", ro, 10], ["L", ri, 10], ["L", ri, 0]]},
+                              "ax": 0, "ay": 0, "az": 1, "nx": 0, "ny": 1, "nz": 0, "off": 0, "x": 0, "y": 0, "z": 0,
+                              "angle": 90}}]}},
                       "material": "steel", "analysis": "static", "mesh": {"size": 2.5},
                       "bcs": [{"kind": "slider", "name": "sym_x", "faces": {"nx": -1}},
                               {"kind": "slider", "name": "sym_y", "faces": {"ny": -1}},
