@@ -15,6 +15,13 @@ pip install -e ".[mesh,mcp,test]"                          # numpy, scipy, gmsh,
 pip install -e ../build123d-translator                     # optional: parts as goals
 ```
 
+On **Linux ARM (aarch64**, e.g. DGX Spark) PyPI has no Gmsh wheels, so the `mesh` extra skips it; use Ubuntu's (Gmsh 4.12 on 24.04) and link its Python module into the venv (same Python version as the system's):
+
+```bash
+sudo apt install -y python3-gmsh
+ln -sf /usr/lib/python3/dist-packages/gmsh.py "$VIRTUAL_ENV/lib/python3.12/site-packages/gmsh.py"
+```
+
 CalculiX (`ccx`) is a separate program:
 
 - macOS: a Homebrew tap packages current ccx for Apple Silicon (`costerwi/calculix`, see its README for the exact formula name), or build it from source; then `ccx -v` should print the version.
@@ -154,7 +161,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `runner.py`, `deck.py` | 2026.10.16.8 (buckling: eigenvalue accuracy 1e-6 instead of CalculiX's 0.01, and one thread per buckling job: with one BLAS thread only, 1 of 4 concurrent `euler_column` runs still returned a wrong factor (20.8); a test runs four at once) |
+| Package, `pyproject.toml` | 2026.10.16.9 (the `mesh` extra skips Gmsh on Linux ARM, where PyPI has no wheels; README: Ubuntu's python3-gmsh linked into the venv) |
+| `runner.py`, `deck.py` | 2026.10.16.8 (buckling: eigenvalue accuracy 1e-6 instead of CalculiX's 0.01, and one thread per buckling job: with one BLAS thread only, 1 of 4 concurrent `euler_column` runs still returned a wrong factor (20.8); a test runs four at once) |
 | `runner.py`, `deck.py` (before) | 2026.10.16.7 (one BLAS thread per CalculiX job: Ubuntu's ccx links OpenBLAS, and a threaded OpenBLAS called from CalculiX's OpenMP code can give wrong eigenvalues; the pump test got a buckling factor of 10.07 for `euler_column`'s 674.7 while several studies ran at once; buckling asks for at least 4 factors and reports the requested number) |
 | `mesher.py`, `meshdata.py`, `runner.py` | 2026.10.16.6 (from the pump test: the DN250 nozzle, with 7-12 mm ligaments around 16 holes at 10-15 mm elements, failed with 'cannot match the mid-edge nodes' or CalculiX's 'nonpositive jacobian'; Gmsh's node order is now used directly instead of matching mid-edge nodes by distance, and inverted curved elements are straightened and reported) |
 | `runner.py`, `study.py` | 2026.10.16.5 (default `stress_band` two element sizes instead of one: in the second bracket test a one-element band moved 14 % on refinement, a two-element band 0.3 %; the convergence warning for `*_off_bc` points to `stress_band`) |
