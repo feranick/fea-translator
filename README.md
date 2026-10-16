@@ -24,7 +24,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 31 tests: 18 run anywhere, 13 need ccx (and Gmsh)
+pytest -q                      # 32 tests: 19 run anywhere, 13 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -106,7 +106,7 @@ The first CalculiX run confirmed what the translator assumes about it:
 ## How it works
 
 1. **Part:** the STEP (or the goal built to STEP).
-2. **Mesh** (`mesher.py`): Gmsh (OpenCascade import, one volume, second-order tetrahedra with mid-edge nodes on the geometry, refinement balls); nodes renumbered, corners oriented to a positive volume and mid-edge nodes put in CalculiX's order from their coordinates, so Gmsh's numbering never matters.
+2. **Mesh** (`mesher.py`): Gmsh (OpenCascade import, one volume, second-order tetrahedra with mid-edge nodes on the geometry, refinement balls); nodes renumbered, Gmsh's documented 10-node order mapped to CalculiX's (the last two mid-edge nodes swap), corners oriented to a positive volume; elements that Gmsh's curving left inverted or nearly so (thin ligaments relative to the element size) get straight edges, and the result says how many (`mesh.straightened_elements`, with a warning).
 3. **Faces** (`meshdata.py`): each Gmsh surface's boundary triangles matched to their element faces (S1..S4), outward normals from the element, areas, centres, planarity, cylinder fits; selectors resolved on this data.
 4. **Deck** (`deck.py`): nodes, elements, node sets per boundary condition, material, the step (`*STATIC`, `*FREQUENCY`, `*BUCKLE`, `*HEAT TRANSFER`), boundaries, loads (forces as consistent nodal loads of a uniform traction: 0 at triangle corners, A/3 at mid-edge nodes), outputs.
 5. **Solve:** `ccx -i <name>` (or the reference solver).
@@ -154,7 +154,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `runner.py`, `study.py` | 2026.10.16.5 (default `stress_band` two element sizes instead of one: in the second bracket test a one-element band moved 14 % on refinement, a two-element band 0.3 %; the convergence warning for `*_off_bc` points to `stress_band`) |
+| Package, `mesher.py`, `meshdata.py`, `runner.py` | 2026.10.16.6 (from the pump test: the DN250 nozzle, with 7-12 mm ligaments around 16 holes at 10-15 mm elements, failed with 'cannot match the mid-edge nodes' or CalculiX's 'nonpositive jacobian'; Gmsh's node order is now used directly instead of matching mid-edge nodes by distance, and inverted curved elements are straightened and reported) |
+| `runner.py`, `study.py` | 2026.10.16.5 (default `stress_band` two element sizes instead of one: in the second bracket test a one-element band moved 14 % on refinement, a two-element band 0.3 %; the convergence warning for `*_off_bc` points to `stress_band`) |
 | `api.py`, `cli.py`, `mcp_server.py`, `runner.py`, `deck.py`, `meshdata.py`, `study.py`, `bench.py` | 2026.10.16.4 (from the first agent test, a bracket designed with b3dt and analysed with feat: background runs, so fine meshes and `converge: true` no longer hit the MCP clients' call time limit (`run_studies` returns within ~45 s, `study_status` collects the rest; `feat status REQUEST`); `cyl_r` with `side: inner/outer` and a warning when one selector took a hole and corner fillets of the same radius, which it did silently; `selection` in every result; safety factor from the larger of the integration-point and nodal peaks (it used the nodal one, which can be lower); peaks and safety factor away from supports and loads, `peak_at_bc` and singularity warnings; `equation_solver` (iterative above 150k nodes)) |
 | `meshdata.py`, `runner.py` (before) | 2026.10.16.3 (face integrals isoparametric, as CalculiX computes them on curved 6-node faces: consistent pressure, traction, flux and film loads, face areas and means; body loads integrated over curved elements. The reaction correction on supports that touch a curved loaded face is now exact: `lame_ring` equilibrium error 1e-3 before) |
 | `bench.py` | 2026.10.16.2 (`lame_ring` as a 90-degree revolve; README: results of the first CalculiX run) |

@@ -1,5 +1,5 @@
 """meshdata.py — the mesh as CalculiX needs it: node ordering, boundary faces, face selection, loads.
-Version: 2026.10.16.4
+Version: 2026.10.16.6
 
 Pure NumPy (no Gmsh, no CalculiX), so every step from a mesh to the deck is testable on its own.
 
@@ -45,6 +45,63 @@ def order_elements(nodes: np.ndarray, corners: np.ndarray, mids: np.ndarray | No
     if not np.all(np.sort(pick, axis=1) == np.arange(6)):
         raise MeshError("cannot match the mid-edge nodes to the edges (badly curved elements?)")
     return np.concatenate([c, np.take_along_axis(m, pick, axis=1)], axis=1)
+
+
+GMSH_TET10 = [0, 1, 2, 3, 4, 5, 6, 7, 9, 8]   # Gmsh's 10-node tetrahedron -> CalculiX: the last two mid-edge nodes swap
+FLIP = [0, 2, 1, 3, 6, 5, 4, 7, 9, 8]         # swapping corners 2 and 3 (1-based) and their mid-edge nodes
+
+
+def order_known(nodes: np.ndarray, tets: np.ndarray) -> np.ndarray:
+    """Tetrahedra already in CalculiX's node order (mid-edge nodes on EDGES), oriented to a positive
+    corner volume. For meshes whose numbering is known (Gmsh, via GMSH_TET10): no geometric matching,
+    so strongly curved elements are handled too."""
+    t = np.array(tets, dtype=np.int64)
+    p = nodes[t[:, :4]]
+    det = np.einsum("ij,ij->i", np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), p[:, 3] - p[:, 0])
+    if np.any(np.abs(det) < 1e-300):
+        raise MeshError("degenerate tetrahedra (zero volume)")
+    neg = det < 0
+    if np.any(neg):
+        t[neg] = t[neg][:, FLIP] if t.shape[1] == 10 else t[neg][:, [0, 2, 1, 3]]
+    return t
+
+
+def min_jacobian(nodes: np.ndarray, tets: np.ndarray) -> np.ndarray:
+    """Smallest Jacobian determinant of each element (relative to its corner volume x 6) over its
+    corners, edge midpoints, centre and Gauss points; <= 0 means an inverted (tangled) element."""
+    Lc = np.eye(4)
+    Le = np.array([(np.eye(4)[a] + np.eye(4)[b]) / 2 for a, b in EDGES])
+    a_, b_ = 0.5854101966249685, 0.1381966011250105
+    Lg = np.array([[a_, b_, b_, b_], [b_, a_, b_, b_], [b_, b_, a_, b_], [b_, b_, b_, a_]])
+    L = np.vstack([Lc, Le, np.full((1, 4), 0.25), Lg])
+    _, dN = simplex_shape(L, tets.shape[1] == 10, EDGES)
+    X = nodes[tets]
+    J = np.einsum("qnj,enk->eqjk", dN[:, :, 1:] - dN[:, :, :1], X)
+    det = np.linalg.det(J)
+    p = X[:, :4]
+    ref = np.einsum("ij,ij->i", np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), p[:, 3] - p[:, 0])
+    return det.min(axis=1) / np.maximum(np.abs(ref), 1e-300)
+
+
+def straighten_inverted(nodes: np.ndarray, tets: np.ndarray, threshold: float = 0.05, rounds: int = 10):
+    """Moves the mid-edge nodes of inverted or nearly inverted quadratic elements onto their straight
+    edges (an element with straight edges and positive corner volume is always valid). Returns the new
+    node coordinates and how many elements were straightened. A curved second-order mesher can tangle
+    elements in thin ligaments relative to the element size; this keeps them usable."""
+    if tets.shape[1] != 10:
+        return nodes, 0
+    nodes = nodes.copy()
+    fixed = np.zeros(len(tets), bool)
+    for _ in range(rounds):
+        bad = min_jacobian(nodes, tets) <= threshold
+        if not bad.any():
+            return nodes, int(fixed.sum())
+        for k, (a, b) in enumerate(EDGES):
+            e = tets[bad]
+            nodes[e[:, 4 + k]] = (nodes[e[:, a]] + nodes[e[:, b]]) / 2
+        fixed |= bad
+    raise MeshError("inverted elements remain after straightening their edges (corner volumes are positive, "
+                    "so this should not happen): try a smaller mesh size")
 
 
 def tet_volumes(nodes: np.ndarray, tets: np.ndarray) -> np.ndarray:

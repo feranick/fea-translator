@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.16.5
+Version: 2026.10.16.6
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -341,6 +341,11 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
         if res.get("heat_balance_error", 0) > 1e-2:
             warn.append(f"heat balance error {res['heat_balance_error']:.2g}")
         warn += res.pop("_selection_warnings", [])
+        ns = res.get("mesh", {}).get("straightened_elements", 0)
+        if ns:
+            warn.append(f"{ns} curved second-order elements were inverted after meshing and were straightened "
+                        "(their mid-edge nodes moved onto straight edges): there are features thin for the "
+                        "element size; stresses right there are approximate; refine near them (mesh.refine)")
         if res.get("peak_at_bc"):
             at = res["peak_at_bc"]
             where = ", ".join(at) if isinstance(at, list) else "a support or load"

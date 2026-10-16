@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.16.4
+Version: 2026.10.16.6
 """
 import shutil
 from pathlib import Path
@@ -277,3 +277,24 @@ def test_bracket_hole_vs_corner_fillets(tmp_path):
     _, plan = deck.write("b", st, mesh)
     assert any("side: 'inner'" in w for w in plan["selection_warnings"])
     assert len(plan["selection"]["load"]) == 5
+
+
+def test_gmsh_order_flip_and_straightening():
+    """Gmsh's tet10 numbering (last two mid-edge nodes swapped), negative orientation, and an element
+    inverted by a mid-edge node pushed through the opposite face (as curving does in thin ligaments)."""
+    from fea_translator.meshdata import GMSH_TET10, min_jacobian, order_known, straighten_inverted
+
+    m = box_mesh(10, 10, 10, 2, 2, 2, origin=(0, 0, 0))
+    gm = m.tets[:, GMSH_TET10]                       # as Gmsh would number them
+    t = order_known(m.nodes, gm[:, GMSH_TET10])
+    assert np.array_equal(t, m.tets)
+    flipped = m.tets[:, [0, 2, 1, 3, 6, 5, 4, 7, 9, 8]]   # negative volume, consistent mid-edge nodes
+    assert np.array_equal(order_known(m.nodes, flipped), m.tets)
+    assert min_jacobian(m.nodes, m.tets).min() > 0.99
+    nodes = m.nodes.copy()
+    e = m.tets[0]
+    nodes[e[4]] = nodes[e[3]] + 1.5 * (nodes[e[3]] - (nodes[e[0]] + nodes[e[1]]) / 2)  # tangle element 0
+    assert min_jacobian(nodes, m.tets)[0] <= 0
+    fixed, n = straighten_inverted(nodes, m.tets)
+    assert n >= 1 and min_jacobian(fixed, m.tets).min() > 0.05
+    assert np.allclose(fixed[e[4]], (fixed[e[0]] + fixed[e[1]]) / 2)

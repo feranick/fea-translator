@@ -1,5 +1,5 @@
 """mesher.py — the part as a tetrahedral mesh: Gmsh from a STEP file (or a build123d-translator goal).
-Version: 2026.10.16.1
+Version: 2026.10.16.6
 
     mesh_part(study, workdir) -> (Mesh, info)
 
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .meshdata import Mesh, MeshError, box_mesh, order_elements
+from .meshdata import GMSH_TET10, Mesh, MeshError, box_mesh, order_known, straighten_inverted
 
 TET = {4: (1, 4), 11: (2, 10)}     # Gmsh element type -> (order, nodes)
 TRI = {2: 3, 9: 6}
@@ -115,9 +115,15 @@ def mesh_step(step: Path, size: float | None = None, order: int = 2, refine=(), 
     nodes = nodes_all[used]
     tets = remap[tets]
     surfaces = {k: remap[v] for k, v in surfaces.items()}
-    t4, mids = tets[:, :4], (tets[:, 4:] if tets.shape[1] == 10 else None)
-    mesh = Mesh(nodes, order_elements(nodes, t4, mids), surfaces, info).build()
-    return mesh, {"size": h, "diag": diag, "nodes": len(nodes), "elements": len(tets), "order": order}
+    # Gmsh's node order is documented: use it (matching mid-edge nodes by distance fails on strongly
+    # curved elements); then straighten the few elements Gmsh's curving left inverted
+    if tets.shape[1] == 10:
+        tets = tets[:, GMSH_TET10]
+    tets = order_known(nodes, tets)
+    nodes, straightened = straighten_inverted(nodes, tets)
+    mesh = Mesh(nodes, tets, surfaces, info).build()
+    return mesh, {"size": h, "diag": diag, "nodes": len(nodes), "elements": len(tets), "order": order,
+                  "straightened_elements": straightened}
 
 
 def mesh_part(study: dict, workdir: Path, size_factor: float = 1.0) -> tuple[Mesh, dict]:
