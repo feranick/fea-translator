@@ -1,5 +1,5 @@
 """deck.py — a study and its mesh as a CalculiX input deck (.inp).
-Version: 2026.10.16.1
+Version: 2026.10.16.4
 
     text, plan = write(name, study, mesh)
 
@@ -34,6 +34,33 @@ def _lines(ids, per: int = 10) -> list[str]:
     return [", ".join(str(i) for i in ids[k:k + per]) for k in range(0, len(ids), per)]
 
 
+def _mixed(sel, faces: list[dict]) -> str | None:
+    """A warning when one selector took faces of different kinds (a hole and fillets of the same radius)."""
+    sels = sel if isinstance(sel, list) else [sel]
+    if len(faces) < 2 or not any("cyl_r" in s and "side" not in s and "at" not in s for s in sels):
+        return None
+    holes = sum(1 for f in faces if f.get("side") == "inner")
+    other = len(faces) - holes
+    if holes and other:
+        return (f"cyl_r took {holes} hole face(s) and {other} convex face(s) (shafts or outside fillets of the same "
+                "radius); add side: 'inner' for holes only, or at: [x, y, z]")
+    return None
+
+
+def selection_report(study: dict, mesh: Mesh, tags: dict) -> tuple[dict, list[str]]:
+    """What each selector matched (kind, radius, side, area, centre per face), and warnings."""
+    rep, warn = {}, []
+    sels = {bc_name(i, b): b["faces"] for i, b in enumerate(study.get("bcs", [])) if "faces" in b}
+    sels.update({"probe:" + p["name"]: p["faces"] for p in study.get("probes", [])})
+    for name, tg in tags.items():
+        faces = [mesh.groups[t].describe() for t in tg]
+        rep[name.replace("probe:", "probe ")] = faces
+        w = _mixed(sels.get(name, {}), faces)
+        if w:
+            warn.append(f"{name}: {w}")
+    return rep, warn
+
+
 def resolve(study: dict, mesh: Mesh) -> dict:
     """Surface tags of every bc and probe: {name: [tags]}; MeshError if a selector matches nothing."""
     out = {}
@@ -49,6 +76,20 @@ def resolve(study: dict, mesh: Mesh) -> dict:
         except MeshError as exc:
             raise MeshError(f"probe {pr['name']}: {exc}") from None
     return out
+
+
+ITERATIVE_ABOVE = 150_000  # nodes: above this, static and thermal use CalculiX's iterative solver
+
+
+def equation_solver(study: dict, n_nodes: int) -> str:
+    """'direct' (SPOOLES) or 'iterative' (preconditioned conjugate gradients: much less memory and time
+    on large solid meshes); eigenvalue analyses (modal, buckling) always use the direct solver."""
+    choice = study.get("equation_solver", "auto")
+    if study["analysis"] not in ("static", "thermal"):
+        return "direct"
+    if choice == "auto":
+        return "iterative" if n_nodes > ITERATIVE_ABOVE else "direct"
+    return choice
 
 
 def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
@@ -86,8 +127,11 @@ def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
         L += ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"NALL, {_g(sum(temps) / len(temps))}"]
     L.append("*STEP")
     modes = int(study.get("modes", 6 if an == "modal" else 3))
-    L += {"static": ["*STATIC"], "modal": ["*FREQUENCY", str(modes)], "buckling": ["*BUCKLE", str(modes)],
-          "thermal": ["*HEAT TRANSFER, STEADY STATE", "1., 1."]}[an]
+    method = equation_solver(study, len(mesh.nodes))
+    plan["equation_solver"] = method
+    opt = ", SOLVER=ITERATIVE CHOLESKY" if method == "iterative" else ""
+    L += {"static": [f"*STATIC{opt}"], "modal": ["*FREQUENCY", str(modes)], "buckling": ["*BUCKLE", str(modes)],
+          "thermal": [f"*HEAT TRANSFER, STEADY STATE{opt}", "1., 1."]}[an]
     bnd, cload, dload, dflux, film = [], {}, [], [], []
     for i, bc in enumerate(study.get("bcs", [])):
         k, bname = bc["kind"], bc_name(i, bc)
@@ -171,4 +215,5 @@ def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
         L += ["*NODE FILE", "U"]
     L.append("*END STEP")
     plan["n_nodes"], plan["n_elements"], plan["element"] = len(mesh.nodes), len(mesh.tets), etype
+    plan["selection"], plan["selection_warnings"] = selection_report(study, mesh, tags)
     return "\n".join(L) + "\n", plan

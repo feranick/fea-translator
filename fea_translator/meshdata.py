@@ -1,5 +1,5 @@
 """meshdata.py — the mesh as CalculiX needs it: node ordering, boundary faces, face selection, loads.
-Version: 2026.10.16.3
+Version: 2026.10.16.4
 
 Pure NumPy (no Gmsh, no CalculiX), so every step from a mesh to the deck is testable on its own.
 
@@ -123,7 +123,7 @@ TRI_EDGES = ((0, 1), (1, 2), (2, 0))
 
 
 def fit_cylinder(pts: np.ndarray, normals: np.ndarray, rtol: float = 2e-3):
-    """(radius, axis direction) if the points lie on a cylinder (the normals are all normal to one
+    """(radius, axis direction, point on the axis) if the points lie on a cylinder (the normals are all normal to one
     axis and the points are on a circle around it), else None."""
     if len(pts) < 6:
         return None
@@ -158,7 +158,25 @@ def fit_cylinder(pts: np.ndarray, normals: np.ndarray, rtol: float = 2e-3):
     r = abs(float(fit.x[4]))
     a = axis + fit.x[0] * e1 + fit.x[1] * e2
     a /= np.linalg.norm(a)
-    return (r, a) if np.abs(fit.fun).max() <= rtol * r else None
+    c = fit.x[2] * e1 + fit.x[3] * e2
+    return (r, a, c) if np.abs(fit.fun).max() <= rtol * r else None
+
+
+def cylinder_side(centroids: np.ndarray, normals: np.ndarray, areas: np.ndarray, axis, centre) -> tuple[bool, float]:
+    """(concave, arc in degrees) of a cylindrical face: concave when the outward normals point to
+    the axis (holes, bores), convex otherwise (shafts, bosses, fillets on outside corners)."""
+    d = centroids - centre
+    radial = d - np.outer(d @ axis, axis)
+    radial /= np.maximum(np.linalg.norm(radial, axis=1), 1e-300)[:, None]
+    concave = bool(np.sum(areas * np.einsum("ij,ij->i", radial, normals)) < 0)
+    e1 = np.cross(axis, [1.0, 0, 0] if abs(axis[0]) < 0.9 else [0, 1.0, 0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(axis, e1)
+    ang = np.sort(np.degrees(np.arctan2(radial @ e2, radial @ e1)) % 360)
+    gaps = np.diff(np.concatenate([ang, [ang[0] + 360]]))
+    arc = float(360 - gaps.max()) if len(ang) > 1 else 0.0
+    # triangle centroids sit inside the face: a closed cylinder leaves only small gaps
+    return concave, (360.0 if gaps.max() < 30 else arc)
 
 
 @dataclass
@@ -187,6 +205,17 @@ class FaceGroup:
     def planar(self) -> bool:
         n0 = self.normal[0]
         return bool(np.all(self.normal @ n0 > 1 - 1e-6))
+
+    def describe(self) -> dict:
+        d = {"kind": self.kind, "area": round(self.total_area, 4), "center": np.round(self.center, 4).tolist()}
+        if self.planar:
+            d["kind"], d["normal"] = "plane", np.round(self.normal[0], 4).tolist()
+        if self.radius:
+            d["radius"] = round(float(self.radius), 4)
+            if getattr(self, "concave", None) is not None:
+                d["side"] = "inner" if self.concave else "outer"
+                d["arc_deg"] = round(float(self.arc), 1)
+        return d
 
     def nodes(self) -> np.ndarray:
         return np.unique(self.corners if self.mids is None else np.concatenate([self.corners, self.mids], axis=1))
@@ -261,6 +290,7 @@ class Mesh:
                 fit = fit_cylinder(self.nodes[np.unique(cor)], g.normal)
                 if fit is not None:
                     g.kind, g.radius, g.axis = "Cylinder", fit[0], fit[1]
+                    g.concave, g.arc = cylinder_side(g.centroid, g.normal, g.area, fit[1], fit[2])
             self.groups[tag] = g
         return self
 
@@ -309,6 +339,9 @@ class Mesh:
         if "cyl_r" in sel:
             r = float(sel["cyl_r"])
             cands = [g for g in groups if g.kind.lower().startswith("cyl") and g.radius and abs(g.radius - r) <= 0.01 * r]
+            side = sel.get("side")
+            if side in ("inner", "outer"):
+                cands = [g for g in cands if getattr(g, "concave", None) is (side == "inner")]
             if not cands:
                 radii = sorted({round(g.radius, 3) for g in groups if g.kind.lower().startswith("cyl") and g.radius})
                 raise MeshError(f"no cylindrical face of radius {r:g}; radii here: {radii}")

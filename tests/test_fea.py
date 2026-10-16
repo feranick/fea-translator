@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.16.3
+Version: 2026.10.16.4
 """
 import shutil
 from pathlib import Path
@@ -53,7 +53,7 @@ def test_cylinder_fit():
     th, z = rng.uniform(0, np.pi, 200), rng.uniform(0, 20, 200)
     p = np.column_stack([4 * np.cos(th) + 3, 4 * np.sin(th) - 2, z])
     n = np.column_stack([np.cos(th), np.sin(th), rng.normal(0, 0.02, 200)])
-    r, axis = fit_cylinder(p, n / np.linalg.norm(n, axis=1)[:, None])
+    r, axis, _ = fit_cylinder(p, n / np.linalg.norm(n, axis=1)[:, None])
     assert abs(r - 4) < 1e-9 and abs(abs(axis[2]) - 1) < 1e-9
     assert fit_cylinder(np.column_stack([th, z, z * 0]), np.tile([0, 0, 1.0], (200, 1))) is None
 
@@ -174,7 +174,7 @@ def test_gmsh_mesh_of_a_goal(tmp_path):
 def test_cli_status_runs():
     from fea_translator import api
 
-    s = api.status()
+    s = api.tool_status()
     assert "translator" in s and s["default_solver"] in ("ccx", "ref")
     assert shutil.which("python3") or True
     assert Path(__file__).is_file()
@@ -203,3 +203,77 @@ def test_curved_quarter_ring_reference_solver(tmp_path):
     want = next(e["value"] for e in st["expect"] if e["quantity"] == "max_displacement")
     assert abs(res["max_displacement"] - want) < 1e-3 * want
     assert res["equilibrium_error"] < 1e-6
+
+
+def _ring(ri=20.0, ro=40.0):
+    import math
+
+    from fea_translator.meshdata import Mesh
+
+    b = box_mesh(ro - ri, 1.0, 10, 4, 8, 2, origin=(0, 0, 0))
+    r, th = ri + b.nodes[:, 0], b.nodes[:, 1] * math.pi / 2
+    return Mesh(np.column_stack([r * np.cos(th), r * np.sin(th), b.nodes[:, 2]]), b.tets, b.surfaces).build()
+
+
+def test_cylinders_inner_outer_and_selection_report():
+    from fea_translator.meshdata import MeshError, cylinder_side
+
+    m = _ring()
+    bore, outer = m.groups[1], m.groups[2]
+    assert bore.concave and not outer.concave and abs(bore.arc - 90) < 10 and abs(outer.arc - 90) < 10
+    assert m.select({"cyl_r": 20, "side": "inner"}) == [1]
+    with pytest.raises(MeshError):
+        m.select({"cyl_r": 20, "side": "outer"})
+    th = np.linspace(0, 2 * np.pi, 72, endpoint=False)
+    c = np.column_stack([np.cos(th), np.sin(th), 0 * th])
+    assert cylinder_side(4 * c, -c, np.ones(72), np.array([0, 0, 1.0]), np.zeros(3)) == (True, 360.0)
+    # a hole and convex fillets of one radius under one cyl_r: reported, with a warning
+    w = deck._mixed({"cyl_r": 4}, [{"side": "inner"}, {"side": "outer"}, {"side": "outer"}])
+    assert w and "side: 'inner'" in w
+    assert deck._mixed({"cyl_r": 4, "side": "inner"}, [{"side": "inner"}]) is None
+    st = dict(bench.cases("ref")["lame_ring"], part={"box": [1, 1, 1]})
+    _, plan = deck.write("ring", st, m)
+    assert plan["selection"]["bore"][0]["side"] == "inner" and plan["selection"]["bore"][0]["radius"] == 20.0
+    assert validate_study(dict(st, bcs=[dict(st["bcs"][0], faces={"nx": -1, "side": "inner"})]))["ok"] is False
+
+
+def test_background_run_status_and_peak_at_support(tmp_path, monkeypatch):
+    from fea_translator import api
+
+    monkeypatch.setenv("FEAT_OUT", str(tmp_path))
+    c = bench.cases("ref")
+    r = api.run({"cant": c["cantilever"], "bad": {"part": {"box": [1, 1, 1]}, "analysis": "static"}}, "ref", wait=0)
+    assert r["studies"]["bad"]["why"] == "invalid study" and "request" in r
+    r = api.status(r["request"], wait=120)
+    assert r["done"] and r["studies"]["cant"]["ok"]
+    cr = r["studies"]["cant"]
+    assert cr["peak_at_bc"] == ["wall"] and cr["peak_von_mises_off_bc"] < cr["peak_von_mises"]
+    assert cr["safety_factor"] == round(250 / cr["peak_von_mises"], 4)
+    assert any("singular" in w for w in cr["warnings"])
+    assert cr["selection"]["wall"][0]["kind"] == "plane"
+
+
+@pytest.mark.skipif(not HAVE_GMSH, reason="Gmsh not installed")
+def test_bracket_hole_vs_corner_fillets(tmp_path):
+    """The user's bracket: an r 4 load hole and r 4 corner fillets. cyl_r 4 takes all five faces
+    and warns; side: 'inner' takes only the hole."""
+    pytest.importorskip("build123d_translator")
+    from fea_translator.mesher import mesh_part
+
+    goal = {"features": [
+        {"kind": "base_box", "params": {"w": 120, "d": 40, "h": 8}},
+        {"kind": "hole_cb", "params": {"r": 3.2, "cbr": 5.5, "cbd": 3.5, "x": -45, "y": 12}},
+        {"kind": "mirror", "params": {"ax": 0, "ay": 1, "az": 0}},
+        {"kind": "hole", "params": {"r": 4, "x": 45, "y": 0}},
+        {"kind": "fillet_vertical", "params": {"r": 4}},
+        {"kind": "chamfer_top", "params": {"size": 0.5}}]}
+    st = {"part": {"goal": goal}, "material": "aluminium_6061_t6", "analysis": "static", "mesh": {"size": 3},
+          "bcs": [{"kind": "fixed", "name": "bolts", "faces": {"cyl_r": 3.2, "side": "inner"}},
+                  {"kind": "force", "name": "load", "faces": {"cyl_r": 4}, "fz": -500}]}
+    mesh, _ = mesh_part(st, tmp_path)
+    assert len(mesh.select({"cyl_r": 4})) == 5
+    assert len(mesh.select({"cyl_r": 4, "side": "inner"})) == 1
+    assert len(mesh.select({"cyl_r": 3.2, "side": "inner"})) == 2
+    _, plan = deck.write("b", st, mesh)
+    assert any("side: 'inner'" in w for w in plan["selection_warnings"])
+    assert len(plan["selection"]["load"]) == 5

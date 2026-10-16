@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.10.16.2
+Version: 2026.10.16.4
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -107,8 +107,8 @@ def cases(solver: str = "ccx") -> dict:
                       "bcs": [{"kind": "slider", "name": "sym_x", "faces": {"nx": -1}},
                               {"kind": "slider", "name": "sym_y", "faces": {"ny": -1}},
                               {"kind": "slider", "name": "base", "faces": {"nz": -1}},
-                              {"kind": "pressure", "name": "bore", "faces": {"cyl_r": ri}, "p": p}],
-                      "probes": [{"name": "bore", "faces": {"cyl_r": ri}}],
+                              {"kind": "pressure", "name": "bore", "faces": {"cyl_r": ri, "side": "inner"}, "p": p}],
+                      "probes": [{"name": "bore", "faces": {"cyl_r": ri, "side": "inner"}}],
                       "expect": [{"quantity": "max_displacement", "value": math.hypot(ur, NU / E * (s_t + s_r) * 10), "tol": 0.02},
                                  {"quantity": "max_von_mises_nodal", "value": vm_bore, "tol": 0.02} if solver == "ccx" else
                                  {"quantity": "max_von_mises", "value": vm_bore, "tol": 0.04}]},

@@ -1,13 +1,16 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.16.1
+Version: 2026.10.16.4
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
-    run(studies, solver)             meshes, solves and checks each study; files in a request folder
+    run(studies, solver, wait)       meshes, solves and checks each study; files in a request folder;
+                                     with wait, returns after that many seconds with the rest pending
+    start(studies, solver)           the same in the background: returns the request folder
+    status(request, wait)            finished studies with results, the others pending
     deck(study, name)                the CalculiX input deck of one study, as text (meshes the part)
     bench(names, solver)             the benchmark studies with closed-form answers
     read_file(path)                  a written file as base64 (only under the output folder)
-    status()                         versions, solver and mesher found
+    tool_status()                    versions, solver and mesher found
 
 Studies run in worker processes with a time limit each. Environment: FEAT_OUT (default
 ~/feat_runs), FEAT_WORKERS (2), FEAT_TIMEOUT (seconds per study, 900), FEAT_CCX (path of ccx),
@@ -43,7 +46,7 @@ def _solver(solver: str | None) -> str:
     return s
 
 
-def status() -> dict:
+def tool_status() -> dict:
     from .runner import find_ccx
 
     out = {"translator": __version__, "ccx": find_ccx(), "default_solver": _solver(None)}
@@ -61,7 +64,7 @@ def status() -> dict:
 
 
 def study_format() -> dict:
-    return {**_format(), "translator": __version__, "status": status()}
+    return {**_format(), "translator": __version__, "status": tool_status()}
 
 
 def validate(studies: dict) -> dict:
@@ -80,28 +83,19 @@ def _run_one(job: dict) -> dict:
 
 
 class _Pool:
+    """Worker processes that live across calls; jobs run in the background and write
+    <request>/<name>/<name>.json when done, so their status can be read at any time."""
+
     def __init__(self):
         self.pool = None
+        self.jobs: dict[str, dict] = {}   # request folder -> {name: AsyncResult}
 
-    def run(self, jobs: list[dict]) -> list[dict]:
+    def submit(self, folder: Path, jobs: list[dict]) -> None:
         workers = int(os.environ.get("FEAT_WORKERS", "2"))
         timeout = float(os.environ.get("FEAT_TIMEOUT", "900"))
         if self.pool is None:
             self.pool = mp.get_context("spawn").Pool(workers, maxtasksperchild=20)
-        pending = [self.pool.apply_async(_run_one, (dict(j, timeout=timeout),)) for j in jobs]
-        out, broken = [], False
-        for res in pending:
-            try:
-                out.append(res.get(timeout=timeout + 60))
-            except mp.TimeoutError:
-                broken = True
-                out.append({"ok": False, "why": f"time limit ({timeout:g} s) exceeded"})
-            except Exception as exc:  # noqa: BLE001
-                out.append({"ok": False, "why": "worker failed", "error": str(exc)[:500]})
-        if broken:
-            self.pool.terminate()
-            self.pool = None
-        return out
+        self.jobs[str(folder)] = {j["name"]: self.pool.apply_async(_run_one, (dict(j, timeout=timeout),)) for j in jobs}
 
 
 _POOL = _Pool()
@@ -113,26 +107,79 @@ def _request_dir(prefix: str) -> Path:
     return d
 
 
-def run(studies: dict, solver: str | None = None) -> dict:
-    """Runs the studies into a new request folder under FEAT_OUT: per study <name>/<name>.inp,
-    .dat, .frd (CalculiX), mesh.msh, part.step, <name>.json; and studies.json, results.json."""
+def _collect(folder: Path) -> dict:
+    """Status of every study of a request: finished ones with their results."""
+    meta = json.loads((folder / "request.json").read_text())
+    handles = _POOL.jobs.get(str(folder), {})
+    out, pending = dict(meta.get("invalid", {})), []
+    for name in meta["names"]:
+        f = folder / name / f"{name}.json"
+        h = handles.get(name)
+        if f.is_file() and (h is None or h.ready()):
+            try:
+                out[name] = json.loads(f.read_text())
+                continue
+            except json.JSONDecodeError:
+                pass
+        if h is not None and h.ready():
+            try:
+                out[name] = h.get()
+            except Exception as exc:  # noqa: BLE001
+                out[name] = {"ok": False, "why": "worker failed", "error": str(exc)[:500]}
+        elif h is None:
+            out[name] = {"ok": False, "why": "not finished and not running here (the server restarted?); run it again"}
+        else:
+            pending.append(name)
+    started = meta.get("started", time.time())
+    res = {"request": str(folder), "translator": __version__, "solver": meta["solver"], "done": not pending,
+           "pending": pending, "elapsed_s": round(time.time() - started, 1), "studies": out}
+    if pending:
+        res["next"] = f"call study_status(request='{folder}') to collect the rest"
+    else:
+        (folder / "results.json").write_text(json.dumps(res, indent=1))
+    return res
+
+
+def start(studies: dict, solver: str | None = None) -> Path:
+    """Validates and starts the studies in the background; returns the request folder."""
     folder = _request_dir("run")
     (folder / "studies.json").write_text(json.dumps(studies, indent=1))
     s = _solver(solver)
-    out, jobs = {}, []
+    invalid, jobs = {}, []
     for n, st in studies.items():
         v = validate_study(st)
         if not v["ok"]:
-            out[n] = {"ok": False, "why": "invalid study", "errors": v["errors"]}
+            invalid[n] = {"ok": False, "why": "invalid study", "errors": v["errors"]}
         else:
             jobs.append({"name": n, "study": st, "folder": str(folder), "solver": s})
-    t0 = time.perf_counter()
-    for j, r in zip(jobs, _POOL.run(jobs)):
-        out[j["name"]] = r
-    res = {"request": str(folder), "translator": __version__, "solver": s,
-           "seconds": round(time.perf_counter() - t0, 3), "studies": out}
-    (folder / "results.json").write_text(json.dumps(res, indent=1))
-    return res
+    (folder / "request.json").write_text(json.dumps({"names": [j["name"] for j in jobs], "invalid": invalid,
+                                                     "solver": s, "started": time.time()}))
+    if jobs:
+        _POOL.submit(folder, jobs)
+    return folder
+
+
+def status(request: str, wait: float = 0.0) -> dict:
+    """The studies of a request: finished ones with results, the others pending. Waits up to
+    `wait` seconds for the pending ones to finish."""
+    folder = Path(request).expanduser()
+    if not (folder / "request.json").is_file():
+        return {"error": f"no request {folder}"}
+    t_end = time.time() + max(0.0, float(wait))
+    while True:
+        res = _collect(folder)
+        if res["done"] or time.time() >= t_end:
+            return res
+        time.sleep(1.0)
+
+
+def run(studies: dict, solver: str | None = None, wait: float | None = None) -> dict:
+    """Runs the studies into a new request folder under FEAT_OUT: per study <name>/<name>.inp,
+    .dat, .frd (CalculiX), mesh.msh, part.step, <name>.json; and studies.json, results.json.
+    Waits for all of them (wait None) or at most `wait` seconds; then the unfinished ones are
+    listed as pending and status(request) collects them later."""
+    folder = start(studies, solver)
+    return status(str(folder), 1e9 if wait is None else wait)
 
 
 def deck(study: dict, name: str = "study") -> dict:

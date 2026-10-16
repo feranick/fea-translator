@@ -39,7 +39,8 @@
     "kind": "force",
     "name": "load",
     "faces": {
-     "cyl_r": 4
+     "cyl_r": 4,
+     "side": "inner"
     },
     "fz": -200
    }

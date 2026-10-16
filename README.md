@@ -24,7 +24,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 28 tests: 16 run anywhere, 12 need ccx (and Gmsh)
+pytest -q                      # 31 tests: 18 run anywhere, 13 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -34,11 +34,12 @@ feat bench                     # every benchmark, pass/fail against closed-form 
 feat format > study_format.json          # analyses, materials, bc kinds, selectors, conventions, example
 feat validate examples/studies.json      # static checks
 feat run examples/studies.json           # mesh, solve, check; files in ~/feat_runs/run_<time>/
+feat status ~/feat_runs/run_<time>       # results of a request (finished and still running studies)
 feat deck examples/studies.json bracket_static   # the CalculiX deck only
 feat bench lame_ring plate_hole          # chosen benchmarks
 ```
 
-Every command prints JSON; `-` reads the studies from stdin. Output folder: `FEAT_OUT` (default `~/feat_runs`); `FEAT_WORKERS` (2) worker processes, `FEAT_TIMEOUT` (900 s per study), `FEAT_SOLVER` (auto | ccx | ref).
+Every command prints JSON; `-` reads the studies from stdin. `feat run` waits for all studies; the MCP `run_studies` returns within about 45 s and leaves long studies `pending` (see below). Output folder: `FEAT_OUT` (default `~/feat_runs`); `FEAT_WORKERS` (2) worker processes, `FEAT_TIMEOUT` (900 s per study), `FEAT_SOLVER` (auto | ccx | ref).
 
 Per study the folder holds `part.step`, `mesh.msh`, `<name>.inp` (the deck; runs with `ccx -i <name>` on its own), `<name>.dat` and `<name>.frd` (CalculiX results; `.frd` opens in CalculiX GraphiX, FreeCAD, or ParaView via ccx2paraview) and `<name>.json` (the results below).
 
@@ -53,28 +54,29 @@ Per study the folder holds `part.step`, `mesh.msh`, `<name>.inp` (the deck; runs
   "analysis": "static",
   "mesh": {"size": 3},
   "bcs": [{"kind": "fixed", "name": "wall", "faces": {"nx": -1}},
-          {"kind": "force", "name": "load", "faces": {"cyl_r": 4}, "fz": -200}],
+          {"kind": "force", "name": "load", "faces": {"cyl_r": 4, "side": "inner"}, "fz": -200}],
   "probes": [{"name": "tip", "faces": {"nx": 1}}]}}
 ```
 
 - **Units:** mm, N, MPa; density kg/m³; conductivity W/(m K); film coefficient W/(m² K); heat flux W/m²; heat W; °C; gravity m/s². The deck uses mm, N, s, t, mW; the conversions are in `study.py`.
 - **Part:** `{"step": path}` (mm) or `{"goal": ...}` (built with build123d-translator); `{"box": [lx, ly, lz]}` is a structured box mesh without Gmsh (tests, quick checks).
 - **Material:** a name (steel, stainless_304, aluminium_6061_t6, titanium_ti6al4v, copper, brass, cast_iron, abs, pla, nylon_pa6; typical values) or `{E, nu, density, k, alpha, yield}`, or a name with overrides `{"name": "steel", "yield": 355}`.
-- **Faces** (as build123d-translator): `{nx, ny, nz}` the largest planar face with that outward normal (`at` for the nearest one), `{pts: [[x, y, z], ...]}` the face nearest to each point, `{cyl_r: r}` every cylindrical face of radius r (bolt holes; found by fitting the mesh, so it does not depend on how the STEP describes the surface), `{all: true}`; a list is their union.
+- **Faces** (as build123d-translator): `{nx, ny, nz}` the largest planar face with that outward normal (`at` for the nearest one), `{pts: [[x, y, z], ...]}` the face nearest to each point, `{cyl_r: r}` every cylindrical face of radius r (found by fitting the mesh, so it does not depend on how the STEP describes the surface; `side: "inner"` for holes and bores only, `"outer"` for shafts, bosses and outside fillets, which otherwise match too: a 4 mm hole and 4 mm corner fillets are all `cyl_r: 4`), `{all: true}`; a list is their union. Every result lists what each selector took (`selection`: kind, radius, side, arc, area, centre per face), with a warning when one `cyl_r` takes holes and convex faces together.
 - **Boundary conditions:** `fixed`, `slider` (normal displacement zero: symmetry planes, rollers), `displacement` (prescribed components); loads `force` (a total force spread uniformly over the faces' area), `pressure` (normal, positive into the part), `gravity`; thermal `temperature`, `heat_flux`, `heat` (total watts on faces), `convection`.
 - **Mesh:** `size` (mm; default 1/20 of the bounding-box diagonal), `order` 2 (10-node tetrahedra, default; 4-node ones are far too stiff in bending), `refine: [{at, r, size}]` finer spheres at stress concentrations. `converge: true` reruns at 0.6 × size and reports the change of the main results.
+- **Large meshes:** `equation_solver`: `auto` (CalculiX's iterative Cholesky-preconditioned solver above 150,000 nodes for static and thermal, else the direct one), `direct` or `iterative`.
 - **Checks:** `expect: [{quantity, value, tol}]` with a dotted path into the results (`max_displacement`, `max_von_mises_nodal`, `frequencies.0`, `critical_factor`, `reactions.wall.fz`, `faces.load.mean_u.uz`, `probes.tip.mean_u.uz`, `heat_flow.base`, `T_max`...).
 
 ### Results
 
 | Analysis | Results |
 |---|---|
-| static | `max_displacement` (+ where, per component), `max_von_mises` (integration points), `max_von_mises_nodal` (CalculiX's nodal values), `safety_factor` (yield / peak), `reactions` per support, `faces` and `probes` (area-weighted mean displacement, largest), `applied_force`, `equilibrium_error`, `mass_kg` |
+| static | `max_displacement` (+ where, per component), `max_von_mises` (integration points) and `max_von_mises_nodal` (CalculiX's nodal values), with where; `peak_von_mises` (the larger of the two) and `safety_factor` (yield / that peak); `peak_von_mises_off_bc` and `safety_factor_off_bc` (leaving out the material within `stress_band`, default one element size, of supports and loads, where stresses are singular); `peak_at_bc` (the supports or loads the peak sits on); `reactions` per support, `faces` and `probes` (area-weighted mean displacement, largest), `applied_force`, `equilibrium_error`, `mass_kg` |
 | modal | `frequencies` (Hz), `mass_kg` |
 | buckling | `buckling_factors`, `critical_factor` (critical load = factor × the applied loads) |
 | thermal | `T_max`, `T_min` (+ where), `heat_flow` per temperature and convection boundary (W, into the part), `heat_balance_error`, `faces` and `probes` (mean, max, min temperature) |
 
-Every run also returns `checks` (the `expect` list, pass or fail), `passed`, `warnings` (unbalanced reactions or heat, a result changing by more than 5 % on a finer mesh), mesh size and counts, times, and the files.
+Every run also returns `checks` (the `expect` list, pass or fail), `passed`, `warnings` (unbalanced reactions or heat; a result changing by more than 5 % on a finer mesh; a peak at a support or load; a peak that grows on a finer mesh while the displacement has converged, i.e. a singularity; a `cyl_r` that took holes and fillets together), mesh size and counts, times, and the files.
 
 ## The checker
 
@@ -118,7 +120,8 @@ The reference solver (`refsolver.py`) is independent element code (isoparametric
 |---|---|
 | `study_format` | The study format, and which solver and mesher are installed. Read it first. |
 | `validate_studies` | Static checks of `{name: study}`. |
-| `run_studies` | Meshes, solves and checks: results, checks, warnings, files. |
+| `run_studies` | Meshes, solves and checks: results, selections, checks, warnings, files. Returns within `wait_s` (≤ 50 s, under the clients' call time limits); studies still running are listed in `pending` with the `request` path. |
+| `study_status` | The finished and pending studies of a request; waits up to `wait_s` for the rest. |
 | `get_deck` | The CalculiX deck of one study, as text. |
 | `run_benchmarks` | The closed-form benchmarks: is the toolchain right on this machine? |
 | `get_file` | A written file as base64. |
@@ -151,7 +154,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `meshdata.py`, `runner.py` | 2026.10.16.3 (face integrals isoparametric, as CalculiX computes them on curved 6-node faces: consistent pressure, traction, flux and film loads, face areas and means; body loads integrated over curved elements. The reaction correction on supports that touch a curved loaded face is now exact: `lame_ring` equilibrium error 1e-3 before) |
+| Package, `api.py`, `cli.py`, `mcp_server.py`, `runner.py`, `deck.py`, `meshdata.py`, `study.py`, `bench.py` | 2026.10.16.4 (from the first agent test, a bracket designed with b3dt and analysed with feat: background runs, so fine meshes and `converge: true` no longer hit the MCP clients' call time limit (`run_studies` returns within ~45 s, `study_status` collects the rest; `feat status REQUEST`); `cyl_r` with `side: inner/outer` and a warning when one selector took a hole and corner fillets of the same radius, which it did silently; `selection` in every result; safety factor from the larger of the integration-point and nodal peaks (it used the nodal one, which can be lower); peaks and safety factor away from supports and loads, `peak_at_bc` and singularity warnings; `equation_solver` (iterative above 150k nodes)) |
+| `meshdata.py`, `runner.py` (before) | 2026.10.16.3 (face integrals isoparametric, as CalculiX computes them on curved 6-node faces: consistent pressure, traction, flux and film loads, face areas and means; body loads integrated over curved elements. The reaction correction on supports that touch a curved loaded face is now exact: `lame_ring` equilibrium error 1e-3 before) |
 | `bench.py` | 2026.10.16.2 (`lame_ring` as a 90-degree revolve; README: results of the first CalculiX run) |
 | Other modules | 2026.10.16.1 (first version) |
 | Tested with | CalculiX (Ubuntu calculix-ccx), Gmsh 4.15.2, Python 3.14 (carbonio); Python 3.10, NumPy 2.2, SciPy 1.15 (reference solver) |

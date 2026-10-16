@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.16.3
+Version: 2026.10.16.4
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -94,7 +94,9 @@ def _get(res: dict, path: str):
     return float(cur)
 
 
-def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None) -> dict:
+def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, band: float | None = None) -> dict:
+    """Results of one solved study. band (mm): peaks 'off_bc' leave out the material within this
+    distance of support and load nodes (default: the element size)."""
     an = study["analysis"]
     n = len(mesh.nodes)
     mat = material_of(study)
@@ -107,20 +109,75 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None) -
         out["max_displacement"] = round(float(mag[i]), 9)
         out["max_displacement_at"] = np.round(mesh.nodes[i], 4).tolist()
         out["max_displacement_components"] = {c: round(float(np.nanmax(np.abs(U[:, k]))), 9) for k, c in enumerate("xyz")}
+        # elements touching a support or a load: fixed boundaries and point-like loads make stresses
+        # singular there, so peaks are also reported away from them
+        bc_names = [s for s in plan["supports"] + plan["loads"] if s in sets]
+        bc_node = np.zeros(n, bool)
+        owner = {}
+        for s in bc_names:
+            idx = np.array(sets[s]["nodes"]) - 1
+            bc_node[idx] = True
+            for k in idx[:]:
+                owner.setdefault(int(k), s)
+        touch = bc_node[mesh.tets].any(axis=1)                     # (E,) element touches a bc
+        # a fixed physical band around the bcs (the same on every mesh, so it converges)
+        b = float(band) if band else float(np.median(np.linalg.norm(
+            mesh.nodes[mesh.tets[:, 1]] - mesh.nodes[mesh.tets[:, 0]], axis=1)))
+        out["off_bc_band_mm"] = round(b, 4)
+        if bc_node.any():
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(mesh.nodes[bc_node])
+            near = tree.query(mesh.nodes, distance_upper_bound=b)[0] <= b          # nodes within the band
+            cen = mesh.nodes[mesh.tets[:, :4]].mean(axis=1)
+            band_el = (tree.query(cen, distance_upper_bound=b)[0] <= b) | touch
+            near |= np.isin(np.arange(n), mesh.tets[touch].ravel())
+        else:
+            near, band_el = np.zeros(n, bool), touch
         sb = results.block(dat, "stresses", "EALL")
+        peaks = {}
         if sb:
-            S = np.array([r[2:8] for r in sb["rows"]])
-            vm = results.von_mises(S)
+            rows = np.array(sb["rows"])
+            el = rows[:, 0].astype(int) - 1
+            vm = results.von_mises(rows[:, 2:8])
             j = int(np.argmax(vm))
-            e = int(sb["rows"][j][0]) - 1
             out["max_von_mises"] = round(float(vm[j]), 6)
-            out["max_von_mises_at"] = np.round(mesh.nodes[mesh.tets[e, :4]].mean(axis=0), 4).tolist()
+            out["max_von_mises_at"] = np.round(mesh.nodes[mesh.tets[el[j], :4]].mean(axis=0), 4).tolist()
+            peaks["ip"] = (float(vm[j]), bool(touch[el[j]]), mesh.tets[el[j]])
+            off = ~band_el[el]
+            if off.any():
+                k = int(np.argmax(np.where(off, vm, -1)))
+                out["max_von_mises_off_bc"] = round(float(vm[k]), 6)
+                out["max_von_mises_off_bc_at"] = np.round(mesh.nodes[mesh.tets[el[k], :4]].mean(axis=0), 4).tolist()
         if frd and "STRESS" in frd:
-            vals = np.array([v[:6] for v in frd["STRESS"].values()])
-            out["max_von_mises_nodal"] = round(float(results.von_mises(vals).max()), 6)
-        peak = out.get("max_von_mises_nodal", out.get("max_von_mises"))
-        if peak and mat.get("yield"):
-            out["safety_factor"] = round(float(mat["yield"]) / peak, 4)
+            ids = np.array(list(frd["STRESS"].keys())) - 1
+            vmn = results.von_mises(np.array([v[:6] for v in frd["STRESS"].values()]))
+            j = int(np.argmax(vmn))
+            out["max_von_mises_nodal"] = round(float(vmn[j]), 6)
+            out["max_von_mises_nodal_at"] = np.round(mesh.nodes[ids[j]], 4).tolist()
+            peaks["nodal"] = (float(vmn[j]), bool(near[ids[j]]), np.array([ids[j]]))
+            off = ~near[ids]
+            if off.any():
+                k = int(np.argmax(np.where(off, vmn, -1)))
+                out["max_von_mises_nodal_off_bc"] = round(float(vmn[k]), 6)
+        if peaks:
+            # the larger of the two peaks: nodal values are extrapolated and averaged, and can be lower
+            kind = max(peaks, key=lambda q: peaks[q][0])
+            val, at_bc, nodes_ = peaks[kind]
+            out["peak_von_mises"] = round(val, 6)
+            out["peak_from"] = {"ip": "integration points", "nodal": "nodes"}[kind]
+            if at_bc:
+                names = sorted({owner[int(q)] for q in nodes_ if int(q) in owner} or
+                               {owner[int(q)] for e in np.nonzero(touch & np.isin(mesh.tets, nodes_).any(axis=1))[0]
+                                for q in mesh.tets[e] if int(q) in owner})
+                out["peak_at_bc"] = names or True
+            offp = max(out.get("max_von_mises_off_bc", 0), out.get("max_von_mises_nodal_off_bc", 0))
+            if offp:
+                out["peak_von_mises_off_bc"] = round(offp, 6)
+            if mat.get("yield"):
+                out["safety_factor"] = round(float(mat["yield"]) / val, 4)
+                if offp:
+                    out["safety_factor_off_bc"] = round(float(mat["yield"]) / offp, 4)
         out["reactions"] = {}
         total = np.zeros(3)
         taken = [set(), set(), set()]  # nodes whose reaction in x, y, z is already counted
@@ -221,13 +278,15 @@ def check_expectations(study: dict, res: dict) -> list[dict]:
     return out
 
 
-MAIN = {"static": ("max_displacement", "max_von_mises"), "modal": ("frequencies.0",),
+MAIN = {"static": ("max_displacement", "peak_von_mises", "peak_von_mises_off_bc"), "modal": ("frequencies.0",),
         "buckling": ("critical_factor",), "thermal": ("T_max", "T_min")}
 
 
 def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float, size_factor: float = 1.0) -> dict:
     t0 = time.perf_counter()
     mesh, minfo = mesh_part(study, folder, size_factor)
+    if size_factor != 1.0 and minfo.get("size"):
+        minfo["size_nominal"] = minfo["size"] / size_factor   # the same off-bc band as the nominal mesh
     t1 = time.perf_counter()
     text, plan = deck.write(name, study, mesh)
     inp = folder / f"{name}.inp"
@@ -241,8 +300,11 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     dat = results.parse_dat(inp.with_suffix(".dat").read_text())
     frd_path = inp.with_suffix(".frd")
     frd = results.parse_frd(frd_path.read_text()) if frd_path.is_file() else None
-    res = evaluate(study, mesh, plan, dat, frd)
-    res["mesh"] = minfo
+    band = study.get("stress_band") or minfo.get("size_nominal") or minfo.get("size")
+    res = evaluate(study, mesh, plan, dat, frd, band)
+    res["selection"] = plan["selection"]
+    res["_selection_warnings"] = plan["selection_warnings"]
+    res["mesh"] = dict(minfo, equation_solver=plan["equation_solver"])
     res["seconds"] = {"mesh": round(t1 - t0, 3), "solve": round(t2 - t1, 3), "total": round(time.perf_counter() - t0, 3)}
     res["files"] = {k: str(p) for k, p in (("inp", inp), ("dat", inp.with_suffix(".dat")), ("frd", frd_path),
                                             ("msh", folder / "mesh.msh"), ("step", Path(minfo.get("step", "")))) if p.is_file()}
@@ -259,6 +321,7 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
             fine_dir = folder / f"{name}_fine"
             fine_dir.mkdir(exist_ok=True)
             fine = solve_once(name, study, fine_dir, solver, timeout, size_factor=0.6)
+            fine.pop("_selection_warnings", None)
             conv = {}
             for q in MAIN[study["analysis"]]:
                 try:
@@ -273,9 +336,21 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
             warn.append(f"reactions do not balance the loads (error {res['equilibrium_error']:.2g})")
         if res.get("heat_balance_error", 0) > 1e-2:
             warn.append(f"heat balance error {res['heat_balance_error']:.2g}")
-        for q, c in res.get("convergence", {}).items():
+        warn += res.pop("_selection_warnings", [])
+        if res.get("peak_at_bc"):
+            at = res["peak_at_bc"]
+            where = ", ".join(at) if isinstance(at, list) else "a support or load"
+            warn.append(f"the peak von Mises stress is at {where}: stresses at fixed or loaded edges are singular "
+                        "(they grow with refinement); judge the design on peak_von_mises_off_bc / safety_factor_off_bc, "
+                        "or model the support more realistically (contact faces, a fillet at the corner)")
+        conv = res.get("convergence", {})
+        for q, c in conv.items():
             if c["rel_change"] > 0.05:
                 warn.append(f"{q} changes {100 * c['rel_change']:.1f} % on a finer mesh: refine the mesh")
+        d, p = conv.get("max_displacement"), conv.get("peak_von_mises")
+        if d and p and d["rel_change"] < 0.02 and p["rel_change"] > 0.1:
+            warn.append("the displacement has converged but the peak stress keeps growing on a finer mesh: a stress "
+                        "singularity (sharp corner, fixed edge, point load); the peak there is not a design value")
         if warn:
             res["warnings"] = warn
         res["passed"] = all(c["pass"] for c in res["checks"]) if res["checks"] else None

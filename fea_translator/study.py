@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.10.16.1
+Version: 2026.10.16.4
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -41,7 +41,9 @@ SELECTOR_DOC = {
     "nx, ny, nz": "a planar face with this outward normal (any direction; the others default to 0): the largest, "
                   "then the farthest along the normal; with at = [x, y, z] the one nearest to that point",
     "pts": "[[x, y, z], ...]: the face nearest to each point (a point on the face, away from its edges)",
-    "cyl_r": "every cylindrical face of this radius (bolt holes, shafts); with at, only the nearest",
+    "cyl_r": "every cylindrical face of this radius; side: 'inner' for holes and bores (concave), 'outer' for "
+             "shafts, bosses and outside fillets (convex), omitted: both (a hole and corner fillets of the same "
+             "radius are all taken); with at, only the nearest",
     "all": "true: every boundary face (convection everywhere)",
 }
 
@@ -101,7 +103,7 @@ EXAMPLE = {"bracket_static": {
     "analysis": "static",
     "mesh": {"size": 3},
     "bcs": [{"kind": "fixed", "name": "wall", "faces": {"nx": -1}},
-            {"kind": "force", "name": "load", "faces": {"cyl_r": 4}, "fz": -200}],
+            {"kind": "force", "name": "load", "faces": {"cyl_r": 4, "side": "inner"}, "fz": -200}],
     "probes": [{"name": "tip", "faces": {"nx": 1}}]}}
 
 
@@ -116,7 +118,9 @@ def study_format() -> dict:
                            "analysis": "|".join(ANALYSES), "modes": "number of modes or buckling factors (6; 3)",
                            "mesh": "{size, order (1|2), refine: [{at, r, size}]}", "bcs": "list of boundary conditions",
                            "probes": "[{name, faces}]: mean and largest displacement (or temperature) there",
-                           "expect": "[{quantity, value, tol}]", "converge": "true: rerun at 0.6 x size and report the change"},
+                           "expect": "[{quantity, value, tol}]", "converge": "true: rerun at 0.6 x size and report the change",
+                           "equation_solver": "auto (iterative above 150k nodes for static and thermal) | direct | iterative",
+                           "stress_band": "mm: *_off_bc peaks leave out material this close to supports and loads (default: the element size)"},
             "material_keys": MATERIAL_KEYS, "materials": MATERIALS, "bc_kinds": bcs, "selectors": SELECTOR_DOC,
             "example": EXAMPLE}
 
@@ -186,7 +190,9 @@ def _selector(sel) -> str | None:
         return "unknown selector: use {nx, ny, nz[, at]}, {pts}, {cyl_r[, at]} or {all: true}"
     if "at" in sel and not _point(sel["at"]):
         return "'at' must be [x, y, z]"
-    extra = keys - {"nx", "ny", "nz", "at", "pts", "cyl_r", "all"}
+    if "side" in keys and ("cyl_r" not in keys or sel["side"] not in ("inner", "outer")):
+        return "'side' goes with cyl_r and is 'inner' (holes) or 'outer' (shafts, fillets)"
+    extra = keys - {"nx", "ny", "nz", "at", "pts", "cyl_r", "all", "side"}
     if extra:
         return f"unknown selector keys {sorted(extra)}"
     return None
@@ -326,7 +332,12 @@ def validate_study(st: dict) -> dict:
             errors.append(f"expect {j + 1}: needs 'quantity' (a results path) and a numeric 'value'")
         elif "tol" in ex and (not _num(ex["tol"]) or ex["tol"] <= 0):
             errors.append(f"expect {j + 1}: 'tol' must be positive")
-    extra = set(st) - {"part", "material", "analysis", "modes", "mesh", "bcs", "probes", "expect", "converge", "notes"}
+    if st.get("equation_solver", "auto") not in ("auto", "direct", "iterative"):
+        errors.append("equation_solver: auto, direct or iterative")
+    if "stress_band" in st and (not _num(st["stress_band"]) or st["stress_band"] < 0):
+        errors.append("stress_band: a distance in mm (>= 0)")
+    extra = set(st) - {"part", "material", "analysis", "modes", "mesh", "bcs", "probes", "expect", "converge", "notes",
+                       "equation_solver", "stress_band"}
     if extra:
         warnings.append(f"unknown study keys ignored: {sorted(extra)}")
     return {"ok": not errors, "errors": errors, "warnings": warnings}

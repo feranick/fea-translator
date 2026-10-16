@@ -1,10 +1,11 @@
 """cli.py — the `feat` command line. Every command prints JSON.
-Version: 2026.10.16.1
+Version: 2026.10.16.4
 
     feat status                          versions; CalculiX and Gmsh found or not
     feat format > study_format.json      the study format
     feat validate studies.json           static checks
-    feat run studies.json [--solver S]   mesh, solve, check (S: auto | ccx | ref)
+    feat run studies.json [--solver S]   mesh, solve, check (S: auto | ccx | ref); waits for all
+    feat status REQUEST                  results of a request folder (finished and pending studies)
     feat deck studies.json NAME          write the CalculiX deck of one study (no solve)
     feat bench [NAMES...] [--solver S]   the benchmark studies with closed-form answers
 
@@ -26,7 +27,8 @@ def _load(path: str) -> dict:
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="feat", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("status")
+    p = sub.add_parser("status")
+    p.add_argument("request", nargs="?")
     sub.add_parser("format")
     p = sub.add_parser("validate")
     p.add_argument("studies")
@@ -41,7 +43,7 @@ def main(argv=None) -> None:
     p.add_argument("--solver", default=None)
     a = ap.parse_args(argv)
     if a.cmd == "status":
-        out = api.status()
+        out = api.status(a.request) if a.request else api.tool_status()
     elif a.cmd == "format":
         out = api.study_format()
     elif a.cmd == "validate":
