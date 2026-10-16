@@ -93,7 +93,7 @@ Every run also returns `checks` (the `expect` list, pass or fail), `passed`, `wa
 | `lame_ring` | quarter ring under internal pressure: Lamé bore displacement and von Mises | 2 % (Gmsh) |
 | `plate_hole` | quarter plate with a hole: Kt = 2 + (1 − d/W)³ on the net section | 5 % (Gmsh, CalculiX) |
 
-**Status (2026-10-16, carbonio: CalculiX from Ubuntu's calculix-ccx, Gmsh 4.15.2, Python 3.14):** 10 of 11 benchmarks pass with CalculiX on the first run (`euler_column` and `plate_hole` included); `lame_ring` failed only because that machine's build123d-translator predated `split`; it is now a 90-degree revolve, which every version builds. The reference solver passes the 9 cases without Gmsh or CalculiX (the exact ones to rounding; cantilever 1.0 %, frequency 0.13 %, pin fin 0.09 %).
+**Status (2026-10-16, carbonio: CalculiX from Ubuntu's calculix-ccx, Gmsh 4.15.2, Python 3.14):** with 2026.10.16.3 all 28 tests and all 11 benchmarks pass with CalculiX and Gmsh (`euler_column`, `lame_ring` and `plate_hole` included). On the first run 10 of 11 passed: `lame_ring` met its Lamé values but its equilibrium check was off by 0.1 %, because the loads on support nodes were integrated on flat triangles while CalculiX integrates the curved faces; the face integrals are now isoparametric. The reference solver passes the 9 cases without Gmsh or CalculiX (the exact ones to rounding; cantilever 1.0 %, frequency 0.13 %, pin fin 0.09 %) and a curved quarter ring (bore displacement 0.01 %, equilibrium 1e-8).
 
 The first CalculiX run confirmed what the translator assumes about it:
 
