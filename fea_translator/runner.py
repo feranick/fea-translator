@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.16.4
+Version: 2026.10.16.5
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -96,7 +96,8 @@ def _get(res: dict, path: str):
 
 def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, band: float | None = None) -> dict:
     """Results of one solved study. band (mm): peaks 'off_bc' leave out the material within this
-    distance of support and load nodes (default: the element size)."""
+    distance of support and load nodes (default here: the median element edge; runs pass two
+    nominal element sizes)."""
     an = study["analysis"]
     n = len(mesh.nodes)
     mat = material_of(study)
@@ -300,7 +301,10 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     dat = results.parse_dat(inp.with_suffix(".dat").read_text())
     frd_path = inp.with_suffix(".frd")
     frd = results.parse_frd(frd_path.read_text()) if frd_path.is_file() else None
-    band = study.get("stress_band") or minfo.get("size_nominal") or minfo.get("size")
+    # default band: two elements of the nominal mesh (one element is still inside the singular zone;
+    # the bracket test: a 1-element band moved 14 % on refinement, a 2-element band 0.3 %)
+    h = minfo.get("size_nominal") or minfo.get("size")
+    band = study.get("stress_band") or (2 * h if h else None)
     res = evaluate(study, mesh, plan, dat, frd, band)
     res["selection"] = plan["selection"]
     res["_selection_warnings"] = plan["selection_warnings"]
@@ -346,7 +350,9 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
         conv = res.get("convergence", {})
         for q, c in conv.items():
             if c["rel_change"] > 0.05:
-                warn.append(f"{q} changes {100 * c['rel_change']:.1f} % on a finer mesh: refine the mesh")
+                hint = ("widen stress_band (now " + str(res.get("off_bc_band_mm")) + " mm) or refine the mesh"
+                        if q.endswith("off_bc") else "refine the mesh")
+                warn.append(f"{q} changes {100 * c['rel_change']:.1f} % on a finer mesh: {hint}")
         d, p = conv.get("max_displacement"), conv.get("peak_von_mises")
         if d and p and d["rel_change"] < 0.02 and p["rel_change"] > 0.1:
             warn.append("the displacement has converged but the peak stress keeps growing on a finer mesh: a stress "

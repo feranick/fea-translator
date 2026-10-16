@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.10.16.4
+Version: 2026.10.16.5
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -120,7 +120,8 @@ def study_format() -> dict:
                            "probes": "[{name, faces}]: mean and largest displacement (or temperature) there",
                            "expect": "[{quantity, value, tol}]", "converge": "true: rerun at 0.6 x size and report the change",
                            "equation_solver": "auto (iterative above 150k nodes for static and thermal) | direct | iterative",
-                           "stress_band": "mm: *_off_bc peaks leave out material this close to supports and loads (default: the element size)"},
+                           "stress_band": "mm: *_off_bc peaks leave out material this close to supports and loads (default: 2 element sizes, "
+                                          "the same on the converge mesh); widen it if peak_von_mises_off_bc does not converge"},
             "material_keys": MATERIAL_KEYS, "materials": MATERIALS, "bc_kinds": bcs, "selectors": SELECTOR_DOC,
             "example": EXAMPLE}
 
