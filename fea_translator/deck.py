@@ -1,5 +1,5 @@
 """deck.py — a study and its mesh as a CalculiX input deck (.inp).
-Version: 2026.10.16.7
+Version: 2026.10.16.8
 
     text, plan = write(name, study, mesh)
 
@@ -132,7 +132,7 @@ def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
     method = equation_solver(study, len(mesh.nodes))
     plan["equation_solver"] = method
     opt = ", SOLVER=ITERATIVE CHOLESKY" if method == "iterative" else ""
-    L += {"static": [f"*STATIC{opt}"], "modal": ["*FREQUENCY", str(modes)], "buckling": ["*BUCKLE", str(modes)],
+    L += {"static": [f"*STATIC{opt}"], "modal": ["*FREQUENCY", str(modes)], "buckling": ["*BUCKLE", f"{modes}, 1.E-6"],  # accuracy 1e-6 (CalculiX's default 0.01 let a wrong factor through)
           "thermal": [f"*HEAT TRANSFER, STEADY STATE{opt}", "1., 1."]}[an]
     bnd, cload, dload, dflux, film = [], {}, [], [], []
     for i, bc in enumerate(study.get("bcs", [])):

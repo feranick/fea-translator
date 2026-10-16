@@ -1,3 +1,3 @@
 """fea-translator: FEA studies (part, material, supports, loads) to Gmsh meshes, CalculiX decks and results."""
 
-__version__ = "2026.10.16.7"
+__version__ = "2026.10.16.8"

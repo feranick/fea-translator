@@ -24,7 +24,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 32 tests: 19 run anywhere, 13 need ccx (and Gmsh)
+pytest -q                      # 33 tests: 19 run anywhere, 14 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -154,7 +154,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `runner.py`, `deck.py` | 2026.10.16.7 (one BLAS thread per CalculiX job: Ubuntu's ccx links OpenBLAS, and a threaded OpenBLAS called from CalculiX's OpenMP code can give wrong eigenvalues; the pump test got a buckling factor of 10.07 for `euler_column`'s 674.7 while several studies ran at once; buckling asks for at least 4 factors and reports the requested number) |
+| Package, `runner.py`, `deck.py` | 2026.10.16.8 (buckling: eigenvalue accuracy 1e-6 instead of CalculiX's 0.01, and one thread per buckling job: with one BLAS thread only, 1 of 4 concurrent `euler_column` runs still returned a wrong factor (20.8); a test runs four at once) |
+| `runner.py`, `deck.py` (before) | 2026.10.16.7 (one BLAS thread per CalculiX job: Ubuntu's ccx links OpenBLAS, and a threaded OpenBLAS called from CalculiX's OpenMP code can give wrong eigenvalues; the pump test got a buckling factor of 10.07 for `euler_column`'s 674.7 while several studies ran at once; buckling asks for at least 4 factors and reports the requested number) |
 | `mesher.py`, `meshdata.py`, `runner.py` | 2026.10.16.6 (from the pump test: the DN250 nozzle, with 7-12 mm ligaments around 16 holes at 10-15 mm elements, failed with 'cannot match the mid-edge nodes' or CalculiX's 'nonpositive jacobian'; Gmsh's node order is now used directly instead of matching mid-edge nodes by distance, and inverted curved elements are straightened and reported) |
 | `runner.py`, `study.py` | 2026.10.16.5 (default `stress_band` two element sizes instead of one: in the second bracket test a one-element band moved 14 % on refinement, a two-element band 0.3 %; the convergence warning for `*_off_bc` points to `stress_band`) |
 | `api.py`, `cli.py`, `mcp_server.py`, `runner.py`, `deck.py`, `meshdata.py`, `study.py`, `bench.py` | 2026.10.16.4 (from the first agent test, a bracket designed with b3dt and analysed with feat: background runs, so fine meshes and `converge: true` no longer hit the MCP clients' call time limit (`run_studies` returns within ~45 s, `study_status` collects the rest; `feat status REQUEST`); `cyl_r` with `side: inner/outer` and a warning when one selector took a hole and corner fillets of the same radius, which it did silently; `selection` in every result; safety factor from the larger of the integration-point and nodal peaks (it used the nodal one, which can be lower); peaks and safety factor away from supports and loads, `peak_at_bc` and singularity warnings; `equation_solver` (iterative above 150k nodes)) |

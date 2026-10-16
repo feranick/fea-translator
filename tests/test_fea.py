@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.16.6
+Version: 2026.10.16.8
 """
 import shutil
 from pathlib import Path
@@ -298,3 +298,15 @@ def test_gmsh_order_flip_and_straightening():
     fixed, n = straighten_inverted(nodes, m.tets)
     assert n >= 1 and min_jacobian(fixed, m.tets).min() > 0.05
     assert np.allclose(fixed[e[4]], (fixed[e[0]] + fixed[e[1]]) / 2)
+
+
+@pytest.mark.skipif(not HAVE_CCX, reason="CalculiX (ccx) not installed")
+def test_buckling_concurrent_runs(tmp_path):
+    """Four euler_column runs at once must all find P = pi^2 EI / 4L^2 (a load-dependent wrong factor,
+    1 run in 4, was found in the pump test)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    st = bench.cases("ccx")["euler_column"]
+    with ThreadPoolExecutor(4) as ex:
+        res = list(ex.map(lambda i: run_study(f"e{i}", st, tmp_path / f"e{i}", solver="ccx"), range(4)))
+    assert all(r["ok"] and r["passed"] for r in res), [r.get("critical_factor") for r in res]

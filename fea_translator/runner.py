@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.16.7
+Version: 2026.10.16.8
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -45,13 +45,17 @@ def find_ccx() -> str | None:
     return None
 
 
-def run_ccx(inp: Path, timeout: float) -> str:
+def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
+    """Runs ccx on the deck. serial: one thread (buckling: the eigenvalues then do not depend on the
+    machine's load; with several threads, 1 in 4 concurrent runs of euler_column returned a wrong factor)."""
     exe = find_ccx()
     if not exe:
         raise SolverError("CalculiX (ccx) not found: install it or set FEAT_CCX to its path (or use solver 'ref')")
     env = dict(os.environ)
     env.setdefault("OMP_NUM_THREADS", str(min(4, os.cpu_count() or 1)))
     env.setdefault("CCX_NPROC_EQUATION_SOLVER", env["OMP_NUM_THREADS"])
+    if serial:
+        env["OMP_NUM_THREADS"] = env["CCX_NPROC_EQUATION_SOLVER"] = "1"
     # CalculiX is OpenMP-parallel and its eigenvalue solver (ARPACK) calls BLAS inside it; a threaded
     # OpenBLAS called that way can return wrong results (OpenBLAS's own warning), most often when several
     # jobs run at once: the pump test got a buckling factor of 10.07 for 674.7. One BLAS thread per job.
@@ -301,7 +305,7 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
         from . import refsolver
         refsolver.run(inp)
     else:
-        run_ccx(inp, timeout)
+        run_ccx(inp, timeout, serial=study["analysis"] == "buckling")
     t2 = time.perf_counter()
     dat = results.parse_dat(inp.with_suffix(".dat").read_text())
     frd_path = inp.with_suffix(".frd")
