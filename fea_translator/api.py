@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.18.5
+Version: 2026.10.18.6
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -309,10 +309,18 @@ def _timing_slurm(folder: Path, progress: dict, ids: dict) -> tuple[dict, str]:
     is a latest start) and then needs its run time."""
     now = time.time()
     exp_end, max_end = [], []
+    # SLURM plans a queued job's start from the time limits of the jobs ahead: a latest start. The expected
+    # start is when the first running study of the request is expected to free its CPUs, if that is sooner.
+    run_ends = sorted(now + 60 * p["eta_min"] for p in progress.values()
+                      if p.get("state") != "queued" and p.get("eta_min") is not None)
     for p in progress.values():
-        start = now if p.get("state") != "queued" else _slurm_time(p.get("expected_start"))
-        exp_end.append(None if start is None or p.get("eta_min") is None else start + 60 * p["eta_min"])
-        max_end.append(None if start is None else start + 60 * p["eta_min_max"])
+        if p.get("state") != "queued":
+            s_exp = s_max = now
+        else:
+            s_max = _slurm_time(p.get("expected_start"))
+            s_exp = min(s_max, run_ends[0]) if s_max is not None and run_ends else s_max
+        exp_end.append(None if s_exp is None or p.get("eta_min") is None else s_exp + 60 * p["eta_min"])
+        max_end.append(None if s_max is None else s_max + 60 * p["eta_min_max"])
     t_exp = max(exp_end) if exp_end and all(e is not None for e in exp_end) else None
     t_max = max(max_end) if max_end and all(e is not None for e in max_end) else None
     t = {"eta_min": None if t_exp is None else round((t_exp - now) / 60, 1),

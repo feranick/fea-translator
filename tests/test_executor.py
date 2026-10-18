@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.10.18.5
+Version: 2026.10.18.6
 """
 import json
 import os
@@ -176,6 +176,10 @@ def test_queued_estimate_and_slurm_finish_times(slurm, monkeypatch):
     t, nxt = api._timing_slurm(out, prog, {"a": "7"})
     assert 10 < t["eta_min"] < 11 and 24 < t["eta_min_max"] < 26 and t["includes_queue_wait"]
     assert f"around {t['expected_finish']} (at the latest {t['latest_finish']})" in nxt
+    # a running study expected to end in 3 min frees its CPUs before SLURM's planned start (10 min)
+    run = {"stage": "solve", "eta_min": 3.0, "eta_min_max": 14.0, "state": "running", "job_id": "6"}
+    t, _ = api._timing_slurm(out, {"r": run, **prog}, {"r": "6", "a": "7"})
+    assert 3 < t["eta_min"] < 4 and 24 < t["eta_min_max"] < 26
     t, nxt = api._timing_slurm(out, {"a": dict(g, state="queued", job_id="7")}, {"a": "7"})
     assert t["expected_finish"] is None and "jobs ahead of them" in nxt
 
