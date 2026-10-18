@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.18.1
+Version: 2026.10.18.3
 """
 import shutil
 from pathlib import Path
@@ -116,6 +116,10 @@ def test_parse_dat_and_frd():
     assert results.block(d, "total force", "N_WALL")["rows"] == [[-1000.0, 2e-12, 0.0]]
     assert [e["hz"] for e in d["eigen"]] == [834.8094, 834.916]
     assert [b["factor"] for b in d["buckling"]] == [674.7, 675.0]
+    # CalculiX 2.21's heat-flux header has no space before the set name (mochi, 2026-10-18)
+    hf = results.parse_dat(" heat flux (elem, integ.pnt.,qx,qy,qz) for setEALL and time  0.1000000E+01\n\n"
+                           "         1   1  5.813953E+00 -0.000000E+00  1.260700E-14\n")
+    assert results.block(hf, "heat flux", "EALL")["rows"] == [[1, 1, 5.813953, -0.0, 1.2607e-14]]
     frd = (" -4  STRESS      6    1\n -5  SXX         1    4    1    1\n"
            " -1         1 1.00000E+01 0.00000E+00 0.00000E+00 0.00000E+00 0.00000E+00 0.00000E+00\n"
            " -1         2-2.00000E+01 0.00000E+00 0.00000E+00 0.00000E+00 0.00000E+00 0.00000E+00\n -3\n")

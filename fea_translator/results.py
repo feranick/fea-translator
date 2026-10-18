@@ -1,12 +1,13 @@
 """results.py — reading CalculiX output (.dat, .frd) and turning it into the study's results.
-Version: 2026.10.16.1
+Version: 2026.10.18.3
 
 parse_dat(text)    -> {"blocks": [{"what", "set", "time", "rows"}], "eigen": [...], "buckling": [...]}
 parse_frd(text)    -> {"STRESS": {node: [sxx, syy, szz, sxy, syz, szx]}, "DISP": ..., ...} (last block of each)
 von_mises(s)       -> von Mises stress of rows [sxx, syy, szz, sxy, sxz|syz, ...] (shear order does not matter)
 
 The .dat blocks are printed by *NODE PRINT / *EL PRINT: a header line
-"<what> (<components>) for set <SET> and time <t>" followed by rows of numbers.
+"<what> (<components>) for set <SET> and time <t>" followed by rows of numbers (CalculiX 2.21 writes
+the heat-flux header without the space: "... for setEALL and time ...").
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ import re
 
 import numpy as np
 
-_HEADER = re.compile(r"^\s*(?P<what>[a-z][a-z .]*?)\s*(\((?P<comp>[^)]*)\))?\s+for set\s+(?P<set>\S+)\s+and time\s+(?P<t>\S+)", re.I)
+_HEADER = re.compile(r"^\s*(?P<what>[a-z][a-z .]*?)\s*(\((?P<comp>[^)]*)\))?\s+for set\s*(?P<set>\S+)\s+and time\s+(?P<t>\S+)", re.I)
 _NUM = re.compile(r"^[\s\d.eE+-]+$")
 
 
