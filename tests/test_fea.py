@@ -333,19 +333,21 @@ def test_progress_and_time_left(tmp_path, monkeypatch):
     d = tmp_path / "req" / "a"
     d.mkdir(parents=True)
 
-    def at(nodes, stage="solve", step=2, steps=2, ago=5.0):
+    def at(nodes, stage="solve", step=2, steps=2, ago=5.0, timeout=900):
         now = time.time()
         (d / "progress.json").write_text(json.dumps({"stage": stage, "step": step, "steps": steps, "nodes": nodes,
                                                      "started": now - 60, "stage_started": now - ago,
                                                      "done_steps_s": [2.0] * (step - 1)}))
-        return api._progress(d, dict(st, converge=steps == 4), "ccx", 900)
+        return api._progress(d, dict(st, converge=steps == 4), "ccx", timeout)
 
     p = at(8000)                                       # 10 x 8^1.5 = 226 s expected, 5 s done
     assert p["iteration"] == 2 and p["max_iterations"] == 2 and p["s_per_iteration"] == 2.0
     assert abs(p["eta_min"] - 221 / 60) < 0.1 and abs(p["eta_min_max"] - 895 / 60) < 0.1
     t, nxt = api._timing(tmp_path / "req", {"a": p})
     assert t["eta_min"] < 5 and "study_status" in nxt and "stop" not in nxt
-    p = at(40000)                                      # 10 x 40^1.5 = 2530 s: 42 min
+    capped = at(40000)                                 # 10 x 40^1.5 = 2530 s, but the solve stops at 900 s
+    assert capped["eta_min"] == capped["eta_min_max"] == round(895 / 60, 1)
+    p = at(40000, timeout=3600)                        # with a 1 h limit: 42 min expected
     t, nxt = api._timing(tmp_path / "req", {"a": p})
     assert t["eta_min"] > 40 and "tell the user" in nxt and t["expected_finish"] in nxt
     p = at(1000, stage="mesh", step=1, steps=4, ago=0.5)   # converge: mesh, solve, finer mesh, finer solve

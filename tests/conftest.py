@@ -6,5 +6,5 @@ import pytest
 @pytest.fixture(autouse=True)
 def _local_executor(monkeypatch):
     monkeypatch.setenv("FEAT_EXECUTOR", "local")
-    for k in ("FEAT_SLURM_ARGS", "FEAT_SLURM_MIN_MINUTES", "FEAT_PROCS"):
+    for k in ("FEAT_SLURM_ARGS", "FEAT_SLURM_MIN_MINUTES", "FEAT_PROCS", "FEAT_SLURM_MEM"):
         monkeypatch.delenv(k, raising=False)

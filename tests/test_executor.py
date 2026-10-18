@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.10.18.2
+Version: 2026.10.18.5
 """
 import json
 import os
@@ -156,3 +156,44 @@ def test_cancel_a_running_job(slurm, monkeypatch):
 def test_local_studies_stay_local(slurm):
     r = api.run({"bar": _bar(queue=False)}, "ref", wait=120)
     assert r["done"] and r["studies"]["bar"]["ok"] and not (Path(r["request"]) / "bar" / "job.json").exists()
+
+
+def test_queued_estimate_and_slurm_finish_times(slurm, monkeypatch):
+    """A queued SLURM study: run time from its mesh size when known before meshing (box parts), else
+    unknown; the request's finish is SLURM's expected start plus the run time."""
+    out = Path(os.environ["FEAT_OUT"])
+    out.mkdir(parents=True)
+    (out / "timing.jsonl").write_text(json.dumps({"analysis": "static", "solver": "ref", "nodes": 1000,
+                                                  "mesh_s": 1.0, "solve_s": 10.0}) + "\n")
+    box = _bar()                                         # 10 x 2 x 2 cells, order 2: 21 x 5 x 5 nodes
+    assert api._nodes_hint(box) == 21 * 5 * 5
+    q = api._progress(out / "none", box, "ref", 900)
+    assert q["stage"] == "queued" and 0 < q["eta_min"] < 1
+    g = api._progress(out / "none", {"analysis": "static", "part": {"goal": {}}}, "ref", 900)
+    assert g["eta_min"] is None and "unknown" in g["note"]
+    start = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + 600))   # SLURM: starts in 10 min
+    prog = {"a": dict(q, state="queued", expected_start=start, job_id="7")}
+    t, nxt = api._timing_slurm(out, prog, {"a": "7"})
+    assert 10 < t["eta_min"] < 11 and 24 < t["eta_min_max"] < 26 and t["includes_queue_wait"]
+    assert f"around {t['expected_finish']} (at the latest {t['latest_finish']})" in nxt
+    t, nxt = api._timing_slurm(out, {"a": dict(g, state="queued", job_id="7")}, {"a": "7"})
+    assert t["expected_finish"] is None and "jobs ahead of them" in nxt
+
+
+def test_job_memory(slurm, monkeypatch):
+    """Where SLURM gives a job without --mem the whole node, only one runs at a time (mochi): jobs ask for
+    memory from the node count when known (box parts), else 8G; FEAT_SLURM_MEM and FEAT_SLURM_ARGS override."""
+    req = Path(os.environ["FEAT_OUT"]) / "run_m"
+    box = {"analysis": "static", "part": {"box": [100, 10, 10], "divisions": [80, 16, 16]}}   # 175,329 nodes
+    assert executor.nodes_hint(box) == 161 * 33 * 33
+    assert executor.mem_for(box) == "8G"                          # 2 + 3e-5 x 175k = 7.3 -> 8
+    assert executor.mem_for(dict(box, converge=True)) == "27G"    # the finer mesh: 4.6x the nodes
+    assert executor.mem_for({"analysis": "static", "part": {"goal": {}}}) == "8G"
+    assert "#SBATCH --mem=8G" in executor.job_script(req, "a", box)
+    monkeypatch.setenv("FEAT_SLURM_MEM", "20G")
+    assert "#SBATCH --mem=20G" in executor.job_script(req, "a", box)
+    monkeypatch.setenv("FEAT_SLURM_MEM", "none")
+    assert "--mem" not in executor.job_script(req, "a", box)
+    monkeypatch.setenv("FEAT_SLURM_MEM", "auto")
+    monkeypatch.setenv("FEAT_SLURM_ARGS", "--mem=64G --nice=10")
+    assert "#SBATCH --mem" not in executor.job_script(req, "a", box)  # the args' --mem wins

@@ -1,11 +1,14 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.18.2
+Version: 2026.10.18.5
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (5): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments;
 FEAT_PROCS (1): CalculiX threads per study (a study's "procs" overrides it); FEAT_TIMEOUT (900 s): per
 CalculiX solve. A study's "queue": true sends it to SLURM, "queue": false keeps it local (not with
-FEAT_EXECUTOR=local, which is always local).
+FEAT_EXECUTOR=local, which is always local). FEAT_SLURM_MEM: auto (default) | a size (8G) | none:
+the job's memory. Where SLURM gives a job without --mem the whole node (CR_Core_Memory with
+DefMemPerNode=UNLIMITED, as on mochi: 60000M each), only one job runs at a time; auto asks for what
+CalculiX needs, from the study's node count when it is known before meshing, else 8G.
 
 One SLURM job per study: <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns it) runs
 `python -m fea_translator.cli run-study REQUEST NAME` with --ntasks=1 --cpus-per-task=N (1 for buckling:
@@ -80,7 +83,48 @@ def time_limit_min(study: dict | None = None) -> int:
 def status_key() -> dict:
     """The 'executor' key of tool_status (llmt status reads it)."""
     return {"kind": kind(), "sbatch": shutil.which("sbatch"), "min_minutes": min_minutes(),
-            "procs": default_procs(), "time_limit_min": time_limit_min()}
+            "procs": default_procs(), "time_limit_min": time_limit_min(),
+            "mem": os.environ.get("FEAT_SLURM_MEM", "auto")}
+
+
+def nodes_hint(study: dict) -> int | None:
+    """Nodes of a study's (first) mesh when they are known before meshing: box parts (their divisions,
+    or the element size); None for STEP files and goals."""
+    part = study.get("part", {})
+    if not isinstance(part, dict) or "box" not in part:
+        return None
+    try:
+        dims = [float(v) for v in part["box"]]
+        div = part.get("divisions")
+        if not div:
+            h = float(study.get("mesh", {}).get("size") or (sum(d * d for d in dims) ** 0.5) / 20)
+            div = [max(1, round(d / h)) for d in dims]
+        k = 2 if int(study.get("mesh", {}).get("order", 2)) == 2 else 1
+        n = 1
+        for d in div:
+            n *= k * int(d) + 1
+        return n
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+MEM_DEFAULT_GB = 8          # when the node count is not known before meshing
+MEM_BASE_GB, MEM_GB_PER_NODE = 2.0, 3e-5   # CalculiX (SPOOLES, 10-node tets): ~7 GB at 175k nodes, ~32 GB at 1M
+
+
+def mem_for(study: dict) -> str | None:
+    """The --mem value of a study's job: FEAT_SLURM_MEM (auto | size | none); None: do not ask."""
+    v = os.environ.get("FEAT_SLURM_MEM", "auto").strip()
+    if v.lower() == "none" or "--mem" in os.environ.get("FEAT_SLURM_ARGS", ""):
+        return None
+    if v and v.lower() != "auto":
+        return v
+    n = nodes_hint(study)
+    if n is None:
+        return f"{MEM_DEFAULT_GB}G"
+    if study.get("converge"):
+        n = int(n / 0.6 ** 3)   # the finer mesh of converge: true
+    return f"{max(2, int(math.ceil(MEM_BASE_GB + MEM_GB_PER_NODE * n)))}G"
 
 
 def use_slurm(study: dict, estimate_min: float | None) -> bool:
@@ -107,6 +151,7 @@ def job_script(request: Path, name: str, study: dict) -> str:
         "#SBATCH --ntasks=1",
         f"#SBATCH --cpus-per-task={p}",
         f"#SBATCH --time={time_limit_min(study)}",
+        *([f"#SBATCH --mem={mem_for(study)}"] if mem_for(study) else []),
         "#SBATCH --export=ALL",
         f"exec {shlex.quote(sys.executable)} -m fea_translator.cli run-study {shlex.quote(str(request))} {shlex.quote(name)}",
         ""])
@@ -132,7 +177,7 @@ def submit(request: Path, name: str, study: dict) -> dict:
         return {"ok": False, "why": f"could not submit: {(p.stderr or p.stdout).strip()[:500]}"}
     job_id = p.stdout.strip().split(";")[0].split()[0]
     info = {"executor": "slurm", "job_id": job_id, "submitted": round(time.time(), 1), "procs": procs_for(study),
-            "time_min": time_limit_min(study), "command": cmd}
+            "time_min": time_limit_min(study), "mem": mem_for(study), "command": cmd}
     (d / "job.json").write_text(json.dumps(info))
     return info
 

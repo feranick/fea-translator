@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.18.2
+Version: 2026.10.18.5
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -19,7 +19,7 @@ Studies run in worker processes with a time limit each, or (FEAT_EXECUTOR=slurm,
 long ones as SLURM jobs. Environment: FEAT_OUT (default ~/feat_runs), FEAT_WORKERS (2), FEAT_TIMEOUT
 (seconds per CalculiX solve, 900), FEAT_CCX (path of ccx), FEAT_SOLVER (auto | ccx | ref; auto =
 CalculiX when found, else the reference solver), FEAT_PROCS (CalculiX threads, 1), FEAT_EXECUTOR,
-FEAT_SLURM_MIN_MINUTES (5), FEAT_SLURM_ARGS.
+FEAT_SLURM_MIN_MINUTES (5), FEAT_SLURM_ARGS, FEAT_SLURM_MEM (auto).
 """
 from __future__ import annotations
 
@@ -178,16 +178,11 @@ def _collect(folder: Path) -> dict:
             else:
                 pr["state"] = "queued" if pr["stage"] == "queued" else "running"
             res["progress"][n] = pr
-        res["time_left"], res["next"] = _timing(folder, res["progress"])
         sl = {n: res["progress"][n].get("job_id") for n in pending if n in slurm}
         if sl:
-            when = res["time_left"].get("expected_finish") or f"at the latest {res['time_left']['latest_finish']}"
-            if any(res["progress"][n]["state"] == "queued" for n in sl):
-                when += " once they start (some are waiting in the queue)"
-            res["next"] = (f"The studies are SLURM jobs on this machine (ids {', '.join(str(v) for v in sl.values())}). "
-                           f"They keep running without this conversation. Tell the user when they should finish "
-                           f"({when}) and stop; collect them later with study_status(request='{folder}') or find them "
-                           f"with jobs().")
+            res["time_left"], res["next"] = _timing_slurm(folder, res["progress"], sl)
+        else:
+            res["time_left"], res["next"] = _timing(folder, res["progress"])
     else:
         (folder / "results.json").write_text(json.dumps(res, indent=1))
     return res
@@ -239,11 +234,17 @@ def _stage_s(stage: str, nodes: int | None, rt: dict | None) -> float | None:
     return rt["solve_s"] * (FINE_NODES ** SOLVE_EXP if fine else 1)
 
 
+def _nodes_hint(study: dict) -> int | None:
+    return executor.nodes_hint(study)
+
+
 def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
     """Where a running study is: step k of n (mesh, solve; with converge: true also the finer mesh),
     seconds per step, and minutes left: expected (from this machine's past solves) and at most (the
-    time limit of each remaining solve)."""
+    time limit of each remaining solve). The expected time never exceeds the limit."""
     steps = 4 if study.get("converge") else 2
+    per_stage = max(1, executor.solves_of(study) // (2 if study.get("converge") else 1))  # joule: 2-3 solves
+    timeout = timeout * per_stage
     rt = _rates(study.get("analysis", ""), solver)
     pf = d / "progress.json"
     try:
@@ -251,11 +252,17 @@ def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
     except (OSError, json.JSONDecodeError):
         p = None
     now = time.time()
-    if p is None:  # waiting for a worker
-        exp = sum(_stage_s(s, None, rt) or 0 for s in STAGES[:steps]) if rt else None
-        return {"stage": "queued", "iteration": 0, "max_iterations": steps,
-                "eta_min": None if exp is None else round(exp / 60, 1),
-                "eta_min_max": round(steps / 2 * timeout / 60, 1)}
+    if p is None:  # not started: estimate from the mesh size when it is known before meshing
+        nodes = _nodes_hint(study)
+        worst = steps / 2 * timeout + (sum(_stage_s(s, nodes, rt) or 0 for s in STAGES[:steps] if s.startswith("mesh"))
+                                      if rt and nodes else 0)
+        exp = min(sum(_stage_s(s, nodes, rt) or 0 for s in STAGES[:steps]), worst) if rt and nodes else None
+        out = {"stage": "queued", "iteration": 0, "max_iterations": steps,
+               "eta_min": None if exp is None else round(exp / 60, 1), "eta_min_max": round(worst / 60, 1)}
+        if exp is None:
+            out["note"] = ("expected run time unknown until the study is meshed" if rt else
+                           "no finished solves on this machine yet: expected run time unknown")
+        return out
     step, stage = int(p["step"]), p["stage"]
     el_stage = now - p.get("stage_started", now)
     done = p.get("done_steps_s", [])
@@ -270,10 +277,13 @@ def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
     for s in STAGES[step - 1:steps]:
         if s.startswith("mesh") and rt:
             worst += max((_stage_s(s, nodes, rt) or 0) - (el_stage if s == stage else 0), 0)
+    worst = max(worst, 0)
+    if exp is not None:
+        exp = min(exp, worst)   # the time limits bound it: a slower run stops at its timeout
     out = {"stage": stage, "iteration": step, "max_iterations": steps,
            "s_per_iteration": round(sum(done) / len(done), 1) if done else None,
            "elapsed_min": round((now - p.get("started", now)) / 60, 1), "nodes": nodes,
-           "eta_min": None if exp is None else round(exp / 60, 1), "eta_min_max": round(max(worst, 0) / 60, 1)}
+           "eta_min": None if exp is None else round(exp / 60, 1), "eta_min_max": round(worst / 60, 1)}
     if rt is None:
         out["note"] = "no finished solves on this machine yet: eta_min is unknown until one finishes"
     return out
@@ -281,6 +291,44 @@ def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
 
 def _clock(t: float) -> str:
     return time.strftime("%H:%M", time.localtime(t)) + (" (tomorrow)" if time.localtime(t).tm_yday != time.localtime().tm_yday else "")
+
+
+def _slurm_time(s: str | None) -> float | None:
+    """SLURM's expected start (local ISO time, e.g. 2026-10-18T22:22:27) as epoch seconds."""
+    if not s:
+        return None
+    try:
+        return time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def _timing_slurm(folder: Path, progress: dict, ids: dict) -> tuple[dict, str]:
+    """Request-level time left when studies are SLURM jobs: a running study ends after its own time left;
+    a queued one starts at SLURM's expected start (planned from the time limits of the jobs ahead, so it
+    is a latest start) and then needs its run time."""
+    now = time.time()
+    exp_end, max_end = [], []
+    for p in progress.values():
+        start = now if p.get("state") != "queued" else _slurm_time(p.get("expected_start"))
+        exp_end.append(None if start is None or p.get("eta_min") is None else start + 60 * p["eta_min"])
+        max_end.append(None if start is None else start + 60 * p["eta_min_max"])
+    t_exp = max(exp_end) if exp_end and all(e is not None for e in exp_end) else None
+    t_max = max(max_end) if max_end and all(e is not None for e in max_end) else None
+    t = {"eta_min": None if t_exp is None else round((t_exp - now) / 60, 1),
+         "eta_min_max": None if t_max is None else round((t_max - now) / 60, 1),
+         "expected_finish": None if t_exp is None else _clock(t_exp),
+         "latest_finish": None if t_max is None else _clock(t_max), "includes_queue_wait": True}
+    if t_exp is not None and t_max is not None:
+        when = f"around {t['expected_finish']} (at the latest {t['latest_finish']})"
+    elif t_max is not None:
+        when = f"by {t['latest_finish']} at the latest (no estimate of the run time yet)"
+    else:
+        when = "when the jobs ahead of them in the queue are done (SLURM gives no start time yet)"
+    nxt = (f"The studies are SLURM jobs on this machine (ids {', '.join(str(v) for v in ids.values())}). They keep "
+           f"running without this conversation. Tell the user they should finish {when} and stop; collect them "
+           f"later with study_status(request='{folder}') or find them with jobs().")
+    return t, nxt
 
 
 def _timing(folder: Path, progress: dict) -> tuple[dict, str]:
