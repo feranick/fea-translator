@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.16.8
+Version: 2026.10.18.1
 """
 import shutil
 from pathlib import Path
@@ -136,7 +136,7 @@ def test_validation():
 
 # ---- benchmarks: reference solver on box parts (always), every case with Gmsh and CalculiX
 
-BOX = ["axial_bar", "cantilever", "cantilever_modal", "gravity_block", "pressure_cantilever", "slab", "fin_end", "fin_sides"]
+BOX = ["axial_bar", "cantilever", "cantilever_modal", "gravity_block", "pressure_cantilever", "slab", "fin_end", "fin_sides", "bar_resistance", "bar_current", "plate_capacitor", "joule_bar", "thermal_stress_bar"]
 
 
 @pytest.mark.parametrize("name", BOX)
@@ -369,3 +369,29 @@ def test_runs_record_their_timing(tmp_path, monkeypatch):
     assert recs[-1]["analysis"] == "static" and recs[-1]["nodes"] > 0 and recs[-1]["solve_s"] >= 0
     prog = json.loads((tmp_path / r["request"].split("/")[-1] / "cant" / "progress.json").read_text())
     assert prog["step"] == 2 and prog["steps"] == 2 and prog["stage"] == "solve"
+
+
+def test_electrical_validation_and_format():
+    fmt = study_format()
+    assert {"electric", "electrostatic", "joule"} <= set(fmt["analyses"])
+    assert {"voltage", "current"} <= set(fmt["bc_kinds"]) and "resistivity" in fmt["material_keys"]
+    box = {"box": [10, 10, 10]}
+    errs = lambda st: " ".join(validate_study(st)["errors"])  # noqa: E731
+    assert "two terminals" in errs({"part": box, "material": "copper", "analysis": "electric",
+                                    "bcs": [{"kind": "voltage", "faces": {"nx": 1}, "V": 0}]})
+    assert "voltage terminal" in errs({"part": box, "material": "copper", "analysis": "electric",
+                                       "bcs": [{"kind": "current", "faces": {"nx": 1}, "I": 1},
+                                               {"kind": "current", "faces": {"nx": -1}, "I": -1}]})
+    assert "two different voltages" in errs({"part": box, "material": "ptfe", "analysis": "electrostatic",
+                                             "bcs": [{"kind": "voltage", "faces": {"nx": 1}, "V": 5}]})
+    assert "needs 'permittivity'" in errs({"part": box, "material": "copper", "analysis": "electrostatic",
+                                           "bcs": [{"kind": "voltage", "faces": {"nx": 1}, "V": 5},
+                                                   {"kind": "voltage", "faces": {"nx": -1}, "V": 0}]})
+    assert "need stress: true" in errs({"part": box, "material": "steel", "analysis": "thermal",
+                                        "bcs": [{"kind": "temperature", "faces": {"nx": 1}, "T": 50},
+                                                {"kind": "fixed", "faces": {"nx": -1}}]})
+    assert "not used in a static" in errs({"part": box, "material": "steel", "analysis": "static",
+                                           "bcs": [{"kind": "fixed", "faces": {"nx": -1}},
+                                                   {"kind": "voltage", "faces": {"nx": 1}, "V": 1}]})
+    for name in ("bar_resistance", "plate_capacitor", "joule_bar", "thermal_stress_bar", "coax_capacitor"):
+        assert validate_study(bench.cases()[name])["ok"], name

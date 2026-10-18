@@ -4,7 +4,7 @@ Turns an **FEA study** (one solid part, a material, an analysis, supports and lo
 
 It is the FEA counterpart of [build123d-translator](https://github.com/feranick/build123d-translator): an LLM writes the study (the flexible part), the translator computes everything else (which mesh faces, which nodes, consistent nodal loads, element face numbers, the deck), and a checker confirms the result: closed-form benchmarks, equilibrium and heat balance on every run, expected values, and mesh convergence. Parts are STEP files or build123d-translator goals, so the same face conventions select CAD features and boundary conditions.
 
-Analyses: **linear static** (displacements, von Mises stress, reactions, safety factor), **modal** (natural frequencies), **linear buckling** (load factors), **steady heat transfer** (temperatures, heat flows).
+Analyses: **linear static** (displacements, von Mises stress, reactions, safety factor), **modal** (natural frequencies), **linear buckling** (load factors), **steady heat transfer** (temperatures, heat flows; with `stress: true`, thermal stresses), **DC electric conduction** (terminal currents, resistance, power, current density), **electrostatics** (charges, capacitance, field, margin to breakdown) and **Joule heating** (electric, then thermal, optionally stresses).
 
 ## Install
 
@@ -31,7 +31,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 33 tests: 19 run anywhere, 14 need ccx (and Gmsh)
+pytest -q                      # 47 tests: 27 run anywhere, 20 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -69,7 +69,8 @@ Per study the folder holds `part.step`, `mesh.msh`, `<name>.inp` (the deck; runs
 - **Part:** `{"step": path}` (mm) or `{"goal": ...}` (built with build123d-translator); `{"box": [lx, ly, lz]}` is a structured box mesh without Gmsh (tests, quick checks).
 - **Material:** a name (steel, stainless_304, aluminium_6061_t6, titanium_ti6al4v, copper, brass, cast_iron, abs, pla, nylon_pa6; typical values) or `{E, nu, density, k, alpha, yield}`, or a name with overrides `{"name": "steel", "yield": 355}`.
 - **Faces** (as build123d-translator): `{nx, ny, nz}` the largest planar face with that outward normal (`at` for the nearest one), `{pts: [[x, y, z], ...]}` the face nearest to each point, `{cyl_r: r}` every cylindrical face of radius r (found by fitting the mesh, so it does not depend on how the STEP describes the surface; `side: "inner"` for holes and bores only, `"outer"` for shafts, bosses and outside fillets, which otherwise match too: a 4 mm hole and 4 mm corner fillets are all `cyl_r: 4`), `{all: true}`; a list is their union. Every result lists what each selector took (`selection`: kind, radius, side, arc, area, centre per face), with a warning when one `cyl_r` takes holes and convex faces together.
-- **Boundary conditions:** `fixed`, `slider` (normal displacement zero: symmetry planes, rollers), `displacement` (prescribed components); loads `force` (a total force spread uniformly over the faces' area), `pressure` (normal, positive into the part), `gravity`; thermal `temperature`, `heat_flux`, `heat` (total watts on faces), `convection`.
+- **Boundary conditions:** `fixed`, `slider` (normal displacement zero: symmetry planes, rollers), `displacement` (prescribed components); loads `force` (a total force spread uniformly over the faces' area), `pressure` (normal, positive into the part), `gravity`; thermal `temperature`, `heat_flux`, `heat` (total watts on faces), `convection`; electrical `voltage` (a terminal or electrode; 0 V for ground) and `current` (total amperes into the faces).
+- **Electrical** (2026.10.18.1): `electric` (resistivity) and `electrostatic` (permittivity) are solved by CalculiX's steady heat transfer, whose equation is the same (∇·(σ∇φ) = 0 with the potential for the temperature); `joule` runs the electric solve, puts σ|∇φ|² into each element as heat and solves the thermal problem with the study's thermal bcs. `stress: true` on `thermal` or `joule` adds a static solve with the temperatures (expansion from `T_ref`, default 20 °C) and the mechanical bcs. Electrical material data in the library: `resistivity` (Ω m), `permittivity` (relative), `dielectric_strength` (kV/mm); new materials silver, gold, alumina_96, fr4, ptfe. Resistivity is constant (room temperature).
 - **Mesh:** `size` (mm; default 1/20 of the bounding-box diagonal), `order` 2 (10-node tetrahedra, default; 4-node ones are far too stiff in bending), `refine: [{at, r, size}]` finer spheres at stress concentrations. `converge: true` reruns at 0.6 × size and reports the change of the main results.
 - **Large meshes:** `equation_solver`: `auto` (CalculiX's iterative Cholesky-preconditioned solver above 150,000 nodes for static and thermal, else the direct one), `direct` or `iterative`.
 - **Checks:** `expect: [{quantity, value, tol}]` with a dotted path into the results (`max_displacement`, `max_von_mises_nodal`, `frequencies.0`, `critical_factor`, `reactions.wall.fz`, `faces.load.mean_u.uz`, `probes.tip.mean_u.uz`, `heat_flow.base`, `T_max`...).
@@ -82,6 +83,10 @@ Per study the folder holds `part.step`, `mesh.msh`, `<name>.inp` (the deck; runs
 | modal | `frequencies` (Hz), `mass_kg` |
 | buckling | `buckling_factors`, `critical_factor` (critical load = factor × the applied loads) |
 | thermal | `T_max`, `T_min` (+ where), `heat_flow` per temperature and convection boundary (W, into the part), `heat_balance_error`, `faces` and `probes` (mean, max, min temperature) |
+| electric | `terminals` (per terminal: `V`, `I_A` into the part), `resistance_ohm` (two terminals), `power_W`, `current_balance_error`, `max_current_density_A_mm2` (+ where) and `max_current_density_off_terminals_A_mm2`, `V_max`, `V_min`, `faces`/`probes` mean potential |
+| electrostatic | `terminals` (`V`, `Q_C`), `capacitance_pF` (two voltage levels), `energy_J`, `charge_balance_error`, `max_field_kV_mm` (+ where) and `max_field_off_electrodes_kV_mm`, `breakdown_safety_factor` (dielectric strength / peak field, also off the electrode edges) |
+| joule | the thermal results, `electric` (the electric results), `joule_heat_W` and `joule_check_error` (element-wise heat against the electric power) |
+| thermal or joule with `stress: true` | `stress`: the static results (displacements, von Mises peaks, safety factors, reactions) of the thermal expansion |
 
 Every run also returns `checks` (the `expect` list, pass or fail), `passed`, `warnings` (unbalanced reactions or heat; a result changing by more than 5 % on a finer mesh; a peak at a support or load; a peak that grows on a finer mesh while the displacement has converged, i.e. a singularity; a `cyl_r` that took holes and fillets together), mesh size and counts, times, and the files.
 
@@ -100,6 +105,11 @@ Every run also returns `checks` (the `expect` list, pass or fail), `passed`, `wa
 | `slab`, `fin_end` | conduction, conduction + end convection | 1e-6 (exact) |
 | `fin_sides` | pin fin with convecting sides and tip (1-D fin) | 1 % |
 | `lame_ring` | quarter ring under internal pressure: Lamé bore displacement and von Mises | 2 % (Gmsh) |
+| `bar_resistance`, `bar_current` | copper bar: R = ρL/A, I = V/R, J = I/A; terminal voltage IR | 1e-6 (exact) |
+| `plate_capacitor` | FR-4 plate: C = ε₀εᵣA/d, E = V/d, breakdown margin | 1e-6 (exact) |
+| `coax_capacitor` | PTFE ring: C = 2πεL/ln(ro/ri) | 0.5 % (Gmsh) |
+| `joule_bar` | steel bar, both ends at 20 °C: P = V²/R, T_max = T₀ + qL²/8k | 1e-6 (exact) |
+| `thermal_stress_bar` | bar at a uniform 120 °C between walls: σ = EαΔT, wall reaction | 1e-6 (exact) |
 | `plate_hole` | quarter plate with a hole: Kt = 2 + (1 − d/W)³ on the net section | 5 % (Gmsh, CalculiX) |
 
 **Status (2026-10-16, carbonio: CalculiX from Ubuntu's calculix-ccx, Gmsh 4.15.2, Python 3.14):** with 2026.10.16.3 all 28 tests and all 11 benchmarks pass with CalculiX and Gmsh (`euler_column`, `lame_ring` and `plate_hole` included). On the first run 10 of 11 passed: `lame_ring` met its Lamé values but its equilibrium check was off by 0.1 %, because the loads on support nodes were integrated on flat triangles while CalculiX integrates the curved faces; the face integrals are now isoparametric. The reference solver passes the 9 cases without Gmsh or CalculiX (the exact ones to rounding; cantilever 1.0 %, frequency 0.13 %, pin fin 0.09 %) and a curved quarter ring (bore displacement 0.01 %, equilibrium 1e-8). Buckling was then found to depend on the machine's load (1 of 4 concurrent `euler_column` runs returned 10-21 instead of 674.7): with eigenvalue accuracy 1e-6 and serial buckling jobs (2026.10.16.8), 8 of 8 concurrent runs give 676.25, identical to every digit.
@@ -169,7 +179,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `pyproject.toml` | 2026.10.16.10 |
+| Package, `study.py`, `deck.py`, `runner.py`, `meshdata.py`, `refsolver.py`, `bench.py`, `mcp_server.py` | 2026.10.18.1 (electrical: `electric` and `electrostatic` analyses solved as heat transfer, `joule` (electric, then thermal with the Joule heat per element), `stress: true` for thermal and joule (thermal expansion in a static solve); `voltage` and `current` bcs; resistivity, permittivity and dielectric strength in the material library, five new materials; reference solver: body heat, heat-flux output, thermal strain; six benchmarks, five exact; no false 'peak at a support' for a uniform stress, heat-balance floor for a uniform temperature) |
+| Package (before), `pyproject.toml` | 2026.10.16.10 |
 | `api.py`, `runner.py`, `mcp_server.py` | 2026.10.16.10 (long runs: `progress` per pending study, `time_left` and `next`; `timing.jsonl` of finished solves for the expected time; instructions: tell the user when to come back instead of polling runs over about 5 min) |
 | Package (before) | 2026.10.16.9 (the `mesh` extra skips Gmsh on Linux ARM, where PyPI has no wheels; README: Ubuntu's python3-gmsh linked into the venv) |
 | `runner.py`, `deck.py` | 2026.10.16.8 (buckling: eigenvalue accuracy 1e-6 instead of CalculiX's 0.01, and one thread per buckling job: with one BLAS thread only, 1 of 4 concurrent `euler_column` runs still returned a wrong factor (20.8); a test runs four at once) |

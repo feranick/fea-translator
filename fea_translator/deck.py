@@ -1,5 +1,5 @@
 """deck.py — a study and its mesh as a CalculiX input deck (.inp).
-Version: 2026.10.16.8
+Version: 2026.10.18.1
 
     text, plan = write(name, study, mesh)
 
@@ -85,20 +85,29 @@ def equation_solver(study: dict, n_nodes: int) -> str:
     """'direct' (SPOOLES) or 'iterative' (preconditioned conjugate gradients: much less memory and time
     on large solid meshes); eigenvalue analyses (modal, buckling) always use the direct solver."""
     choice = study.get("equation_solver", "auto")
-    if study["analysis"] not in ("static", "thermal"):
+    if study["analysis"] not in ("static", "thermal", "electric", "electrostatic"):
         return "direct"
     if choice == "auto":
         return "iterative" if n_nodes > ITERATIVE_ABOVE else "direct"
     return choice
 
 
-def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
+FIELD = ("electric", "electrostatic")  # solved as steady heat transfer: potential for temperature
+
+
+def write(name: str, study: dict, mesh: Mesh, extra: dict | None = None) -> tuple[str, dict]:
+    """The deck of one solve. extra: body_heat (W/mm3 per element) for a thermal solve, or
+    temperatures (degrees C per node) and T_ref for a static solve with thermal expansion."""
+    extra = extra or {}
     an = study["analysis"]
     mat = to_deck_units(material_of(study))
     tags = resolve(study, mesh)
     etype = "C3D10" if mesh.order == 2 else "C3D4"
     L = [f"** {name}: written by fea-translator {__version__} ({an})",
-         "** units: mm, N, s, t (tonne), mW; temperatures in degrees C",
+         "** units: mm, N, s, t (tonne), mW; temperatures in degrees C" if an not in FIELD else
+         ("** electric, solved as heat transfer: potential (V) for temperature, conductivity S/mm, current A, A/mm2"
+          if an == "electric" else
+          "** electrostatic, solved as heat transfer: potential (V) for temperature, relative permittivity for conductivity"),
          "*NODE, NSET=NALL"]
     L += [f"{i + 1}, {_g(x)}, {_g(y)}, {_g(z)}" for i, (x, y, z) in enumerate(mesh.nodes)]
     L.append(f"*ELEMENT, TYPE={etype}, ELSET=EALL")
@@ -106,17 +115,24 @@ def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
     plan = {"analysis": an, "sets": {}, "applied_force": [0.0, 0.0, 0.0], "supports": [], "loads": [],
             "heat_in_W": 0.0, "films": [], "fluxes": [], "tags": tags, "dofs": {},
             # equivalent nodal loads (N) and heat (mW): CalculiX's RF / RFL at a node include them
-            "nodal_load": np.zeros((len(mesh.nodes), 3)), "nodal_heat": np.zeros(len(mesh.nodes))}
+            "nodal_load": np.zeros((len(mesh.nodes), 3)), "nodal_heat": np.zeros(len(mesh.nodes)),
+            "current_in_A": 0.0, "terminals": {}}
     for bname, tg in tags.items():
         nodes = mesh.nodes_of(tg)
         sname = set_name(bname.replace("probe:", "P_"))
         plan["sets"][bname] = {"nset": sname, "nodes": (nodes + 1).tolist(), "area": mesh.area_of(tg)}
         L.append(f"*NSET, NSET={sname}")
         L += _lines((nodes + 1).tolist())
-    L += ["*MATERIAL, NAME=MAT", "*ELASTIC", f"{_g(mat['E'])}, {_g(mat['nu'])}"]
+    L.append("*MATERIAL, NAME=MAT")
+    if "E" in mat:
+        L += ["*ELASTIC", f"{_g(mat['E'])}, {_g(mat['nu'])}"]
     if "density" in mat:
         L += ["*DENSITY", _g(mat["density"])]
-    if "k" in mat:
+    if an == "electric":
+        L += ["*CONDUCTIVITY", _g(mat["sigma"])]
+    elif an == "electrostatic":
+        L += ["*CONDUCTIVITY", _g(mat["eps_r"])]
+    elif "k" in mat:
         L += ["*CONDUCTIVITY", _g(mat["k"])]
     if "alpha" in mat:
         L += ["*EXPANSION", _g(mat["alpha"])]
@@ -125,6 +141,11 @@ def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
         temps = [float(b["T"]) for b in study["bcs"] if b["kind"] == "temperature"] + \
                 [float(b["T_inf"]) for b in study["bcs"] if b["kind"] == "convection"]
         L += ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"NALL, {_g(sum(temps) / len(temps))}"]
+    elif an in FIELD:
+        volts = [float(b["V"]) for b in study["bcs"] if b["kind"] == "voltage"]
+        L += ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"NALL, {_g(sum(volts) / len(volts))}"]
+    elif an == "static" and "temperatures" in extra:
+        L += ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"NALL, {_g(extra['T_ref'])}"]
     L.append("*STEP")
     modes = int(study.get("modes", 6 if an == "modal" else 3))
     if an == "buckling":
@@ -133,7 +154,9 @@ def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
     plan["equation_solver"] = method
     opt = ", SOLVER=ITERATIVE CHOLESKY" if method == "iterative" else ""
     L += {"static": [f"*STATIC{opt}"], "modal": ["*FREQUENCY", str(modes)], "buckling": ["*BUCKLE", f"{modes}, 1.E-6"],  # accuracy 1e-6 (CalculiX's default 0.01 let a wrong factor through)
-          "thermal": [f"*HEAT TRANSFER, STEADY STATE{opt}", "1., 1."]}[an]
+          "thermal": [f"*HEAT TRANSFER, STEADY STATE{opt}", "1., 1."],
+          "electric": [f"*HEAT TRANSFER, STEADY STATE{opt}", "1., 1."],
+          "electrostatic": [f"*HEAT TRANSFER, STEADY STATE{opt}", "1., 1."]}[an]
     bnd, cload, dload, dflux, film = [], {}, [], [], []
     for i, bc in enumerate(study.get("bcs", [])):
         k, bname = bc["kind"], bc_name(i, bc)
@@ -185,6 +208,18 @@ def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
             plan["heat_in_W"] += q * mesh.area_of(tg) / P_SCALE
             plan["nodal_heat"] += mesh.flux_nodes(tg, q)
             plan["fluxes"].append(bname)
+        elif k == "voltage":
+            bnd.append(f"{sname}, 11, 11, {_g(bc['V'])}")
+            plan["supports"].append(bname)
+            plan["dofs"][bname] = [0]
+            plan["terminals"][bname] = {"kind": "voltage", "V": float(bc["V"])}
+        elif k == "current":
+            q = float(bc["I"]) / mesh.area_of(tg)  # A/mm2 with the conductivity in S/mm
+            dflux += [f"{e + 1}, S{s}, {_g(q)}" for e, s in mesh.faces_of(tg)]
+            plan["current_in_A"] += float(bc["I"])
+            plan["nodal_heat"] += mesh.flux_nodes(tg, q)
+            plan["fluxes"].append(bname)
+            plan["terminals"][bname] = {"kind": "current", "I": float(bc["I"]), "tags": tg}
         elif k == "convection":
             h = float(bc["h"]) * H_SCALE
             film += [f"{e + 1}, F{s}, {_g(bc['T_inf'])}, {_g(h)}" for e, s in mesh.faces_of(tg)]
@@ -199,6 +234,13 @@ def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
                     L.append(f"{n + 1}, {d + 1}, {_g(cload[n][d])}")
     if dload:
         L += ["*DLOAD"] + dload
+    if "body_heat" in extra and an == "thermal":  # W/mm3 per element -> mW/mm3 body flux
+        q = np.asarray(extra["body_heat"], float)
+        dflux += [f"{e + 1}, BF, {_g(v * P_SCALE)}" for e, v in enumerate(q) if v != 0]
+        plan["heat_in_W"] += float((q * mesh.element_volumes()).sum())
+        plan["nodal_heat"] += mesh.source_nodes(q * P_SCALE)
+    if "temperatures" in extra and an == "static":
+        L += ["*TEMPERATURE"] + [f"{i + 1}, {_g(t)}" for i, t in enumerate(extra["temperatures"])]
     if dflux:
         L += ["*DFLUX"] + dflux
     if film:
@@ -208,8 +250,8 @@ def write(name: str, study: dict, mesh: Mesh) -> tuple[str, dict]:
         for s in plan["supports"]:
             L += [f"*NODE PRINT, NSET={plan['sets'][s]['nset']}", "RF"]  # per node: shared nodes counted once
         L += ["*NODE FILE", "U", "*EL FILE", "S"]
-    elif an == "thermal":
-        L += ["*NODE PRINT, NSET=NALL", "NT"]
+    elif an in ("thermal",) + FIELD:
+        L += ["*NODE PRINT, NSET=NALL", "NT", "*EL PRINT, ELSET=EALL", "HFL"]
         for s in plan["supports"]:
             L += [f"*NODE PRINT, NSET={plan['sets'][s]['nset']}", "RFL"]
         L += ["*NODE FILE", "NT", "*EL FILE", "HFL"]

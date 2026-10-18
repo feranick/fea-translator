@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.16.10
+Version: 2026.10.18.1
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -28,7 +28,7 @@ import numpy as np
 from . import __version__, deck, results
 from .meshdata import Mesh, MeshError
 from .mesher import mesh_part
-from .study import bc_name, material_of
+from .study import EPS0, bc_name, material_of, to_deck_units
 
 
 class SolverError(Exception):
@@ -181,7 +181,9 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, b
             val, at_bc, nodes_ = peaks[kind]
             out["peak_von_mises"] = round(val, 6)
             out["peak_from"] = {"ip": "integration points", "nodal": "nodes"}[kind]
-            if at_bc:
+            offp_ = max(out.get("max_von_mises_off_bc", 0), out.get("max_von_mises_nodal_off_bc", 0))
+            uniform = sb is not None and val <= 1.05 * float(np.median(vm))
+            if at_bc and not uniform and not (offp_ and val <= 1.05 * offp_):  # a uniform stress is not a peak
                 names = sorted({owner[int(q)] for q in nodes_ if int(q) in owner} or
                                {owner[int(q)] for e in np.nonzero(touch & np.isin(mesh.tets, nodes_).any(axis=1))[0]
                                 for q in mesh.tets[e] if int(q) in owner})
@@ -237,6 +239,8 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, b
         out["buckling_factors"] = f
         pos = [x for x in f if x > 0]
         out["critical_factor"] = min(pos) if pos else None
+    elif an in ("electric", "electrostatic"):
+        out.update(_field_results(study, mesh, plan, dat, band))
     elif an == "thermal":
         T = _node_values(dat, "temperatures", n, 1)[:, 0]
         out["T_max"], out["T_min"] = round(float(np.nanmax(T)), 6), round(float(np.nanmin(T)), 6)
@@ -266,7 +270,9 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, b
             q = fl["h_W"] * 1e-6 * mesh.area_of(fl["tags"]) * (tf - fl["T_inf"])  # W/(m2 K) * m2 * K
             out["heat_flow"][fl["name"]] = round(-q, 9)
             film_out += q
-        scale = max(sum(abs(v) for v in out["heat_flow"].values()) + abs(plan["heat_in_W"]), 1e-12)
+        # floor: a heat flow typical of the part (k L, 1 K), so a uniform temperature (no flow) reads as balanced
+        typical = float(mat.get("k", 1.0)) * 1e-3 * mesh.size
+        scale = max(sum(abs(v) for v in out["heat_flow"].values()) + abs(plan["heat_in_W"]), typical)
         out["heat_balance_error"] = round(abs(into - film_out) / scale, 8)
         out["faces"] = {}
         for bname, tags in plan["tags"].items():
@@ -275,6 +281,95 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, b
             nodes = mesh.nodes_of(tags)
             tgt[key] = {"mean_T": round(float(_face_mean(mesh, tags, T[:, None])[0]), 6),
                         "max_T": round(float(np.nanmax(T[nodes])), 6), "min_T": round(float(np.nanmin(T[nodes])), 6)}
+    return out
+
+
+def _field_results(study: dict, mesh: Mesh, plan: dict, dat: dict, band: float | None) -> dict:
+    """Electric (DC current) or electrostatic results of a field solved as heat transfer: the potential is
+    the temperature; the heat flux is the current density (electric, A/mm2) or eps_r grad(phi)
+    (electrostatic); the heat a temperature boundary supplies is the current (A) or charge / eps0."""
+    an = study["analysis"]
+    n = len(mesh.nodes)
+    mat = material_of(study)
+    sets = plan["sets"]
+    phi = _node_values(dat, "temperatures", n, 1)[:, 0]
+    out = {"V_max": round(float(np.nanmax(phi)), 9), "V_min": round(float(np.nanmin(phi)), 9)}
+    scale = 1.0 if an == "electric" else EPS0          # A, or C per (eps_r V mm)
+    terms, taken = {}, set()
+    for s in plan["supports"]:                         # voltage terminals
+        b = [x for x in dat["blocks"] if x["set"] == sets[s]["nset"] and x["rows"]]
+        if not b:
+            raise SolverError(f"no flow through terminal {s} in the .dat file")
+        q = 0.0
+        for row in b[-1]["rows"]:
+            nd = int(row[0])
+            if nd not in taken:                        # applied current at a shared node is not this terminal's
+                taken.add(nd)
+                q += row[1] - plan["nodal_heat"][nd - 1]
+        terms[s] = {"V": plan["terminals"][s]["V"], ("I_A" if an == "electric" else "Q_C"): q * scale}
+    for s, t in plan["terminals"].items():             # current terminals: the potential they reach (face mean)
+        if t["kind"] == "current":
+            terms[s] = {"V": float(_face_mean(mesh, t["tags"], phi[:, None])[0]), "I_A": t["I"]}
+    key = "I_A" if an == "electric" else "Q_C"
+    for t in terms.values():
+        t["V"] = round(t["V"], 9)
+        t[key] = float(f"{t[key]:.9g}")
+    out["terminals"] = terms
+    total = sum(t[key] for t in terms.values())
+    big = max((abs(t[key]) for t in terms.values()), default=0.0)
+    out["current_balance_error" if an == "electric" else "charge_balance_error"] = round(abs(total) / max(big, 1e-300), 8)
+    levels = sorted({t["V"] for t in terms.values()})
+    if an == "electric":
+        out["power_W"] = float(f"{sum(t['V'] * t['I_A'] for t in terms.values()):.9g}")
+        if len(terms) == 2:
+            (na, a), (nb, b) = sorted(terms.items(), key=lambda kv: -kv[1]["V"])
+            if abs(a["I_A"]) > 0:
+                out["resistance_ohm"] = float(f"{(a['V'] - b['V']) / a['I_A']:.9g}")
+    else:
+        out["energy_J"] = float(f"{0.5 * sum(t['V'] * t['Q_C'] for t in terms.values()):.9g}")
+        if len(levels) == 2:
+            hi = sum(t["Q_C"] for t in terms.values() if t["V"] == levels[1])
+            out["capacitance_pF"] = float(f"{abs(hi) / (levels[1] - levels[0]) * 1e12:.9g}")
+    hb = results.block(dat, "heat flux", "EALL")
+    if hb and hb["rows"]:
+        rows = np.array(hb["rows"])
+        el = rows[:, 0].astype(int) - 1
+        mag = np.linalg.norm(rows[:, 2:5], axis=1)
+        if an == "electrostatic":
+            mag = mag / float(mat["permittivity"]) / 1e3   # eps_r |grad phi| -> |E| in kV/mm
+        j = int(np.argmax(mag))
+        where = np.round(mesh.nodes[mesh.tets[el[j], :4]].mean(axis=0), 4).tolist()
+        # away from the terminals / electrode edges, where fields concentrate (sharp edges are singular)
+        bc_node = np.zeros(n, bool)
+        for s in sets:
+            if not s.startswith("probe:"):
+                bc_node[np.array(sets[s]["nodes"]) - 1] = True
+        off = ~bc_node[mesh.tets[el]].any(axis=1)
+        if band and bc_node.any():
+            from scipy.spatial import cKDTree
+
+            cen = mesh.nodes[mesh.tets[el, :4]].mean(axis=1)
+            off &= cKDTree(mesh.nodes[bc_node]).query(cen, distance_upper_bound=band)[0] > band
+        offv = float(mag[off].max()) if off.any() else None
+        if an == "electric":
+            out["max_current_density_A_mm2"] = round(float(mag[j]), 9)
+            out["max_current_density_at"] = where
+            if offv is not None:
+                out["max_current_density_off_terminals_A_mm2"] = round(offv, 9)
+        else:
+            out["max_field_kV_mm"] = round(float(mag[j]), 9)
+            out["max_field_at"] = where
+            if offv is not None:
+                out["max_field_off_electrodes_kV_mm"] = round(offv, 9)
+            if mat.get("dielectric_strength"):
+                out["breakdown_safety_factor"] = round(float(mat["dielectric_strength"]) / float(mag[j]), 4)
+                if offv:
+                    out["breakdown_safety_factor_off_electrodes"] = round(float(mat["dielectric_strength"]) / offv, 4)
+    out["faces"] = {}
+    for bname, tags in plan["tags"].items():
+        k = bname.replace("probe:", "")
+        tgt = out.setdefault("probes", {}) if bname.startswith("probe:") else out["faces"]
+        tgt[k] = {"mean_V": round(float(_face_mean(mesh, tags, phi[:, None])[0]), 9)}
     return out
 
 
@@ -294,6 +389,9 @@ def check_expectations(study: dict, res: dict) -> list[dict]:
 
 
 MAIN = {"static": ("max_displacement", "peak_von_mises", "peak_von_mises_off_bc"), "modal": ("frequencies.0",),
+        "electric": ("resistance_ohm", "power_W", "max_current_density_off_terminals_A_mm2"),
+        "electrostatic": ("capacitance_pF", "energy_J", "max_field_off_electrodes_kV_mm"),
+        "joule": ("T_max", "joule_heat_W"),
         "buckling": ("critical_factor",), "thermal": ("T_max", "T_min")}
 
 
@@ -334,6 +432,49 @@ class Progress:
         tmp.replace(self.path)
 
 
+ELECTRIC_BCS = ("voltage", "current")
+THERMAL_BCS = ("temperature", "heat_flux", "heat", "convection")
+MECH_BCS = ("fixed", "slider", "displacement", "force", "pressure", "gravity")
+
+
+def _sub(study: dict, analysis: str, kinds) -> dict:
+    """The part of a study one solve needs: its analysis and its kinds of bcs (named as in the study)."""
+    bcs = [dict(b, name=bc_name(i, b)) for i, b in enumerate(study.get("bcs", [])) if b["kind"] in kinds]
+    return dict(study, analysis=analysis, bcs=bcs)
+
+
+def _solve(name: str, study: dict, mesh: Mesh, folder: Path, solver: str, timeout: float, extra=None):
+    """Writes and solves one deck; returns (plan, dat, frd, inp)."""
+    text, plan = deck.write(name, study, mesh, extra)
+    inp = folder / f"{name}.inp"
+    inp.write_text(text)
+    if solver == "ref":
+        from . import refsolver
+        refsolver.run(inp)
+    else:
+        run_ccx(inp, timeout, serial=study["analysis"] == "buckling")
+    dat = results.parse_dat(inp.with_suffix(".dat").read_text())
+    frd_path = inp.with_suffix(".frd")
+    frd = results.parse_frd(frd_path.read_text()) if frd_path.is_file() else None
+    return plan, dat, frd, inp
+
+
+def joule_heat(study: dict, mesh: Mesh, dat: dict) -> np.ndarray:
+    """Joule heat per element (W/mm3) from the current density at the integration points of an electric
+    solve: |J|^2 / sigma, averaged over each element's points (J in A/mm2, sigma in S/mm)."""
+    b = results.block(dat, "heat flux", "EALL")
+    if b is None or not b["rows"]:
+        raise SolverError("no current densities in the electric solve's .dat file")
+    rows = np.array(b["rows"])
+    el = rows[:, 0].astype(int) - 1
+    j2 = (rows[:, 2:5] ** 2).sum(axis=1)
+    acc, cnt = np.zeros(len(mesh.tets)), np.zeros(len(mesh.tets))
+    np.add.at(acc, el, j2)
+    np.add.at(cnt, el, 1)
+    sigma = to_deck_units(material_of(study))["sigma"]
+    return acc / np.maximum(cnt, 1) / sigma
+
+
 def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float, size_factor: float = 1.0,
                progress: Progress | None = None) -> dict:
     fine = size_factor != 1.0
@@ -344,32 +485,62 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     if size_factor != 1.0 and minfo.get("size"):
         minfo["size_nominal"] = minfo["size"] / size_factor   # the same off-bc band as the nominal mesh
     t1 = time.perf_counter()
-    text, plan = deck.write(name, study, mesh)
-    inp = folder / f"{name}.inp"
-    inp.write_text(text)
     if progress:
         progress.stage("solve_fine" if fine else "solve", **{("nodes_fine" if fine else "nodes"): int(minfo.get("nodes", 0))})
-    if solver == "ref":
-        from . import refsolver
-        refsolver.run(inp)
-    else:
-        run_ccx(inp, timeout, serial=study["analysis"] == "buckling")
-    t2 = time.perf_counter()
-    _record_timing(study, solver, minfo, t1 - t0, t2 - t1)
-    dat = results.parse_dat(inp.with_suffix(".dat").read_text())
-    frd_path = inp.with_suffix(".frd")
-    frd = results.parse_frd(frd_path.read_text()) if frd_path.is_file() else None
     # default band: two elements of the nominal mesh (one element is still inside the singular zone;
     # the bracket test: a 1-element band moved 14 % on refinement, a 2-element band 0.3 %)
     h = minfo.get("size_nominal") or minfo.get("size")
     band = study.get("stress_band") or (2 * h if h else None)
-    res = evaluate(study, mesh, plan, dat, frd, band)
-    res["selection"] = plan["selection"]
-    res["_selection_warnings"] = plan["selection_warnings"]
-    res["mesh"] = dict(minfo, equation_solver=plan["equation_solver"])
+    an = study["analysis"]
+    files, warns, sel = {}, [], {}
+
+    def run(sname, st, extra=None):
+        plan, dat, frd, inp = _solve(sname, st, mesh, folder, solver, timeout, extra)
+        for k, p in (("inp", inp), ("dat", inp.with_suffix(".dat")), ("frd", inp.with_suffix(".frd"))):
+            if p.is_file():
+                files[k if sname == name else f"{k}_{sname[len(name) + 1:]}"] = str(p)
+        warns.extend(plan["selection_warnings"])
+        sel.update(plan["selection"])
+        return plan, dat, frd
+
+    if an == "joule":
+        st_e = _sub(study, "electric", ELECTRIC_BCS)
+        plan_e, dat_e, frd_e = run(f"{name}_electric", st_e)
+        res_e = evaluate(st_e, mesh, plan_e, dat_e, frd_e, band)
+        q = joule_heat(study, mesh, dat_e)
+        st_t = _sub(study, "thermal", THERMAL_BCS)
+        plan_t, dat_t, frd_t = run(f"{name}_thermal", st_t, {"body_heat": q})
+        res = evaluate(st_t, mesh, plan_t, dat_t, frd_t, band)
+        res["analysis"] = "joule"
+        res["electric"] = {k: v for k, v in res_e.items() if k not in ("analysis",)}
+        jw = float((q * mesh.element_volumes()).sum())
+        res["joule_heat_W"] = round(jw, 9)
+        pw = res_e.get("power_W")
+        if pw:
+            res["joule_check_error"] = round(abs(jw - pw) / max(abs(pw), 1e-30), 6)
+        T = _node_values(dat_t, "temperatures", len(mesh.nodes), 1)[:, 0]
+    else:
+        plan, dat, frd = run(name, study if an != "thermal" else _sub(study, "thermal", THERMAL_BCS))
+        res = evaluate(study if an != "thermal" else _sub(study, "thermal", THERMAL_BCS), mesh, plan, dat, frd, band)
+        T = _node_values(dat, "temperatures", len(mesh.nodes), 1)[:, 0] if an == "thermal" else None
+    if study.get("stress") and an in ("thermal", "joule"):
+        st_s = _sub(study, "static", MECH_BCS)
+        t_ref = float(study.get("T_ref", 20.0))
+        plan_s, dat_s, frd_s = run(f"{name}_stress", st_s, {"temperatures": T, "T_ref": t_ref})
+        rs = evaluate(st_s, mesh, plan_s, dat_s, frd_s, band)
+        rs.pop("analysis", None)
+        rs["T_ref"] = t_ref
+        res["stress"] = rs
+    t2 = time.perf_counter()
+    _record_timing(study, solver, minfo, t1 - t0, t2 - t1)
+    res["selection"] = sel
+    res["_selection_warnings"] = warns
+    res["mesh"] = dict(minfo, equation_solver=deck.equation_solver(study, len(mesh.nodes)))
     res["seconds"] = {"mesh": round(t1 - t0, 3), "solve": round(t2 - t1, 3), "total": round(time.perf_counter() - t0, 3)}
-    res["files"] = {k: str(p) for k, p in (("inp", inp), ("dat", inp.with_suffix(".dat")), ("frd", frd_path),
-                                            ("msh", folder / "mesh.msh"), ("step", Path(minfo.get("step", "")))) if p.is_file()}
+    for k, p in (("msh", folder / "mesh.msh"), ("step", Path(minfo.get("step", "")))):
+        if p.is_file():
+            files[k] = str(p)
+    res["files"] = files
     return res
 
 
@@ -386,7 +557,9 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
             fine = solve_once(name, study, fine_dir, solver, timeout, size_factor=0.6, progress=prog)
             fine.pop("_selection_warnings", None)
             conv = {}
-            for q in MAIN[study["analysis"]]:
+            keys = MAIN[study["analysis"]] + (("stress.max_displacement", "stress.peak_von_mises",
+                                                 "stress.peak_von_mises_off_bc") if study.get("stress") else ())
+            for q in keys:
                 try:
                     a, b = _get(res, q), _get(fine, q)
                     conv[q] = {"mesh": a, "finer_mesh": b, "rel_change": round(abs(b - a) / max(abs(b), 1e-12), 6)}
@@ -399,6 +572,20 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
             warn.append(f"reactions do not balance the loads (error {res['equilibrium_error']:.2g})")
         if res.get("heat_balance_error", 0) > 1e-2:
             warn.append(f"heat balance error {res['heat_balance_error']:.2g}")
+        el = res.get("electric", res)
+        for key, what in (("current_balance_error", "the terminal currents do not add up to zero"),
+                          ("charge_balance_error", "the electrode charges do not add up to zero")):
+            if el.get(key, 0) > 1e-3:
+                warn.append(f"{what} (error {el[key]:.2g})")
+        if res.get("joule_check_error", 0) > 0.03:
+            warn.append(f"the Joule heat put into the thermal solve differs from the electric power by "
+                        f"{100 * res['joule_check_error']:.1f} % (it is taken constant in each element): refine the mesh")
+        st = res.get("stress", {})
+        if st.get("equilibrium_error", 0) > 1e-3:
+            warn.append(f"stress: reactions do not balance (error {st['equilibrium_error']:.2g})")
+        if st.get("peak_at_bc"):
+            warn.append("stress: the peak von Mises stress is at a support, where stresses are singular; judge the "
+                        "design on stress.peak_von_mises_off_bc / stress.safety_factor_off_bc")
         warn += res.pop("_selection_warnings", [])
         ns = res.get("mesh", {}).get("straightened_elements", 0)
         if ns:

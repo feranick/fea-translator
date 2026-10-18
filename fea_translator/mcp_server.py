@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.10.16.10
+Version: 2026.10.18.1
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -29,7 +29,10 @@ except ImportError:  # 1.x
 
 INSTRUCTIONS = """fea-translator runs finite-element analyses of one solid part: linear static (stresses,
 displacements, reactions, safety factor), modal (natural frequencies), linear buckling (load factors)
-and steady heat transfer (temperatures, heat flows). A study names the part (a STEP file or a
+steady heat transfer (temperatures, heat flows; with stress: true, thermal stresses), DC electric
+conduction (terminal currents, resistance, power, current density), electrostatics (charges,
+capacitance, peak field, margin to breakdown) and Joule heating (electric -> heat -> temperatures,
+optionally -> stresses). A study names the part (a STEP file or a
 build123d-translator goal), the material, the analysis, the supports and loads on faces chosen by
 normal, point or cylinder radius, and optional expected values to check. Gmsh meshes the part,
 CalculiX solves it.
@@ -42,7 +45,7 @@ from a task scheduled after that time). Follow 'next' in the result.
 Check equilibrium_error, warnings and 'selection' (what each
 face selector took), and rerun with converge: true before trusting peak stresses; peaks at supports
 are singular: judge designs on peak_von_mises_off_bc and safety_factor_off_bc.
-Units: mm, N, MPa, kg/m3, W, degrees C."""
+Units: mm, N, MPa, kg/m3, W, degrees C; V, A, ohm m, kV/mm."""
 
 server = _Server("fea-translator", instructions=INSTRUCTIONS)
 

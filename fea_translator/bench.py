@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.10.16.4
+Version: 2026.10.18.1
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -17,6 +17,12 @@ build123d-translator goals meshed by Gmsh. Cases (E = 210 GPa, nu = 0.3 unless n
   fin_sides       square pin fin 100 mm, sides and tip convecting (h 50): 1-D fin with a convecting tip (1 %)
   lame_ring       quarter ring (a 90-degree revolve) ri 20, ro 40, 10 MPa inside, plane stress: Lame bore displacement
                   and von Mises (2 %; Gmsh)
+  bar_resistance  copper bar 100x10x10, 10 mV across: R = rho L / A, I = V / R, J = I / A (exact)
+  bar_current     the same bar fed 100 A, other end grounded: terminal voltage I R (exact)
+  plate_capacitor FR-4 plate 100x100x1, 1 kV: C = eps0 eps_r A / d, E = V / d (exact)
+  coax_capacitor  PTFE ring ri 5, ro 15, length 20: C = 2 pi eps L / ln(ro/ri) (0.5 %; Gmsh)
+  joule_bar       steel bar, 50 mV across, both ends at 20 C: P = V^2 / R, T_max = T0 + q L^2 / 8k (exact)
+  thermal_stress_bar  steel bar at a uniform 120 C between two walls: sigma = E alpha dT (exact)
   plate_hole      quarter plate 200x50x2 with a 10 mm hole, net-section Kt = 2 + (1 - d/W)^3 (5 %; Gmsh, CalculiX)
 """
 from __future__ import annotations
@@ -59,7 +65,54 @@ def cases(solver: str = "ccx") -> dict:
     ratio = hf / (mf * kf)
     q_fin = Mf * (math.sinh(mf * 0.1) + ratio * math.cosh(mf * 0.1)) / (math.cosh(mf * 0.1) + ratio * math.sinh(mf * 0.1))
     weight = 7850 * (100 * 10 * 10 * 1e-9) * 9.81
+    EPS0_F_M = 8.8541878128e-12
+    r_cu = 1.72e-8 * 0.1 / 1e-4                      # ohm: copper bar, L 0.1 m, A 1e-4 m2
+    r_st = 1.6e-7 * 0.1 / 1e-4                       # steel bar
+    q_st = (0.05 ** 2 / r_st) / (100 * 10 * 10)      # W/mm3 of Joule heat
     out = {
+        "bar_resistance": {"part": _box(100, 10, 10, [10, 2, 2], [0, 0, 0]), "material": "copper", "analysis": "electric",
+                           "bcs": [{"kind": "voltage", "name": "plus", "faces": {"nx": -1}, "V": 0.01},
+                                   {"kind": "voltage", "name": "minus", "faces": {"nx": 1}, "V": 0.0}],
+                           "expect": [{"quantity": "resistance_ohm", "value": r_cu, "tol": 1e-6},
+                                      {"quantity": "terminals.plus.I_A", "value": 0.01 / r_cu, "tol": 1e-6},
+                                      {"quantity": "max_current_density_A_mm2", "value": 0.01 / r_cu / 100, "tol": 1e-6}]},
+        "bar_current": {"part": _box(100, 10, 10, [10, 2, 2], [0, 0, 0]), "material": "copper", "analysis": "electric",
+                        "bcs": [{"kind": "current", "name": "feed", "faces": {"nx": -1}, "I": 100},
+                                {"kind": "voltage", "name": "ground", "faces": {"nx": 1}, "V": 0.0}],
+                        "expect": [{"quantity": "terminals.feed.V", "value": 100 * r_cu, "tol": 1e-6},
+                                   {"quantity": "resistance_ohm", "value": r_cu, "tol": 1e-6},
+                                   {"quantity": "power_W", "value": 100 ** 2 * r_cu, "tol": 1e-6}]},
+        "plate_capacitor": {"part": _box(100, 100, 1, [10, 10, 2], [-50, -50, 0]), "material": "fr4",
+                            "analysis": "electrostatic",
+                            "bcs": [{"kind": "voltage", "name": "hv", "faces": {"nz": 1}, "V": 1000},
+                                    {"kind": "voltage", "name": "ground", "faces": {"nz": -1}, "V": 0}],
+                            "expect": [{"quantity": "capacitance_pF", "value": EPS0_F_M * 4.4 * 0.01 / 0.001 * 1e12, "tol": 1e-6},
+                                       {"quantity": "max_field_kV_mm", "value": 1.0, "tol": 1e-6},
+                                       {"quantity": "breakdown_safety_factor", "value": 20.0, "tol": 1e-6}]},
+        "coax_capacitor": {"part": {"goal": {"features": [{"kind": "base_ring", "params": {"ri": 5, "ro": 15, "h": 20}}]}},
+                           "material": "ptfe", "analysis": "electrostatic", "mesh": {"size": 1.5},
+                           "bcs": [{"kind": "voltage", "name": "inner", "faces": {"cyl_r": 5, "side": "inner"}, "V": 1000},
+                                   {"kind": "voltage", "name": "outer", "faces": {"cyl_r": 15, "side": "outer"}, "V": 0}],
+                           "expect": [{"quantity": "capacitance_pF",
+                                       "value": 2 * math.pi * EPS0_F_M * 2.1 * 0.02 / math.log(3) * 1e12, "tol": 0.005}]},
+        "joule_bar": {"part": _box(100, 10, 10, [10, 2, 2], [0, 0, 0]), "material": "steel", "analysis": "joule",
+                      "bcs": [{"kind": "voltage", "name": "plus", "faces": {"nx": -1}, "V": 0.05},
+                              {"kind": "voltage", "name": "minus", "faces": {"nx": 1}, "V": 0.0},
+                              {"kind": "temperature", "name": "cold_l", "faces": {"nx": -1}, "T": 20},
+                              {"kind": "temperature", "name": "cold_r", "faces": {"nx": 1}, "T": 20}],
+                      "expect": [{"quantity": "joule_heat_W", "value": 0.05 ** 2 / r_st, "tol": 1e-6},
+                                 {"quantity": "T_max", "value": 20 + q_st * 100 ** 2 / (8 * 0.05), "tol": 1e-6},
+                                 {"quantity": "electric.resistance_ohm", "value": r_st, "tol": 1e-6}]},
+        "thermal_stress_bar": {"part": _box(100, 10, 10, [10, 2, 2], [0, 0, 0]), "material": "steel", "analysis": "thermal",
+                               "stress": True, "T_ref": 20,
+                               "bcs": [{"kind": "temperature", "name": "hot_l", "faces": {"nx": -1}, "T": 120},
+                                       {"kind": "temperature", "name": "hot_r", "faces": {"nx": 1}, "T": 120},
+                                       {"kind": "slider", "name": "wall_l", "faces": {"nx": -1}},
+                                       {"kind": "slider", "name": "wall_r", "faces": {"nx": 1}},
+                                       {"kind": "slider", "name": "sym_y", "faces": {"ny": -1}},
+                                       {"kind": "slider", "name": "sym_z", "faces": {"nz": -1}}],
+                               "expect": [{"quantity": "stress.peak_von_mises", "value": 210000 * 1.2e-5 * 100, "tol": 1e-6},
+                                          {"quantity": "stress.reactions.wall_l.fx", "value": 210000 * 1.2e-5 * 100 * 100, "tol": 1e-6}]},
         "axial_bar": {"part": _box(100, 10, 10, [10, 2, 2], [0, 0, 0]), "material": "steel", "analysis": "static",
                       "bcs": [sl("sx", "nx"), sl("sy", "ny"), sl("sz", "nz"),
                               {"kind": "force", "name": "pull", "faces": {"nx": 1}, "fx": 1000}],
@@ -128,7 +181,7 @@ def cases(solver: str = "ccx") -> dict:
     return out
 
 
-NEEDS = {"euler_column": {"ccx"}, "plate_hole": {"ccx", "gmsh"}, "lame_ring": {"gmsh"}}
+NEEDS = {"euler_column": {"ccx"}, "plate_hole": {"ccx", "gmsh"}, "lame_ring": {"gmsh"}, "coax_capacitor": {"gmsh"}}
 
 
 def run(solver: str = "ccx", names=None, folder: Path | None = None) -> dict:

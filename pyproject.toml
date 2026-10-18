@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fea-translator"
-version = "2026.10.16.10"
+version = "2026.10.18.1"
 description = "FEA studies (part, material, supports, loads) to Gmsh meshes, CalculiX decks and checked results; MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,3 +24,7 @@ feat-mcp = "fea_translator.mcp_server:main"
 
 [tool.setuptools]
 packages = ["fea_translator"]
+
+[tool.pytest.ini_options]
+# lib3mf (a build123d dependency) warns about ctypes layouts under Python 3.14: not ours, harmless
+filterwarnings = ["ignore::DeprecationWarning:lib3mf.*"]

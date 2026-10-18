@@ -1,11 +1,12 @@
 """refsolver.py — a small reference solver for the decks this package writes (not CalculiX).
-Version: 2026.10.16.1
+Version: 2026.10.18.1
 
     run(inp_path) -> writes <job>.dat in CalculiX's .dat layout (the parts results.py reads)
 
 Reads the subset of the CalculiX/Abaqus input that deck.py writes (*NODE, *ELEMENT C3D4/C3D10,
 *NSET, *MATERIAL, *BOUNDARY, *CLOAD, *DLOAD P/GRAV, *DFLUX S, *FILM F, *STATIC, *FREQUENCY,
-*HEAT TRANSFER) and solves linear statics, natural frequencies and steady conduction with its own
+*HEAT TRANSFER, *DFLUX BF, *TEMPERATURE, *EL PRINT HFL) and solves linear statics (with thermal
+expansion), natural frequencies and steady conduction (also electric fields solved as conduction) with its own
 element code (isoparametric tetrahedra, collapsed Gauss-Legendre quadrature, SciPy sparse solvers).
 It exists to check the decks and the result handling independently of CalculiX, and as a fallback
 for small studies when CalculiX is not installed. Buckling needs CalculiX.
@@ -107,7 +108,7 @@ def _grad(X: np.ndarray, dNdL: np.ndarray):
 
 def read_deck(text: str) -> dict:
     d = {"nodes": {}, "elems": [], "etype": None, "nsets": {}, "mat": {}, "bnd": [], "cload": [], "dload": [],
-         "dflux": [], "film": [], "step": None, "modes": 6, "init_T": 0.0}
+         "dflux": [], "bflux": [], "film": [], "step": None, "modes": 6, "init_T": 0.0, "temps": {}}
     kw, opts, nset = None, {}, None
     lines = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("**")]
     i = 0
@@ -148,7 +149,12 @@ def read_deck(text: str) -> dict:
         elif kw == "DLOAD":
             d["dload"].append(f)
         elif kw == "DFLUX":
-            d["dflux"].append((int(f[0]), int(f[1][1:]), float(f[2])))
+            if f[1].upper() == "BF":
+                d["bflux"].append((int(f[0]), float(f[2])))
+            else:
+                d["dflux"].append((int(f[0]), int(f[1][1:]), float(f[2])))
+        elif kw == "TEMPERATURE":
+            d["temps"][int(f[0])] = float(f[1])
         elif kw == "FILM":
             d["film"].append((int(f[0]), int(f[1][1:]), float(f[2]), float(f[3])))
         elif kw == "INITIAL CONDITIONS":
@@ -318,8 +324,20 @@ def run(inp: Path) -> Path:
                     p = float(rec[2])
                     for a, nd in enumerate(nodes):
                         f[3 * nd:3 * nd + 3] -= p * nint[a]
+            dT = None
+            if d["temps"]:  # thermal expansion from the initial temperature: equivalent nodal forces
+                dT = np.array([d["temps"].get(int(i), d["init_T"]) for i in m.ids]) - d["init_T"]
+                alpha = d["mat"]["EXPANSION"][0]
+                B = Model._B(m.G)
+                eth = alpha * (m.N @ dT[m.conn].T).T                                  # (E, q)
+                vec = np.array([1.0, 1, 1, 0, 0, 0])
+                fe = np.einsum("eq,eqia,i->ea", m.det * m.w * eth, B, m.D @ vec, optimize=True)
+                fth = np.zeros(3 * n)
+                np.add.at(fth, (m.conn[:, :, None] * 3 + np.arange(3)).reshape(len(m.conn), -1), fe)
+                f = f + fth
             u = _solve(K, f, fixed, 3 * n)
-            r = K @ u  # as CalculiX's RF: the external force at the node (reaction plus applied loads)
+            # as CalculiX's RF: the internal force (from the stresses) at the node = reaction plus applied loads
+            r = K @ u - fth if dT is not None else K @ u
             U = u.reshape(-1, 3)
             out += [" displacements (vx,vy,vz) for set NALL and time  0.1000000E+01", ""]
             out += [f"{m.ids[i]:10d} {_fmt(U[i, 0])} {_fmt(U[i, 1])} {_fmt(U[i, 2])}" for i in range(n)]
@@ -334,6 +352,10 @@ def run(inp: Path) -> Path:
             Bg = Model._B(Gg)
             ue = U[m.conn].reshape(len(m.conn), -1)
             eps = np.einsum("eqij,ej->eqi", Bg, ue)
+            if dT is not None:
+                Ng, _ = tet_shape(Lg, m.quad)
+                eps = eps - d["mat"]["EXPANSION"][0] * np.einsum("qa,ea->eq", Ng, dT[m.conn])[:, :, None] * \
+                    np.array([1.0, 1, 1, 0, 0, 0])
             sig = np.einsum("ij,eqj->eqi", m.D, eps)
             out += ["", " stresses (elem, integ.pnt.,sxx,syy,szz,sxy,sxz,syz) for set EALL and time  0.1000000E+01", ""]
             for e in range(len(m.conn)):
@@ -352,6 +374,9 @@ def run(inp: Path) -> Path:
         for e, s, q in d["dflux"]:
             nodes, nint, _, _ = m.face_integrals(e, s)
             np.add.at(f, nodes, q * nint)
+        for e, q in d["bflux"]:  # heat per volume in the element
+            k_ = m.epos[e]
+            np.add.at(f, m.conn[k_], q * (m.det[k_] * m.w) @ m.N)
         for e, s, tinf, h in d["film"]:
             nodes, nint, nn, _ = m.face_integrals(e, s)
             for a, na in enumerate(nodes):
@@ -368,6 +393,18 @@ def run(inp: Path) -> Path:
         r = Kc @ T  # as CalculiX's RFL (assumed): conduction heat at the node, films and fluxes there included
         out += [" temperatures for set NALL and time  0.1000000E+01", ""]
         out += [f"{m.ids[i]:10d} {_fmt(T[i])}" for i in range(n)]
+        if m.quad:  # heat flux -k grad T at the integration points, as *EL PRINT HFL
+            a_, b_ = 0.5854101966249685, 0.1381966011250105
+            Lg = np.array([[a_, b_, b_, b_], [b_, a_, b_, b_], [b_, b_, a_, b_], [b_, b_, b_, a_]])
+        else:
+            Lg = np.full((1, 4), 0.25)
+        _, dNg = tet_shape(Lg, m.quad)
+        Gg, _ = _grad(m.X[m.conn], dNg)
+        qv = -d["mat"]["CONDUCTIVITY"][0] * np.einsum("eqak,ea->eqk", Gg, T[m.conn])
+        out += ["", " heat flux (elem, integ.pnt.,qx,qy,qz) for set EALL and time  0.1000000E+01", ""]
+        for e in range(len(m.conn)):
+            for q in range(len(Lg)):
+                out.append(f"{m.eids[e]:10d}{q + 1:4d} " + " ".join(_fmt(qv[e, q, c]) for c in range(3)))
         for name in d["nsets"]:
             if any(b[0] == name for b in d["bnd"]):
                 out += ["", f" heat generation (external concentrated heat sources) for set {name} and time  0.1000000E+01", ""]

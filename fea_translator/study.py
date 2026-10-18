@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.10.16.5
+Version: 2026.10.18.1
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -17,24 +17,40 @@ The deck uses mm, N, s, t (tonne), mW: conversions are in `to_deck_units`.
 """
 from __future__ import annotations
 
-ANALYSES = ("static", "modal", "buckling", "thermal")
+ANALYSES = ("static", "modal", "buckling", "thermal", "electric", "electrostatic", "joule")
+MECH = ("static", "modal", "buckling", "thermal", "joule")      # analyses that take mechanical bcs (thermal, joule: with stress)
+EPS0 = 8.8541878128e-15  # vacuum permittivity, F/mm
 
 # typical room-temperature values; give your own for design work
 MATERIALS = {
-    "steel": {"E": 210000, "nu": 0.30, "density": 7850, "k": 50, "alpha": 1.2e-5, "yield": 250},
-    "stainless_304": {"E": 193000, "nu": 0.29, "density": 8000, "k": 16.2, "alpha": 1.73e-5, "yield": 215},
-    "aluminium_6061_t6": {"E": 68900, "nu": 0.33, "density": 2700, "k": 167, "alpha": 2.36e-5, "yield": 276},
-    "titanium_ti6al4v": {"E": 113800, "nu": 0.342, "density": 4430, "k": 6.7, "alpha": 8.6e-6, "yield": 880},
-    "copper": {"E": 117000, "nu": 0.34, "density": 8940, "k": 390, "alpha": 1.7e-5, "yield": 70},
-    "brass": {"E": 100000, "nu": 0.34, "density": 8500, "k": 110, "alpha": 1.9e-5, "yield": 200},
-    "cast_iron": {"E": 110000, "nu": 0.26, "density": 7200, "k": 52, "alpha": 1.1e-5, "yield": 200},
-    "abs": {"E": 2300, "nu": 0.35, "density": 1050, "k": 0.17, "alpha": 9.0e-5, "yield": 40},
-    "pla": {"E": 3500, "nu": 0.36, "density": 1240, "k": 0.13, "alpha": 6.8e-5, "yield": 50},
-    "nylon_pa6": {"E": 2800, "nu": 0.39, "density": 1140, "k": 0.25, "alpha": 8.5e-5, "yield": 70},
+    "steel": {"E": 210000, "nu": 0.30, "density": 7850, "k": 50, "alpha": 1.2e-5, "yield": 250, "resistivity": 1.6e-7},
+    "stainless_304": {"E": 193000, "nu": 0.29, "density": 8000, "k": 16.2, "alpha": 1.73e-5, "yield": 215, "resistivity": 7.2e-7},
+    "aluminium_6061_t6": {"E": 68900, "nu": 0.33, "density": 2700, "k": 167, "alpha": 2.36e-5, "yield": 276, "resistivity": 3.99e-8},
+    "titanium_ti6al4v": {"E": 113800, "nu": 0.342, "density": 4430, "k": 6.7, "alpha": 8.6e-6, "yield": 880, "resistivity": 1.78e-6},
+    "copper": {"E": 117000, "nu": 0.34, "density": 8940, "k": 390, "alpha": 1.7e-5, "yield": 70, "resistivity": 1.72e-8},
+    "brass": {"E": 100000, "nu": 0.34, "density": 8500, "k": 110, "alpha": 1.9e-5, "yield": 200, "resistivity": 6.4e-8},
+    "cast_iron": {"E": 110000, "nu": 0.26, "density": 7200, "k": 52, "alpha": 1.1e-5, "yield": 200, "resistivity": 1.0e-6},
+    "silver": {"E": 83000, "nu": 0.37, "density": 10490, "k": 429, "alpha": 1.89e-5, "resistivity": 1.59e-8},
+    "gold": {"E": 79000, "nu": 0.42, "density": 19300, "k": 318, "alpha": 1.42e-5, "resistivity": 2.44e-8},
+    "abs": {"E": 2300, "nu": 0.35, "density": 1050, "k": 0.17, "alpha": 9.0e-5, "yield": 40,
+            "resistivity": 1e14, "permittivity": 3.0, "dielectric_strength": 16},
+    "pla": {"E": 3500, "nu": 0.36, "density": 1240, "k": 0.13, "alpha": 6.8e-5, "yield": 50,
+            "resistivity": 1e14, "permittivity": 3.0, "dielectric_strength": 15},
+    "nylon_pa6": {"E": 2800, "nu": 0.39, "density": 1140, "k": 0.25, "alpha": 8.5e-5, "yield": 70,
+                  "resistivity": 1e12, "permittivity": 3.8, "dielectric_strength": 20},
+    "alumina_96": {"E": 300000, "nu": 0.21, "density": 3720, "k": 24, "alpha": 8.2e-6,
+                   "resistivity": 1e14, "permittivity": 9.0, "dielectric_strength": 12},
+    "fr4": {"E": 22000, "nu": 0.12, "density": 1850, "k": 0.3, "alpha": 1.4e-5,
+            "resistivity": 1e12, "permittivity": 4.4, "dielectric_strength": 20},
+    "ptfe": {"E": 500, "nu": 0.46, "density": 2200, "k": 0.25, "alpha": 1.2e-4, "yield": 10,
+             "resistivity": 1e16, "permittivity": 2.1, "dielectric_strength": 20},
 }
 MATERIAL_KEYS = {"E": "Young's modulus, MPa", "nu": "Poisson's ratio", "density": "kg/m3 (modal, gravity)",
                  "k": "thermal conductivity, W/(m K) (thermal)", "alpha": "thermal expansion, 1/K",
-                 "yield": "yield strength, MPa (safety factor)"}
+                 "yield": "yield strength, MPa (safety factor)",
+                 "resistivity": "electrical resistivity, ohm m (electric, joule)",
+                 "permittivity": "relative permittivity (electrostatic)",
+                 "dielectric_strength": "breakdown field, kV/mm (electrostatic: margin to breakdown)"}
 
 # ---- face selectors ----------------------------------------------------------------------
 SELECTOR_DOC = {
@@ -62,13 +78,21 @@ BC_KINDS = {
                  "Uniform pressure normal to the faces."),
     "gravity": (("static", "buckling"), {}, {"gx": "", "gy": "", "gz": "m/s2 (default 0, 0, -9.81)"},
                 "Body weight (needs density)."),
-    "temperature": (("thermal",), {"faces": "", "T": "degrees C"}, {}, "Fixed temperature on the faces."),
-    "heat_flux": (("thermal",), {"faces": "", "q": "W/m2 into the part (negative: out)"}, {}, "Uniform heat flux."),
-    "heat": (("thermal",), {"faces": "", "power": "W into the part, spread uniformly over the faces' area"}, {},
+    "temperature": (("thermal", "joule"), {"faces": "", "T": "degrees C"}, {}, "Fixed temperature on the faces."),
+    "heat_flux": (("thermal", "joule"), {"faces": "", "q": "W/m2 into the part (negative: out)"}, {}, "Uniform heat flux."),
+    "heat": (("thermal", "joule"), {"faces": "", "power": "W into the part, spread uniformly over the faces' area"}, {},
              "Total heat input on the faces (a heater, a chip)."),
-    "convection": (("thermal",), {"faces": "", "h": "film coefficient, W/(m2 K)", "T_inf": "ambient, degrees C"}, {},
+    "convection": (("thermal", "joule"), {"faces": "", "h": "film coefficient, W/(m2 K)", "T_inf": "ambient, degrees C"}, {},
                    "Convection to an ambient temperature."),
+    "voltage": (("electric", "electrostatic", "joule"), {"faces": "", "V": "volts"}, {},
+                "Fixed potential on the faces: a terminal or electrode (0 V for ground)."),
+    "current": (("electric", "joule"), {"faces": "", "I": "amperes into the part, spread uniformly over the faces' area"}, {},
+                "Total current fed into the faces (a terminal driven by a current source)."),
 }
+# mechanical supports and loads also go with thermal and joule studies that ask for stress
+for _k in ("fixed", "slider", "displacement", "force", "pressure", "gravity"):
+    _a, _r, _o, _w = BC_KINDS[_k]
+    BC_KINDS[_k] = (_a + ("thermal", "joule"), _r, _o, _w)
 
 CONVENTIONS = [
     "Units: mm, N, MPa; density kg/m3; conductivity W/(m K); film coefficient W/(m2 K); heat flux W/m2; "
@@ -83,6 +107,16 @@ CONVENTIONS = [
     "force is a total force spread uniformly over the faces' area; pressure acts normal to the faces (positive "
     "into the part); gravity uses the material density.",
     "buckling: the loads are a reference; the results are load factors (critical load = factor x reference load).",
+    "Electrical (DC): electric solves current flow (resistivity; voltage and current terminals; at least one voltage, "
+    "e.g. 0 V ground): current per terminal, resistance (two terminals), power, peak current density. electrostatic "
+    "solves the field in a dielectric (permittivity; voltage electrodes): charge per electrode, capacitance (two "
+    "electrodes), energy, peak field and the margin to dielectric_strength. Faces with no bc are insulated (electric) "
+    "or carry no charge (electrostatic). joule: electric, then the Joule heat (resistivity x current density squared) "
+    "into a thermal solve with the thermal bcs (temperature, convection, ...): the electric and thermal results and "
+    "the Joule heat (= I^2 R). Resistivity is taken at its room-temperature value.",
+    "stress: true on thermal or joule adds a static solve with the temperatures (thermal expansion alpha from T_ref, "
+    "default 20 degrees C) and the mechanical bcs of the study (supports must stop rigid-body motion): stresses, "
+    "displacements, reactions, safety factor, as in static.",
     "Results: static: maximum displacement and von Mises stress (at integration points and at nodes), reaction "
     "force of each support, mean displacement of each load face and probe, safety factor (with yield), "
     "equilibrium check. modal: frequencies in Hz. buckling: load factors. thermal: temperature range, heat "
@@ -116,6 +150,8 @@ def study_format() -> dict:
                            "material": f"one of {sorted(MATERIALS)} or {{{', '.join(MATERIAL_KEYS)}}} "
                                        "(a name plus overrides: {'name': 'steel', 'yield': 355})",
                            "analysis": "|".join(ANALYSES), "modes": "number of modes or buckling factors (6; 3)",
+                           "stress": "thermal, joule: true adds the thermal-stress static solve",
+                           "T_ref": "thermal, joule with stress: stress-free temperature, degrees C (20)",
                            "mesh": "{size, order (1|2), refine: [{at, r, size}]}", "bcs": "list of boundary conditions",
                            "probes": "[{name, faces}]: mean and largest displacement (or temperature) there",
                            "expect": "[{quantity, value, tol}]", "converge": "true: rerun at 0.6 x size and report the change",
@@ -138,8 +174,12 @@ def material_of(study: dict) -> dict:
 
 
 def to_deck_units(mat: dict) -> dict:
-    """Material in the deck's units (mm, N, s, t, mW)."""
-    out = {"E": float(mat["E"]), "nu": float(mat["nu"])}
+    """Material in the deck's units (mm, N, s, t, mW; S/mm)."""
+    out = {"E": float(mat["E"]), "nu": float(mat["nu"])} if "E" in mat and "nu" in mat else {}
+    if "resistivity" in mat:
+        out["sigma"] = 1e-3 / float(mat["resistivity"])  # ohm m -> S/mm
+    if "permittivity" in mat:
+        out["eps_r"] = float(mat["permittivity"])
     if "density" in mat:
         out["density"] = float(mat["density"]) * 1e-12  # kg/m3 -> t/mm3
     if "k" in mat:
@@ -238,12 +278,17 @@ def validate_study(st: dict) -> dict:
     else:
         errors.append("material: a name or an object")
         mat = {}
-    for k in ("E", "nu"):
+    need = {"static": ("E", "nu"), "modal": ("E", "nu", "density"), "buckling": ("E", "nu"), "thermal": ("k",),
+            "electric": ("resistivity",), "electrostatic": ("permittivity",), "joule": ("resistivity", "k")}.get(an, ())
+    if st.get("stress") and an in ("thermal", "joule"):
+        need = need + ("E", "nu", "alpha")
+    for k in need:
         if k not in mat:
-            errors.append(f"material: needs '{k}'")
+            errors.append(f"material: a {an} study{' with stress' if st.get('stress') and k in ('E', 'nu', 'alpha') else ''} "
+                          f"needs '{k}'")
     if _num(mat.get("nu")) and not (-1 < mat["nu"] < 0.5):
         errors.append("material: 'nu' must be between -1 and 0.5")
-    for k in ("E", "density", "k", "yield"):
+    for k in ("E", "density", "k", "yield", "resistivity", "permittivity", "dielectric_strength"):
         if _num(mat.get(k)) and mat[k] <= 0:
             errors.append(f"material: '{k}' must be positive")
     bcs = st.get("bcs", [])
@@ -288,6 +333,9 @@ def validate_study(st: dict) -> dict:
             errors.append(f"{where}: 'h' must be positive")
         if k == "gravity" and not _num(mat.get("density")):
             errors.append(f"{where}: needs the material density")
+        if k in ("fixed", "slider", "displacement", "force", "pressure", "gravity") and an in ("thermal", "joule") \
+                and not st.get("stress"):
+            errors.append(f"{where}: mechanical bcs in a {an} study need stress: true")
         supports += k in (("temperature", "convection") if an == "thermal" else ("fixed", "slider", "displacement"))
         loads += k in ("force", "pressure", "gravity", "heat_flux", "heat") or (k == "displacement" and any(
             _num(bc.get(c)) and bc[c] != 0 for c in ("ux", "uy", "uz")))
@@ -295,13 +343,25 @@ def validate_study(st: dict) -> dict:
         errors.append(f"{an}: needs supports (fixed, slider or displacement); a free part moves as a rigid body")
     if an in ("static", "buckling") and not loads:
         errors.append(f"{an}: needs a load (force, pressure, gravity or a non-zero displacement)")
-    if an == "thermal" and not any(isinstance(b, dict) and b.get("kind") in ("temperature", "convection") for b in bcs):
-        errors.append("thermal: needs a temperature or convection boundary (otherwise the temperature is undetermined)")
-    if an == "modal" and not _num(mat.get("density")):
-        errors.append("modal: needs the material density")
-    if an == "thermal" and not _num(mat.get("k")):
-        errors.append("thermal: needs the material conductivity k")
-    if an in ("static", "buckling", "modal"):
+    kinds = [b.get("kind") for b in bcs if isinstance(b, dict)]
+    if an in ("thermal", "joule") and not ({"temperature", "convection"} & set(kinds)):
+        errors.append(f"{an}: needs a temperature or convection boundary (otherwise the temperature is undetermined)")
+    if an in ("electric", "electrostatic", "joule") and "voltage" not in kinds:
+        errors.append(f"{an}: needs at least one voltage terminal (e.g. 0 V ground: it sets the potential's reference)")
+    if an in ("electric", "joule") and len([q for q in kinds if q in ("voltage", "current")]) < 2:
+        errors.append(f"{an}: needs two terminals at least (voltage or current) for a current to flow")
+    if an == "electrostatic":
+        vs = {float(b["V"]) for b in bcs if isinstance(b, dict) and b.get("kind") == "voltage" and _num(b.get("V"))}
+        if len(vs) < 2:
+            errors.append("electrostatic: needs electrodes at two different voltages at least")
+    if an in ("thermal", "joule") and st.get("stress"):
+        if not ({"fixed", "slider", "displacement"} & set(kinds)):
+            errors.append(f"{an} with stress: needs supports (fixed, slider or displacement)")
+    if "stress" in st and (not isinstance(st["stress"], bool) or an not in ("thermal", "joule")):
+        errors.append("stress: true or false, only for thermal and joule studies")
+    if "T_ref" in st and not _num(st["T_ref"]):
+        errors.append("T_ref: a temperature in degrees C")
+    if an in ("static", "buckling", "modal") or st.get("stress"):
         sl = [b for b in bcs if isinstance(b, dict) and b.get("kind") == "slider"]
         if sl and not any(isinstance(b, dict) and b.get("kind") in ("fixed", "displacement") for b in bcs) and len(sl) < 3:
             warnings.append("sliders alone need three faces normal to X, Y and Z (and may still allow rotation)")
@@ -338,7 +398,7 @@ def validate_study(st: dict) -> dict:
     if "stress_band" in st and (not _num(st["stress_band"]) or st["stress_band"] < 0):
         errors.append("stress_band: a distance in mm (>= 0)")
     extra = set(st) - {"part", "material", "analysis", "modes", "mesh", "bcs", "probes", "expect", "converge", "notes",
-                       "equation_solver", "stress_band"}
+                       "equation_solver", "stress_band", "stress", "T_ref"}
     if extra:
         warnings.append(f"unknown study keys ignored: {sorted(extra)}")
     return {"ok": not errors, "errors": errors, "warnings": warnings}

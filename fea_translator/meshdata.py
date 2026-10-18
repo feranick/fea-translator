@@ -1,5 +1,5 @@
 """meshdata.py — the mesh as CalculiX needs it: node ordering, boundary faces, face selection, loads.
-Version: 2026.10.16.6
+Version: 2026.10.18.1
 
 Pure NumPy (no Gmsh, no CalculiX), so every step from a mesh to the deck is testable on its own.
 
@@ -486,6 +486,26 @@ class Mesh:
         acc = np.zeros((len(self.nodes), 3))
         np.add.at(acc, self.tets.ravel(), wN.ravel()[:, None] * accel_density[None, :])
         return acc
+
+    def source_nodes(self, q_e: np.ndarray) -> np.ndarray:
+        """Nodal equivalents (N,) of a source per volume that is constant in each element (q_e, (E,)):
+        the integral of N q_e over each (possibly curved) element. Also returns nothing else."""
+        L, w = tet_quadrature(4)
+        N, dN = simplex_shape(L, self.order == 2, EDGES)
+        X = self.nodes[self.tets]
+        J = np.einsum("qnj,enk->eqjk", dN[:, :, 1:] - dN[:, :, :1], X)
+        wN = np.einsum("eq,qa->ea", np.linalg.det(J) * w[None, :], N) * np.asarray(q_e, float)[:, None]
+        acc = np.zeros(len(self.nodes))
+        np.add.at(acc, self.tets.ravel(), wN.ravel())
+        return acc
+
+    def element_volumes(self) -> np.ndarray:
+        """Volumes of the (possibly curved) elements."""
+        L, w = tet_quadrature(4)
+        _, dN = simplex_shape(L, self.order == 2, EDGES)
+        X = self.nodes[self.tets]
+        J = np.einsum("qnj,enk->eqjk", dN[:, :, 1:] - dN[:, :, :1], X)
+        return (np.linalg.det(J) * w[None, :]).sum(axis=1)
 
     def pressure_resultant(self, tags, p: float) -> np.ndarray:
         r = np.zeros(3)
