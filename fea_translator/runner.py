@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.18.1
+Version: 2026.10.18.2
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -617,7 +617,9 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
         res = {"ok": False, "why": type(exc).__name__, "error": str(exc)[:2000]}
     res["translator"] = __version__
     res["solver"] = solver
-    (folder / f"{name}.json").write_text(json.dumps(res, indent=1))
+    tmp = folder / f".{name}.json.tmp"   # atomic: study_status never reads half a file
+    tmp.write_text(json.dumps(res, indent=1))
+    tmp.replace(folder / f"{name}.json")
     return res
 
 

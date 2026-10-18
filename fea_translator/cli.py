@@ -1,5 +1,5 @@
 """cli.py — the `feat` command line. Every command prints JSON.
-Version: 2026.10.16.4
+Version: 2026.10.18.2
 
     feat status                          versions; CalculiX and Gmsh found or not
     feat format > study_format.json      the study format
@@ -8,6 +8,9 @@ Version: 2026.10.16.4
     feat status REQUEST                  results of a request folder (finished and pending studies)
     feat deck studies.json NAME          write the CalculiX deck of one study (no solve)
     feat bench [NAMES...] [--solver S]   the benchmark studies with closed-form answers
+    feat run-study REQUEST NAME          run one study of a request folder (what a SLURM job runs)
+    feat jobs [--limit N] [--active]     recent requests with SLURM jobs, their states, the queue
+    feat cancel REQUEST [NAMES...]       stop a request's studies
 
 '-' reads the studies from stdin.
 """
@@ -22,6 +25,26 @@ from . import api
 
 def _load(path: str) -> dict:
     return json.load(sys.stdin) if path == "-" else json.loads(open(path).read())
+
+
+def run_study(request: str, name: str) -> int:
+    """One study of a request folder, as a pool worker runs it: what a SLURM job's job.sh executes.
+    Threads from SLURM_CPUS_PER_TASK (else FEAT_PROCS). Exit 0 when it wrote <name>.json, even for a
+    failed study (the result says why); non-zero only on a crash (job.log has the traceback)."""
+    import os
+    from pathlib import Path
+
+    from . import executor
+    from .runner import run_study as _run
+
+    folder = Path(request).expanduser().resolve()
+    meta = json.loads((folder / "request.json").read_text())
+    study = json.loads((folder / "studies.json").read_text())[name]
+    os.environ.setdefault("FEAT_OUT", str(folder.parent))   # timing records next to the request
+    n = os.environ.get("SLURM_CPUS_PER_TASK") or str(executor.procs_for(study))
+    os.environ["OMP_NUM_THREADS"] = os.environ["CCX_NPROC_EQUATION_SOLVER"] = str(n)
+    _run(name, study, folder / name, meta.get("solver", "ccx"), float(meta.get("timeout", executor.timeout_s())))
+    return 0 if (folder / name / f"{name}.json").is_file() else 1
 
 
 def main(argv=None) -> None:
@@ -41,7 +64,18 @@ def main(argv=None) -> None:
     p = sub.add_parser("bench")
     p.add_argument("names", nargs="*")
     p.add_argument("--solver", default=None)
+    p = sub.add_parser("run-study")
+    p.add_argument("request")
+    p.add_argument("name")
+    p = sub.add_parser("jobs")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--active", action="store_true")
+    p = sub.add_parser("cancel")
+    p.add_argument("request")
+    p.add_argument("names", nargs="*")
     a = ap.parse_args(argv)
+    if a.cmd == "run-study":
+        sys.exit(run_study(a.request, a.name))
     if a.cmd == "status":
         out = api.status(a.request) if a.request else api.tool_status()
     elif a.cmd == "format":
@@ -53,6 +87,10 @@ def main(argv=None) -> None:
     elif a.cmd == "deck":
         st = _load(a.studies)
         out = api.deck(st[a.name], a.name)
+    elif a.cmd == "jobs":
+        out = api.jobs(a.limit, a.active)
+    elif a.cmd == "cancel":
+        out = api.cancel(a.request, a.names or None)
     else:
         out = api.bench(a.names or None, a.solver)
     print(json.dumps(out, indent=1))

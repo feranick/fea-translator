@@ -1,0 +1,297 @@
+"""executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
+Version: 2026.10.18.2
+
+Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (5): studies whose
+time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments;
+FEAT_PROCS (1): CalculiX threads per study (a study's "procs" overrides it); FEAT_TIMEOUT (900 s): per
+CalculiX solve. A study's "queue": true sends it to SLURM, "queue": false keeps it local (not with
+FEAT_EXECUTOR=local, which is always local).
+
+One SLURM job per study: <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns it) runs
+`python -m fea_translator.cli run-study REQUEST NAME` with --ntasks=1 --cpus-per-task=N (1 for buckling:
+its eigenvalues are only repeatable single-threaded); job.json records the id. The state of a study is
+read from the files and the queue (squeue once per call; sacct, else job.log, for jobs that ended
+without a result), never from this process, so it works after restarts and from other conversations.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PREFIX = "feat:"           # job names: feat:<request folder name>:<study name>
+FINAL = ("timed_out", "out_of_memory", "cancelled", "failed")
+
+
+# ----------------------------------------------------------------------------- settings
+
+def kind() -> str:
+    k = os.environ.get("FEAT_EXECUTOR", "local").strip().lower()
+    return k if k in ("local", "slurm") else "local"
+
+
+def min_minutes() -> float:
+    try:
+        return float(os.environ.get("FEAT_SLURM_MIN_MINUTES", "5"))
+    except ValueError:
+        return 5.0
+
+
+def default_procs() -> int:
+    try:
+        return max(1, int(os.environ.get("FEAT_PROCS", "1")))
+    except ValueError:
+        return 1
+
+
+def timeout_s() -> float:
+    return float(os.environ.get("FEAT_TIMEOUT", "900"))
+
+
+def procs_for(study: dict) -> int:
+    """CalculiX threads (CPUs) for a study: 1 for buckling (repeatable eigenvalues), else the study's
+    procs or FEAT_PROCS."""
+    if study.get("analysis") == "buckling":
+        return 1
+    try:
+        return max(1, int(study.get("procs") or default_procs()))
+    except (TypeError, ValueError):
+        return default_procs()
+
+
+def solves_of(study: dict) -> int:
+    """CalculiX runs of a study (each has FEAT_TIMEOUT): joule 2, +1 with stress, x2 with converge."""
+    n = {"joule": 2}.get(study.get("analysis"), 1) + (1 if study.get("stress") else 0)
+    return n * (2 if study.get("converge") else 1)
+
+
+def time_limit_min(study: dict | None = None) -> int:
+    """The job's time limit: every solve's timeout plus 10 minutes, so the translator's own timeout
+    (which writes a clean result) fires before SLURM's."""
+    return int(math.ceil(solves_of(study or {}) * timeout_s() / 60)) + 10
+
+
+def status_key() -> dict:
+    """The 'executor' key of tool_status (llmt status reads it)."""
+    return {"kind": kind(), "sbatch": shutil.which("sbatch"), "min_minutes": min_minutes(),
+            "procs": default_procs(), "time_limit_min": time_limit_min()}
+
+
+def use_slurm(study: dict, estimate_min: float | None) -> bool:
+    """Whether a study becomes a SLURM job: only with FEAT_EXECUTOR=slurm; then "queue" decides if
+    given, else the estimate (no estimate: SLURM)."""
+    if kind() != "slurm":
+        return False
+    q = study.get("queue")
+    if q is not None:
+        return bool(q)
+    return estimate_min is None or estimate_min >= min_minutes()
+
+
+# ----------------------------------------------------------------------------- submission
+
+def job_script(request: Path, name: str, study: dict) -> str:
+    d = request / name
+    p = procs_for(study)
+    return "\n".join([
+        "#!/bin/bash",
+        f"#SBATCH --job-name={PREFIX}{request.name}:{name}",
+        f"#SBATCH --chdir={d}",
+        f"#SBATCH --output={d / 'job.log'}",
+        "#SBATCH --ntasks=1",
+        f"#SBATCH --cpus-per-task={p}",
+        f"#SBATCH --time={time_limit_min(study)}",
+        "#SBATCH --export=ALL",
+        f"exec {shlex.quote(sys.executable)} -m fea_translator.cli run-study {shlex.quote(str(request))} {shlex.quote(name)}",
+        ""])
+
+
+def submit(request: Path, name: str, study: dict) -> dict:
+    """Writes job.sh and submits it; returns job.json's content, or {'ok': False, 'why': ...} (never a
+    silent fallback to local)."""
+    d = request / name
+    d.mkdir(parents=True, exist_ok=True)
+    script = d / "job.sh"
+    script.write_text(job_script(request, name, study))
+    script.chmod(0o755)
+    cmd = ["sbatch", "--parsable", *shlex.split(os.environ.get("FEAT_SLURM_ARGS", "")), str(script)]
+    exe = shutil.which("sbatch")
+    if not exe:
+        return {"ok": False, "why": "could not submit: sbatch not found (FEAT_EXECUTOR=slurm needs SLURM)"}
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "why": f"could not submit: {exc}"}
+    if p.returncode != 0 or not p.stdout.strip():
+        return {"ok": False, "why": f"could not submit: {(p.stderr or p.stdout).strip()[:500]}"}
+    job_id = p.stdout.strip().split(";")[0].split()[0]
+    info = {"executor": "slurm", "job_id": job_id, "submitted": round(time.time(), 1), "procs": procs_for(study),
+            "time_min": time_limit_min(study), "command": cmd}
+    (d / "job.json").write_text(json.dumps(info))
+    return info
+
+
+# ----------------------------------------------------------------------------- queue
+
+def _run(cmd: list[str], timeout: float = 30) -> subprocess.CompletedProcess | None:
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _minutes(t: str) -> float | None:
+    """squeue's elapsed time ([D-]HH:MM:SS, MM:SS) in minutes."""
+    try:
+        days = 0
+        if "-" in t:
+            d, t = t.split("-", 1)
+            days = int(d)
+        parts = [int(x) for x in t.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        h, m, s = parts
+        return round(days * 1440 + h * 60 + m + s / 60, 1)
+    except ValueError:
+        return None
+
+
+def squeue(ids: list[str]) -> dict:
+    """{id: {state, reason, start, elapsed_min}} of the given jobs still in the queue (one call)."""
+    if not ids:
+        return {}
+    p = _run(["squeue", "-h", "-j", ",".join(ids), "-o", "%i|%T|%r|%S|%M"])
+    out = {}
+    if p is None or p.returncode != 0:
+        # squeue errors on ids that have all left the queue ("Invalid job id"): treat as none listed
+        return out
+    for line in p.stdout.splitlines():
+        f = line.strip().split("|")
+        if len(f) >= 5:
+            out[f[0]] = {"state": f[1], "reason": f[2], "start": f[3], "elapsed_min": _minutes(f[4])}
+    return out
+
+
+def ahead_of(job_id: str) -> int | None:
+    """Pending jobs submitted before this one (all of the queue's, not only the translators')."""
+    p = _run(["squeue", "-h", "-t", "PENDING", "-o", "%i"])
+    if p is None or p.returncode != 0:
+        return None
+    try:
+        me = int(job_id.split("_")[0])
+        return sum(1 for x in p.stdout.split() if x.split("_")[0].isdigit() and int(x.split("_")[0]) < me)
+    except ValueError:
+        return None
+
+
+def sacct(ids: list[str]) -> dict:
+    """{id: STATE} from SLURM's accounting; {} when there is none (common on single-node installs)."""
+    if not ids:
+        return {}
+    p = _run(["sacct", "-n", "-P", "-X", "-j", ",".join(ids), "-o", "JobID,State"])
+    if p is None or p.returncode != 0:
+        return {}
+    out = {}
+    for line in p.stdout.splitlines():
+        f = line.strip().split("|")
+        if len(f) >= 2 and f[0]:
+            out[f[0].split(".")[0]] = f[1].strip()   # e.g. "CANCELLED by 1000": keep who
+    return out
+
+
+def _tail(path: Path, n: int = 30) -> str:
+    try:
+        return "\n".join(path.read_text(errors="replace").splitlines()[-n:])
+    except OSError:
+        return ""
+
+
+def ended_state(acct: str | None, log: Path) -> tuple[str, str]:
+    """(state, why) of a job that left the queue without writing a result."""
+    a = (acct or "").upper()
+    tail = _tail(log)
+    if a.startswith("TIMEOUT") or (not a and "DUE TO TIME LIMIT" in tail):
+        return "timed_out", ("SLURM's time limit stopped it before feat's own timeout: raise FEAT_TIMEOUT "
+                             "(it also sets the job's limit) or coarsen the mesh / drop converge")
+    if a.startswith("OUT_OF_MEMORY") or (not a and ("oom-kill" in tail.lower() or "out of memory" in tail.lower())):
+        return "out_of_memory", "add --mem=... to FEAT_SLURM_ARGS, or coarsen the mesh"
+    if a.startswith("CANCELLED") or (not a and "CANCELLED" in tail):
+        who = acct.split("by", 1)[1].strip() if acct and "by" in acct else None
+        return "cancelled", "cancelled" + (f" by {who}" if who else "") + " (scancel or cancel())"
+    return "failed", "the job ended without a result" + (f"; job.log:\n{tail}" if tail else " (no job.log)")
+
+
+def job_states(request: Path, names: list[str]) -> dict:
+    """{name: {state, job_id, ...}} for the request's SLURM studies, from the files and the queue."""
+    jobs = {}
+    for n in names:
+        try:
+            jobs[n] = json.loads((request / n / "job.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+    ids = [j["job_id"] for j in jobs.values()]
+    q = squeue(ids)
+    gone = [j["job_id"] for n, j in jobs.items() if j["job_id"] not in q and not (request / n / f"{n}.json").is_file()]
+    acct = sacct(gone) if gone else {}
+    out = {}
+    for n, j in jobs.items():
+        jid = j["job_id"]
+        if (request / n / f"{n}.json").is_file():
+            out[n] = {"state": "done", "job_id": jid}
+        elif jid in q:
+            st = q[jid]
+            if st["state"] in ("PENDING", "CONFIGURING", "REQUEUED", "SUSPENDED"):
+                rec = {"state": "queued", "job_id": jid, "reason": st["reason"]}
+                if st["start"] and st["start"] not in ("N/A", "Unknown", "None"):
+                    rec["expected_start"] = st["start"]
+                rec["ahead"] = ahead_of(jid)
+            else:
+                rec = {"state": "running", "job_id": jid, "job_elapsed_min": st["elapsed_min"]}
+            out[n] = rec
+        elif (request / n / f"{n}.json").is_file():   # finished between the two looks
+            out[n] = {"state": "done", "job_id": jid}
+        else:
+            state, why = ended_state(acct.get(jid), request / n / "job.log")
+            out[n] = {"state": state, "job_id": jid, "why": why}
+    return out
+
+
+def queue_summary() -> dict:
+    """This translator's jobs in the queue, and the machine's CPUs."""
+    out = {"queue": {"running": 0, "queued": 0, "cpus_in_use": 0}, "machine": {}}
+    p = _run(["squeue", "-h", "-o", "%i|%j|%T|%C"])
+    if p is not None and p.returncode == 0:
+        for line in p.stdout.splitlines():
+            f = line.strip().split("|")
+            if len(f) >= 4 and f[1].startswith(PREFIX):
+                if f[2] in ("RUNNING", "COMPLETING"):
+                    out["queue"]["running"] += 1
+                    out["queue"]["cpus_in_use"] += int(f[3]) if f[3].isdigit() else 0
+                else:
+                    out["queue"]["queued"] += 1
+    p = _run(["sinfo", "-h", "-o", "%C"])
+    if p is not None and p.returncode == 0 and p.stdout.strip():
+        try:
+            alloc, idle, other, total = (int(x) for x in p.stdout.split()[0].split("/"))
+            out["machine"] = {"cpus": total, "cpus_allocated": alloc}
+        except ValueError:
+            pass
+    return out
+
+
+def scancel(ids: list[str]) -> str | None:
+    """Cancels the jobs; returns an error message or None."""
+    if not ids:
+        return None
+    p = _run(["scancel", *ids])
+    if p is None:
+        return "scancel not found"
+    return None if p.returncode == 0 else (p.stderr or p.stdout).strip()[:300]

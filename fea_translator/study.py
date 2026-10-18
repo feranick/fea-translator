@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.10.18.1
+Version: 2026.10.18.2
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -152,6 +152,9 @@ def study_format() -> dict:
                            "analysis": "|".join(ANALYSES), "modes": "number of modes or buckling factors (6; 3)",
                            "stress": "thermal, joule: true adds the thermal-stress static solve",
                            "T_ref": "thermal, joule with stress: stress-free temperature, degrees C (20)",
+                           "procs": "CalculiX threads for this study (default FEAT_PROCS, 1; buckling always 1)",
+                           "queue": "true: always a SLURM job; false: always local (with FEAT_EXECUTOR=slurm; "
+                                    "otherwise studies estimated above FEAT_SLURM_MIN_MINUTES go to SLURM)",
                            "mesh": "{size, order (1|2), refine: [{at, r, size}]}", "bcs": "list of boundary conditions",
                            "probes": "[{name, faces}]: mean and largest displacement (or temperature) there",
                            "expect": "[{quantity, value, tol}]", "converge": "true: rerun at 0.6 x size and report the change",
@@ -359,6 +362,10 @@ def validate_study(st: dict) -> dict:
             errors.append(f"{an} with stress: needs supports (fixed, slider or displacement)")
     if "stress" in st and (not isinstance(st["stress"], bool) or an not in ("thermal", "joule")):
         errors.append("stress: true or false, only for thermal and joule studies")
+    if "queue" in st and not isinstance(st["queue"], bool):
+        errors.append("queue: true or false")
+    if "procs" in st and (not _num(st["procs"]) or int(st["procs"]) != st["procs"] or st["procs"] < 1):
+        errors.append("procs: a whole number of threads, at least 1")
     if "T_ref" in st and not _num(st["T_ref"]):
         errors.append("T_ref: a temperature in degrees C")
     if an in ("static", "buckling", "modal") or st.get("stress"):
@@ -398,7 +405,7 @@ def validate_study(st: dict) -> dict:
     if "stress_band" in st and (not _num(st["stress_band"]) or st["stress_band"] < 0):
         errors.append("stress_band: a distance in mm (>= 0)")
     extra = set(st) - {"part", "material", "analysis", "modes", "mesh", "bcs", "probes", "expect", "converge", "notes",
-                       "equation_solver", "stress_band", "stress", "T_ref"}
+                       "equation_solver", "stress_band", "stress", "T_ref", "procs", "queue"}
     if extra:
         warnings.append(f"unknown study keys ignored: {sorted(extra)}")
     return {"ok": not errors, "errors": errors, "warnings": warnings}

@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.10.18.1
+Version: 2026.10.18.2
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -10,6 +10,8 @@ Tools (all JSON):
   get_deck          the CalculiX input deck of one study, as text
   run_benchmarks    the benchmark studies with closed-form answers (is the toolchain right?)
   get_file          a written file as base64 (for callers on another machine)
+  jobs              recent requests with SLURM jobs (also from other conversations) and the queue
+  cancel            stops a request's studies
 
 Run:  feat-mcp                       (stdio)
       feat-mcp --http 8767 [--host 0.0.0.0]
@@ -45,6 +47,10 @@ from a task scheduled after that time). Follow 'next' in the result.
 Check equilibrium_error, warnings and 'selection' (what each
 face selector took), and rerun with converge: true before trusting peak stresses; peaks at supports
 are singular: judge designs on peak_von_mises_off_bc and safety_factor_off_bc.
+Long studies run as SLURM jobs on the machine (when FEAT_EXECUTOR=slurm): run_studies returns them pending
+with job ids. They do not depend on this conversation. Report the expected finish time and stop; do not poll.
+Later, study_status(request) collects them; jobs() lists recent and active runs (also those started in other
+conversations); cancel(request) stops them.
 Units: mm, N, MPa, kg/m3, W, degrees C; V, A, ohm m, kV/mm."""
 
 server = _Server("fea-translator", instructions=INSTRUCTIONS)
@@ -72,7 +78,9 @@ def run_studies(studies: dict, solver: str = "auto", wait_s: float = 45) -> dict
     Returns after at most wait_s seconds: studies still running are listed in 'pending' with
     'progress' (step of steps, s per step, eta_min, eta_min_max) and 'time_left' (expected_finish,
     latest_finish); 'next' says whether to collect them with study_status soon or to tell the user
-    when to come back (runs over about 5 min). Fine meshes and converge: true can take minutes."""
+    when to come back (runs over about 5 min). Fine meshes and converge: true can take minutes.
+    With FEAT_EXECUTOR=slurm, long studies (and those with "queue": true) are SLURM jobs: their
+    progress has 'state' (queued, running) and 'job_id'; they keep running without this conversation."""
     return api.run(studies, solver, wait=min(max(float(wait_s), 0.0), 50.0))
 
 
@@ -101,6 +109,21 @@ def run_benchmarks(names: list[str] | None = None, solver: str = "auto") -> dict
 def get_file(path: str, max_mb: float = 20) -> dict:
     """A file written by run_studies (a path from its result) as base64."""
     return api.read_file(path, max_mb)
+
+
+@server.tool()
+def jobs(limit: int = 20, active: bool = False) -> dict:
+    """Recent requests that have SLURM jobs, with each study's state (queued, running, done, timed_out,
+    out_of_memory, cancelled, failed), job id and expected time; the translator's queue and the machine's
+    CPUs. active=True: only requests with queued or running studies. Finds runs started in other
+    conversations too."""
+    return api.jobs(limit, active)
+
+
+@server.tool()
+def cancel(request: str, names: list[str] | None = None) -> dict:
+    """Stops a request's studies (or the named ones): their SLURM jobs are cancelled. Returns their states."""
+    return api.cancel(request, names)
 
 
 def main() -> None:

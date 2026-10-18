@@ -31,7 +31,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 47 tests: 27 run anywhere, 20 need ccx (and Gmsh)
+pytest -q                      # 62 tests: 42 run anywhere (15 with fake SLURM commands), 20 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -142,6 +142,8 @@ The reference solver (`refsolver.py`) is independent element code (isoparametric
 | `get_deck` | The CalculiX deck of one study, as text. |
 | `run_benchmarks` | The closed-form benchmarks: is the toolchain right on this machine? |
 | `get_file` | A written file as base64. |
+| `jobs` | Recent requests with SLURM jobs (also from other conversations), each study's state, job id and expected time; the translator's queue and the machine's CPUs. `active=True`: only queued or running ones. |
+| `cancel` | Stops a request's studies (or the named ones): `scancel` for SLURM jobs. |
 
 **Long runs.** Polling costs the calling model tokens on every call, so pending studies say where they are and how long they still need, and long runs are not polled:
 
@@ -150,6 +152,10 @@ The reference solver (`refsolver.py`) is independent element code (isoparametric
 - `next`: under about 5 minutes, call `study_status` again with a `wait_s` that covers it; over 5 minutes, tell the user when the run should finish and stop; collect it later with `study_status` (when the user asks, or from a task scheduled after that time). The server instructions say the same.
 
 The expected time comes from this machine's own finished solves: each run appends its mesh size and mesh and solve times to `timing.jsonl` in the output folder, and a new solve is estimated as (median seconds per nodes^1.5) x nodes^1.5 (sparse direct solver on a 3D mesh); the finer mesh of `converge: true` has about 4.6x the nodes. Before the first finished solve on a machine `eta_min` is unknown and the advice goes by `eta_min_max`.
+
+**SLURM** (2026.10.18.2, the llm-translators contract in `docs/EXECUTION.md`). With `FEAT_EXECUTOR=slurm`, a study estimated above `FEAT_SLURM_MIN_MINUTES` (default 5, from this machine's `timing.jsonl`; a study with no estimate counts as long), or marked `"queue": true`, becomes a SLURM job; the others run in the local pool (`"queue": false` keeps one local). Each job is `<request>/<name>/job.sh` (a complete script: `sbatch job.sh` reruns it by hand) submitted with `sbatch --parsable $FEAT_SLURM_ARGS`; it runs `feat run-study REQUEST NAME` with `--ntasks=1 --cpus-per-task=N`, N = the study's `procs` or `FEAT_PROCS` (default 1), and CalculiX gets `OMP_NUM_THREADS` from `SLURM_CPUS_PER_TASK`; buckling always asks for 1 CPU (its eigenvalues are repeatable only single-threaded). The time limit is every CalculiX solve's `FEAT_TIMEOUT` plus 10 minutes (`converge` doubles the solves, `joule` has 2-3), so feat's own timeout writes a clean result first. `job.json` records the job id; a failed `sbatch` is that study's result (`could not submit: ...`), never a silent local run.
+
+A SLURM study's state comes from the files and the queue only, so `study_status` works from any server process, after restarts and from other conversations: `done` (`<name>.json`, written atomically), `queued` (`reason`, `expected_start`, `ahead`), `running` (the progress above plus `job_elapsed_min`), and the final `timed_out`, `out_of_memory` (add `--mem=` to `FEAT_SLURM_ARGS`), `cancelled` and `failed` (the last 30 lines of `job.log`), which move the study into the results with `ok: false`. One `squeue` call per status; `sacct` for jobs that left the queue without a result, else `job.log` (SLURM's "DUE TO TIME LIMIT" and "CANCELLED" lines). `tool_status` reports `executor: {kind, sbatch, min_minutes, procs, time_limit_min}`. Command line: `feat run-study REQUEST NAME`, `feat jobs [--limit N] [--active]`, `feat cancel REQUEST [NAMES...]`. Tested with fake `sbatch`, `squeue`, `scancel`, `sacct` and `sinfo` (`tests/fake_slurm`): submit, running, done collected by a new process, queued, every final state from `sacct` and from `job.log`, cancel, `jobs`.
 
 In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.json`), next to `b3dt`:
 
@@ -179,7 +185,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `study.py`, `deck.py`, `runner.py`, `meshdata.py`, `refsolver.py`, `bench.py`, `mcp_server.py` | 2026.10.18.1 (electrical: `electric` and `electrostatic` analyses solved as heat transfer, `joule` (electric, then thermal with the Joule heat per element), `stress: true` for thermal and joule (thermal expansion in a static solve); `voltage` and `current` bcs; resistivity, permittivity and dielectric strength in the material library, five new materials; reference solver: body heat, heat-flux output, thermal strain; six benchmarks, five exact; no false 'peak at a support' for a uniform stress, heat-balance floor for a uniform temperature) |
+| Package, `executor.py` (new), `api.py`, `cli.py`, `mcp_server.py`, `runner.py`, `study.py` | 2026.10.18.2 (SLURM execution per llm-translators `docs/EXECUTION.md`: `FEAT_EXECUTOR`, `FEAT_SLURM_MIN_MINUTES`, `FEAT_SLURM_ARGS`, `FEAT_PROCS`; study keys `procs` and `queue`; one job per study with `--cpus-per-task` (1 for buckling); states from files and the queue; `feat run-study`, `jobs` and `cancel` (tools and commands); `executor` in `tool_status`; result files written atomically; tests with fake SLURM commands) |
+| `study.py`, `deck.py`, `runner.py`, `meshdata.py`, `refsolver.py`, `bench.py`, `mcp_server.py` | 2026.10.18.1 (electrical: `electric` and `electrostatic` analyses solved as heat transfer, `joule` (electric, then thermal with the Joule heat per element), `stress: true` for thermal and joule (thermal expansion in a static solve); `voltage` and `current` bcs; resistivity, permittivity and dielectric strength in the material library, five new materials; reference solver: body heat, heat-flux output, thermal strain; six benchmarks, five exact; no false 'peak at a support' for a uniform stress, heat-balance floor for a uniform temperature) |
 | Package (before), `pyproject.toml` | 2026.10.16.10 |
 | `api.py`, `runner.py`, `mcp_server.py` | 2026.10.16.10 (long runs: `progress` per pending study, `time_left` and `next`; `timing.jsonl` of finished solves for the expected time; instructions: tell the user when to come back instead of polling runs over about 5 min) |
 | Package (before) | 2026.10.16.9 (the `mesh` extra skips Gmsh on Linux ARM, where PyPI has no wheels; README: Ubuntu's python3-gmsh linked into the venv) |

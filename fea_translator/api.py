@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.16.10
+Version: 2026.10.18.2
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -11,11 +11,15 @@ Version: 2026.10.16.10
     deck(study, name)                the CalculiX input deck of one study, as text (meshes the part)
     bench(names, solver)             the benchmark studies with closed-form answers
     read_file(path)                  a written file as base64 (only under the output folder)
-    tool_status()                    versions, solver and mesher found
+    jobs(limit, active)              recent requests with SLURM jobs and their states; the queue
+    cancel(request, names)           stops a request's studies (scancel)
+    tool_status()                    versions, solver and mesher found, the executor
 
-Studies run in worker processes with a time limit each. Environment: FEAT_OUT (default
-~/feat_runs), FEAT_WORKERS (2), FEAT_TIMEOUT (seconds per study, 900), FEAT_CCX (path of ccx),
-FEAT_SOLVER (auto | ccx | ref; auto = CalculiX when found, else the reference solver).
+Studies run in worker processes with a time limit each, or (FEAT_EXECUTOR=slurm, executor.py) the
+long ones as SLURM jobs. Environment: FEAT_OUT (default ~/feat_runs), FEAT_WORKERS (2), FEAT_TIMEOUT
+(seconds per CalculiX solve, 900), FEAT_CCX (path of ccx), FEAT_SOLVER (auto | ccx | ref; auto =
+CalculiX when found, else the reference solver), FEAT_PROCS (CalculiX threads, 1), FEAT_EXECUTOR,
+FEAT_SLURM_MIN_MINUTES (5), FEAT_SLURM_ARGS.
 """
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import __version__
+from . import __version__, executor
 from .study import study_format as _format
 from .study import validate as _validate
 from .study import validate_study
@@ -61,6 +65,7 @@ def tool_status() -> dict:
         out["build123d_translator"] = build123d_translator.__version__
     except ImportError:
         out["build123d_translator"] = None
+    out["executor"] = executor.status_key()
     return out
 
 
@@ -77,6 +82,11 @@ def _run_one(job: dict) -> dict:
 
     if job.get("out"):  # the worker may outlive a change of FEAT_OUT: timing records go with the request
         os.environ["FEAT_OUT"] = job["out"]
+    # CalculiX threads: the study's procs or FEAT_PROCS when given, else up to 4 (set every time: the
+    # worker process runs one study after another)
+    given = job["study"].get("procs") or os.environ.get("FEAT_PROCS")
+    os.environ["OMP_NUM_THREADS"] = str(int(given) if given else min(4, os.cpu_count() or 1))
+    os.environ["CCX_NPROC_EQUATION_SOLVER"] = os.environ["OMP_NUM_THREADS"]
     t0 = time.perf_counter()
     r = run_study(job["name"], job["study"], Path(job["folder"]) / job["name"], job["solver"], job.get("timeout", 900))
     r.setdefault("seconds", {})
@@ -115,6 +125,9 @@ def _collect(folder: Path) -> dict:
     meta = json.loads((folder / "request.json").read_text())
     handles = _POOL.jobs.get(str(folder), {})
     out, pending = dict(meta.get("invalid", {})), []
+    slurm = set(meta.get("slurm", []))
+    todo = [n for n in slurm if not (folder / n / f"{n}.json").is_file()]
+    states = executor.job_states(folder, todo) if todo else {}
     for name in meta["names"]:
         f = folder / name / f"{name}.json"
         h = handles.get(name)
@@ -124,6 +137,18 @@ def _collect(folder: Path) -> dict:
                 continue
             except json.JSONDecodeError:
                 pass
+        if name in slurm:
+            st = states.get(name, {"state": "failed", "why": "no job.json"})
+            if st["state"] in executor.FINAL:   # a finished state is a result
+                out[name] = {"ok": False, **st}
+            elif st["state"] == "done":         # written between the two looks
+                try:
+                    out[name] = json.loads(f.read_text())
+                except (OSError, json.JSONDecodeError):
+                    pending.append(name)
+            else:
+                pending.append(name)
+            continue
         if h is not None and h.ready():
             try:
                 out[name] = h.get()
@@ -139,8 +164,30 @@ def _collect(folder: Path) -> dict:
     if pending:
         studies = json.loads((folder / "studies.json").read_text()) if (folder / "studies.json").is_file() else {}
         timeout = float(meta.get("timeout", os.environ.get("FEAT_TIMEOUT", "900")))
-        res["progress"] = {n: _progress(folder / n, studies.get(n, {}), meta["solver"], timeout) for n in pending}
+        res["progress"] = {}
+        for n in pending:
+            pr = _progress(folder / n, studies.get(n, {}), meta["solver"], timeout)
+            if n in slurm:
+                st = states.get(n, {})
+                pr.update({k: v for k, v in st.items() if k != "state"})
+                pr["state"] = st.get("state", "queued")
+                if pr["state"] == "queued":   # not started: the run's own estimate; the queue wait comes first
+                    pr["stage"] = "queued"
+                elif pr["stage"] == "queued":  # started by SLURM, no progress written yet
+                    pr["stage"] = "starting"
+            else:
+                pr["state"] = "queued" if pr["stage"] == "queued" else "running"
+            res["progress"][n] = pr
         res["time_left"], res["next"] = _timing(folder, res["progress"])
+        sl = {n: res["progress"][n].get("job_id") for n in pending if n in slurm}
+        if sl:
+            when = res["time_left"].get("expected_finish") or f"at the latest {res['time_left']['latest_finish']}"
+            if any(res["progress"][n]["state"] == "queued" for n in sl):
+                when += " once they start (some are waiting in the queue)"
+            res["next"] = (f"The studies are SLURM jobs on this machine (ids {', '.join(str(v) for v in sl.values())}). "
+                           f"They keep running without this conversation. Tell the user when they should finish "
+                           f"({when}) and stop; collect them later with study_status(request='{folder}') or find them "
+                           f"with jobs().")
     else:
         (folder / "results.json").write_text(json.dumps(res, indent=1))
     return res
@@ -273,12 +320,32 @@ def start(studies: dict, solver: str | None = None) -> Path:
             invalid[n] = {"ok": False, "why": "invalid study", "errors": v["errors"]}
         else:
             jobs.append({"name": n, "study": st, "folder": str(folder), "solver": s, "out": str(out_root())})
+    slurm = [j["name"] for j in jobs if executor.use_slurm(j["study"], estimate_min(j["study"], s))]
     (folder / "request.json").write_text(json.dumps({"names": [j["name"] for j in jobs], "invalid": invalid,
-                                                     "solver": s, "started": time.time(),
+                                                     "solver": s, "started": time.time(), "slurm": slurm,
+                                                     "executor": executor.kind(),
                                                      "timeout": float(os.environ.get("FEAT_TIMEOUT", "900"))}))
-    if jobs:
-        _POOL.submit(folder, jobs)
+    for n in slurm:   # one SLURM job per study; a failed submission is that study's result (no local fallback)
+        info = executor.submit(folder, n, studies[n])
+        if info.get("ok") is False:
+            (folder / n).mkdir(parents=True, exist_ok=True)
+            (folder / n / f"{n}.json").write_text(json.dumps({**info, "state": "failed"}))
+    local = [j for j in jobs if j["name"] not in slurm]
+    if local:
+        _POOL.submit(folder, local)
     return folder
+
+
+def estimate_min(study: dict, solver: str) -> float | None:
+    """Expected minutes of a study from this machine's finished solves of its analysis (timing.jsonl);
+    None without records (such a study goes to SLURM when FEAT_EXECUTOR=slurm)."""
+    rt = _rates(study.get("analysis", ""), solver)
+    if rt is None:
+        return None
+    s = rt["mesh_s"] + rt["solve_s"]
+    if study.get("converge"):
+        s += rt["mesh_s"] * FINE_NODES + rt["solve_s"] * FINE_NODES ** SOLVE_EXP
+    return s / 60
 
 
 def status(request: str, wait: float = 0.0) -> dict:
@@ -292,7 +359,8 @@ def status(request: str, wait: float = 0.0) -> dict:
         res = _collect(folder)
         if res["done"] or time.time() >= t_end:
             return res
-        time.sleep(1.0)
+        slurm = any(p.get("job_id") for p in res.get("progress", {}).values())
+        time.sleep(min(5.0 if slurm else 1.0, max(0.1, t_end - time.time())))   # one squeue per look
 
 
 def run(studies: dict, solver: str | None = None, wait: float | None = None) -> dict:
@@ -302,6 +370,96 @@ def run(studies: dict, solver: str | None = None, wait: float | None = None) -> 
     listed as pending and status(request) collects them later."""
     folder = start(studies, solver)
     return status(str(folder), 1e9 if wait is None else wait)
+
+
+def jobs(limit: int = 20, active: bool = False) -> dict:
+    """The newest requests under FEAT_OUT with SLURM jobs, their studies' states, job ids and times;
+    the translator's queue (running, queued, CPUs) and the machine's CPUs. active: only requests with
+    queued or running studies."""
+    root = out_root()
+    reqs = sorted((d for d in root.glob("run_*") if (d / "request.json").is_file()),
+                  key=lambda d: d.stat().st_mtime, reverse=True) if root.is_dir() else []
+    out = []
+    for d in reqs:
+        if len(out) >= max(1, int(limit)):
+            break
+        try:
+            meta = json.loads((d / "request.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        names = meta.get("slurm", [])
+        if not names or not any((d / n / "job.json").is_file() for n in names):
+            continue
+        st = executor.job_states(d, names)
+        if active and not any(v["state"] in ("queued", "running") for v in st.values()):
+            continue
+        studies = {}
+        for n, v in st.items():
+            rec = dict(v)
+            if v["state"] == "done":
+                try:
+                    r = json.loads((d / n / f"{n}.json").read_text())
+                    rec["ok"] = r.get("ok")
+                    if r.get("ok") is False:
+                        rec["why"] = r.get("why")
+                except (OSError, json.JSONDecodeError):
+                    pass
+            elif v["state"] == "running":
+                pr = _progress(d / n, {}, meta.get("solver", "ccx"), float(meta.get("timeout", 900)))
+                rec.update({k: pr[k] for k in ("stage", "eta_min", "eta_min_max") if k in pr})
+            studies[n] = rec
+        out.append({"request": str(d), "started": _clock(meta.get("started", d.stat().st_mtime)), "studies": studies})
+    return {"executor": executor.kind(), "requests": out, **executor.queue_summary()}
+
+
+def cancel(request: str, names: list[str] | None = None) -> dict:
+    """Stops a request's studies (or the named ones): scancel for SLURM jobs; a local study only if
+    this server process runs it. Returns their states."""
+    folder = Path(request).expanduser()
+    try:
+        meta = json.loads((folder / "request.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"error": f"no request {folder}"}
+    want = list(names) if names else list(meta.get("names", []))
+    slurm = [n for n in want if n in meta.get("slurm", [])]
+    ids = []
+    for n in slurm:
+        try:
+            if not (folder / n / f"{n}.json").is_file():
+                ids.append(json.loads((folder / n / "job.json").read_text())["job_id"])
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+    err = executor.scancel(ids)
+    out = {"cancelled_jobs": ids}
+    if err:
+        out["error"] = err
+    local = [n for n in want if n not in slurm]
+    if local:
+        handles = _POOL.jobs.get(str(folder), {})
+        running = [n for n in local if n in handles and not handles[n].ready()]
+        others = [h for f, hs in _POOL.jobs.items() for n, h in hs.items()
+                  if not h.ready() and not (f == str(folder) and n in running)]
+        if running and not others and _POOL.pool is not None:   # the pool runs only these: stop it
+            _POOL.pool.terminate()
+            _POOL.pool = None
+            for n in running:
+                (folder / n).mkdir(parents=True, exist_ok=True)
+                (folder / n / f"{n}.json").write_text(json.dumps({"ok": False, "state": "cancelled",
+                                                                  "why": "cancelled (local worker pool stopped)"}))
+            out["cancelled_local"] = running
+        elif running:
+            out["note"] = ("local studies run in this server's worker pool together with other studies; they cannot "
+                           "be stopped alone and end at their time limit: " + ", ".join(running))
+        elif any(n not in handles for n in local if not (folder / n / f"{n}.json").is_file()):
+            out["note"] = "local studies of this request are not run by this server process; they cannot be cancelled here"
+    t_end = time.time() + 10   # give SLURM a moment to end the jobs
+    while ids and time.time() < t_end and any(executor.squeue(ids)):
+        time.sleep(1)
+    st = _collect(folder)
+    out["states"] = {n: (st["progress"][n]["state"] if n in st.get("pending", []) else
+                         st["studies"].get(n, {}).get("state", "done" if st["studies"].get(n, {}).get("ok") else "failed"))
+                     for n in want}
+    return out
 
 
 def deck(study: dict, name: str = "study") -> dict:
