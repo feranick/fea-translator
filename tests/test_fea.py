@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.18.4
+Version: 2026.10.18.7
 """
 import shutil
 from pathlib import Path
@@ -428,3 +428,27 @@ def test_stresses_are_checked_against_the_displacements(tmp_path):
     res = evaluate(st, m, plan, dat, None)
     assert res["stress_check"]["elements_disagreeing"] == 10 and not res["stress_check"]["agree"]
     assert abs(res["max_von_mises"] - 10.0) < 1e-4      # the recomputed stresses (from 7-digit displacements)
+
+
+def test_unbalanced_solve_is_rerun_single_threaded(tmp_path, monkeypatch):
+    """CalculiX's multithreaded solve once gave wrong displacements (plate_hole on a busy mochi, equilibrium
+    error 1.4e-3, exact on every rerun): a solve whose balance check is off is rerun single-threaded once."""
+    from fea_translator import runner
+
+    orig, calls = runner._solve, []
+
+    def fake(name, study, mesh, folder, solver, timeout, extra=None, serial=False):
+        plan, dat, frd, inp = orig(name, study, mesh, folder, "ref", timeout, extra)
+        calls.append(serial)
+        if not serial:   # the multithreaded run went wrong: its reactions do not balance the load
+            for b in dat["blocks"]:
+                if b["what"].startswith("forces"):
+                    for row in b["rows"]:
+                        row[3] *= 1.01
+        return plan, dat, frd, inp
+
+    monkeypatch.setattr(runner, "_solve", fake)
+    r = runner.run_study("c", bench.cases("ref")["cantilever"], tmp_path, solver="ccx")
+    assert calls == [False, True], calls
+    assert r["solver_reruns"][0]["balance_error"] > 1e-3 and r["equilibrium_error"] < 1e-6
+    assert any("rerun single-threaded" in w for w in r["warnings"])

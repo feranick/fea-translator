@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.18.4
+Version: 2026.10.18.7
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -63,6 +63,10 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
     # points (correct displacements) in a busy test run on mochi: the stress step runs single-threaded
     # (it is a small part of the time); recompute_stresses() checks every result anyway
     env["CCX_NPROC_RESULTS"] = "1"
+    # ... and its multithreaded stiffness assembly once gave wrong displacements near a hole (plate_hole,
+    # equilibrium error 1.4e-3, exact on every rerun) while other jobs used the machine: assembly is cheap,
+    # it runs single-threaded too; the equation solver keeps its threads
+    env["CCX_NPROC_STIFFNESS"] = "1"
     if serial:
         env["OMP_NUM_THREADS"] = env["CCX_NPROC_EQUATION_SOLVER"] = "1"
     # CalculiX is OpenMP-parallel and its eigenvalue solver (ARPACK) calls BLAS inside it; a threaded
@@ -520,7 +524,23 @@ def _sub(study: dict, analysis: str, kinds) -> dict:
     return dict(study, analysis=analysis, bcs=bcs)
 
 
-def _solve(name: str, study: dict, mesh: Mesh, folder: Path, solver: str, timeout: float, extra=None):
+BALANCE_KEYS = ("equilibrium_error", "heat_balance_error", "current_balance_error", "charge_balance_error")
+
+
+def _balance(res: dict) -> float:
+    return max((float(res.get(k) or 0) for k in BALANCE_KEYS), default=0.0)
+
+
+def _suspect(res: dict, plan: dict) -> bool:
+    """A solve whose own balance check is off: with the direct solver equilibrium is ~1e-8, so 1e-5 (static)
+    or 1e-4 (heat, current) means a wrong solve; the iterative solver stops at a tolerance (1e-3)."""
+    if plan.get("equation_solver") == "iterative":
+        return _balance(res) > 1e-3
+    return _balance(res) > (1e-5 if res.get("analysis") == "static" else 1e-4)
+
+
+def _solve(name: str, study: dict, mesh: Mesh, folder: Path, solver: str, timeout: float, extra=None,
+           serial: bool = False):
     """Writes and solves one deck; returns (plan, dat, frd, inp)."""
     text, plan = deck.write(name, study, mesh, extra)
     inp = folder / f"{name}.inp"
@@ -529,7 +549,8 @@ def _solve(name: str, study: dict, mesh: Mesh, folder: Path, solver: str, timeou
         from . import refsolver
         refsolver.run(inp)
     else:
-        run_ccx(inp, timeout, serial=study["analysis"] == "buckling")
+        run_ccx(inp, timeout, serial=serial or study["analysis"] == "buckling")
+    plan["equation_solver"] = deck.equation_solver(study, len(mesh.nodes))
     dat = results.parse_dat(inp.with_suffix(".dat").read_text())
     frd_path = inp.with_suffix(".frd")
     frd = results.parse_frd(frd_path.read_text()) if frd_path.is_file() else None
@@ -571,23 +592,30 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     an = study["analysis"]
     files, warns, sel = {}, [], {}
 
+    reruns = []
+
     def run(sname, st, extra=None):
+        """One solve, evaluated; rerun once fully single-threaded if its balance check is off."""
         plan, dat, frd, inp = _solve(sname, st, mesh, folder, solver, timeout, extra)
+        r_ = evaluate(st, mesh, plan, dat, frd, band)
+        if solver == "ccx" and _suspect(r_, plan):
+            first = _balance(r_)
+            plan, dat, frd, inp = _solve(sname, st, mesh, folder, solver, timeout, extra, serial=True)
+            r_ = evaluate(st, mesh, plan, dat, frd, band)
+            reruns.append({"solve": sname, "balance_error": round(first, 8), "after_rerun": round(_balance(r_), 8)})
         for k, p in (("inp", inp), ("dat", inp.with_suffix(".dat")), ("frd", inp.with_suffix(".frd"))):
             if p.is_file():
                 files[k if sname == name else f"{k}_{sname[len(name) + 1:]}"] = str(p)
         warns.extend(plan["selection_warnings"])
         sel.update(plan["selection"])
-        return plan, dat, frd
+        return plan, dat, frd, r_
 
     if an == "joule":
         st_e = _sub(study, "electric", ELECTRIC_BCS)
-        plan_e, dat_e, frd_e = run(f"{name}_electric", st_e)
-        res_e = evaluate(st_e, mesh, plan_e, dat_e, frd_e, band)
+        plan_e, dat_e, frd_e, res_e = run(f"{name}_electric", st_e)
         q = joule_heat(study, mesh, dat_e)
         st_t = _sub(study, "thermal", THERMAL_BCS)
-        plan_t, dat_t, frd_t = run(f"{name}_thermal", st_t, {"body_heat": q})
-        res = evaluate(st_t, mesh, plan_t, dat_t, frd_t, band)
+        plan_t, dat_t, frd_t, res = run(f"{name}_thermal", st_t, {"body_heat": q})
         res["analysis"] = "joule"
         res["electric"] = {k: v for k, v in res_e.items() if k not in ("analysis",)}
         jw = float((q * mesh.element_volumes()).sum())
@@ -597,17 +625,17 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
             res["joule_check_error"] = round(abs(jw - pw) / max(abs(pw), 1e-30), 6)
         T = _node_values(dat_t, "temperatures", len(mesh.nodes), 1)[:, 0]
     else:
-        plan, dat, frd = run(name, study if an != "thermal" else _sub(study, "thermal", THERMAL_BCS))
-        res = evaluate(study if an != "thermal" else _sub(study, "thermal", THERMAL_BCS), mesh, plan, dat, frd, band)
+        plan, dat, frd, res = run(name, study if an != "thermal" else _sub(study, "thermal", THERMAL_BCS))
         T = _node_values(dat, "temperatures", len(mesh.nodes), 1)[:, 0] if an == "thermal" else None
     if study.get("stress") and an in ("thermal", "joule"):
         st_s = _sub(study, "static", MECH_BCS)
         t_ref = float(study.get("T_ref", 20.0))
-        plan_s, dat_s, frd_s = run(f"{name}_stress", st_s, {"temperatures": T, "T_ref": t_ref})
-        rs = evaluate(st_s, mesh, plan_s, dat_s, frd_s, band)
+        plan_s, dat_s, frd_s, rs = run(f"{name}_stress", st_s, {"temperatures": T, "T_ref": t_ref})
         rs.pop("analysis", None)
         rs["T_ref"] = t_ref
         res["stress"] = rs
+    if reruns:
+        res["solver_reruns"] = reruns
     t2 = time.perf_counter()
     _record_timing(study, solver, minfo, t1 - t0, t2 - t1)
     res["selection"] = sel
@@ -664,6 +692,11 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
             warn.append("stress: the peak von Mises stress is at a support, where stresses are singular; judge the "
                         "design on stress.peak_von_mises_off_bc / stress.safety_factor_off_bc")
         warn += res.pop("_selection_warnings", [])
+        for rr in res.get("solver_reruns", []):
+            ok_ = rr["after_rerun"] <= rr["balance_error"] / 100 or rr["after_rerun"] < 1e-5
+            warn.append(f"CalculiX's multithreaded solve of {rr['solve']} did not balance (error {rr['balance_error']:.2g}); "
+                        f"it was rerun single-threaded (error {rr['after_rerun']:.2g})"
+                        + ("" if ok_ else ": still off, check the model"))
         for where, r_ in (("", res), ("stress: ", res.get("stress", {}))):
             sc = r_.get("stress_check", {})
             if sc and not sc.get("agree", True) and "elements_disagreeing" in sc:
