@@ -31,7 +31,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 62 tests: 42 run anywhere (15 with fake SLURM commands), 20 need ccx (and Gmsh)
+pytest -q                      # 63 tests: 43 run anywhere (15 with fake SLURM commands), 20 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -79,7 +79,7 @@ Per study the folder holds `part.step`, `mesh.msh`, `<name>.inp` (the deck; runs
 
 | Analysis | Results |
 |---|---|
-| static | `max_displacement` (+ where, per component), `max_von_mises` (integration points) and `max_von_mises_nodal` (CalculiX's nodal values), with where; `peak_von_mises` (the larger of the two) and `safety_factor` (yield / that peak); `peak_von_mises_off_bc` and `safety_factor_off_bc` (leaving out the material within `stress_band` of supports and loads, where stresses are singular; default two element sizes of the nominal mesh, the same on the `converge` mesh so the value can converge; widen it if it does not); `peak_at_bc` (the supports or loads the peak sits on); `reactions` per support, `faces` and `probes` (area-weighted mean displacement, largest), `applied_force`, `equilibrium_error`, `mass_kg` |
+| static | `max_displacement` (+ where, per component), `max_von_mises` (integration points) and `max_von_mises_nodal` (CalculiX's nodal values), with where; `peak_von_mises` (the larger of the two) and `safety_factor` (yield / that peak); `peak_von_mises_off_bc` and `safety_factor_off_bc` (leaving out the material within `stress_band` of supports and loads, where stresses are singular; default two element sizes of the nominal mesh, the same on the `converge` mesh so the value can converge; widen it if it does not); `peak_at_bc` (the supports or loads the peak sits on); `reactions` per support, `faces` and `probes` (area-weighted mean displacement, largest), `applied_force`, `equilibrium_error`, `mass_kg` ; `stress_check` (CalculiX's integration-point stresses against those recomputed from its displacements: `agree`, `max_difference_MPa`, `elements_disagreeing`) |
 | modal | `frequencies` (Hz), `mass_kg` |
 | buckling | `buckling_factors`, `critical_factor` (critical load = factor × the applied loads) |
 | thermal | `T_max`, `T_min` (+ where), `heat_flow` per temperature and convection boundary (W, into the part), `heat_balance_error`, `faces` and `probes` (mean, max, min temperature) |
@@ -185,7 +185,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `results.py`, `tests/conftest.py` | 2026.10.18.3 (CalculiX 2.21 writes the heat-flux header as `for setEALL`: the current density, field and Joule heat were not read on mochi; tests run in local mode even where the machine's config sets `FEAT_EXECUTOR=slurm`) |
+| Package, `runner.py`, `deck.py` | 2026.10.18.4 (CalculiX 2.21's multithreaded stress step returned wrong stresses at 504 of 960 integration points of `axial_bar` (correct displacements) in a busy test run on mochi, and was right in 10 reruns: the stress step runs single-threaded (`CCX_NPROC_RESULTS=1`), and every static result recomputes the integration-point stresses from the displacements (`stress_check`); if CalculiX's disagree, the recomputed ones give the peaks and safety factors, with a warning) |
+| `results.py`, `tests/conftest.py` | 2026.10.18.3 (CalculiX 2.21 writes the heat-flux header as `for setEALL`: the current density, field and Joule heat were not read on mochi; tests run in local mode even where the machine's config sets `FEAT_EXECUTOR=slurm`) |
 | `executor.py` (new), `api.py`, `cli.py`, `mcp_server.py`, `runner.py`, `study.py` | 2026.10.18.2 (SLURM execution per llm-translators `docs/EXECUTION.md`: `FEAT_EXECUTOR`, `FEAT_SLURM_MIN_MINUTES`, `FEAT_SLURM_ARGS`, `FEAT_PROCS`; study keys `procs` and `queue`; one job per study with `--cpus-per-task` (1 for buckling); states from files and the queue; `feat run-study`, `jobs` and `cancel` (tools and commands); `executor` in `tool_status`; result files written atomically; tests with fake SLURM commands) |
 | `study.py`, `deck.py`, `runner.py`, `meshdata.py`, `refsolver.py`, `bench.py`, `mcp_server.py` | 2026.10.18.1 (electrical: `electric` and `electrostatic` analyses solved as heat transfer, `joule` (electric, then thermal with the Joule heat per element), `stress: true` for thermal and joule (thermal expansion in a static solve); `voltage` and `current` bcs; resistivity, permittivity and dielectric strength in the material library, five new materials; reference solver: body heat, heat-flux output, thermal strain; six benchmarks, five exact; no false 'peak at a support' for a uniform stress, heat-balance floor for a uniform temperature) |
 | Package (before), `pyproject.toml` | 2026.10.16.10 |

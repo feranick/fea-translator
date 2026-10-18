@@ -1,5 +1,5 @@
 """deck.py — a study and its mesh as a CalculiX input deck (.inp).
-Version: 2026.10.18.1
+Version: 2026.10.18.4
 
     text, plan = write(name, study, mesh)
 
@@ -240,6 +240,7 @@ def write(name: str, study: dict, mesh: Mesh, extra: dict | None = None) -> tupl
         plan["heat_in_W"] += float((q * mesh.element_volumes()).sum())
         plan["nodal_heat"] += mesh.source_nodes(q * P_SCALE)
     if "temperatures" in extra and an == "static":
+        plan["temperatures"], plan["T_ref"] = extra["temperatures"], extra["T_ref"]
         L += ["*TEMPERATURE"] + [f"{i + 1}, {_g(t)}" for i, t in enumerate(extra["temperatures"])]
     if dflux:
         L += ["*DFLUX"] + dflux

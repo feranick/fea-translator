@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.18.3
+Version: 2026.10.18.4
 """
 import shutil
 from pathlib import Path
@@ -399,3 +399,30 @@ def test_electrical_validation_and_format():
                                                    {"kind": "voltage", "faces": {"nx": 1}, "V": 1}]})
     for name in ("bar_resistance", "plate_capacitor", "joule_bar", "thermal_stress_bar", "coax_capacitor"):
         assert validate_study(bench.cases()[name])["ok"], name
+
+
+def test_stresses_are_checked_against_the_displacements(tmp_path):
+    """CalculiX's stress step once returned wrong stresses from correct displacements (mochi, 2026-10-18):
+    every static result recomputes the integration-point stresses from the displacements; when they
+    disagree, the recomputed ones are used, with a warning."""
+    from fea_translator import refsolver
+    from fea_translator.runner import evaluate
+
+    for name in ("axial_bar", "thermal_stress_bar"):
+        r = run_study(name, bench.cases("ref")[name], tmp_path / name, solver="ref")
+        chk = r["stress_check"] if name == "axial_bar" else r["stress"]["stress_check"]
+        assert chk["agree"] and chk["max_difference_MPa"] < 1e-4, (name, chk)
+    st = bench.cases("ref")["axial_bar"]
+    m = box_mesh(100, 10, 10, 10, 2, 2, origin=(0, 0, 0))
+    text, plan = deck.write("bar", st, m)
+    inp = tmp_path / "bar.inp"
+    inp.write_text(text)
+    refsolver.run(inp)
+    dat = results.parse_dat(inp.with_suffix(".dat").read_text())
+    b = results.block(dat, "stresses", "EALL")
+    for row in b["rows"][40:80]:          # corrupt 10 elements' stresses, as the race did
+        row[2] *= 4.7
+        row[5] += 15.0
+    res = evaluate(st, m, plan, dat, None)
+    assert res["stress_check"]["elements_disagreeing"] == 10 and not res["stress_check"]["agree"]
+    assert abs(res["max_von_mises"] - 10.0) < 1e-4      # the recomputed stresses (from 7-digit displacements)

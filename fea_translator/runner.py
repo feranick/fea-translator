@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.18.2
+Version: 2026.10.18.4
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -59,6 +59,10 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
     env = dict(os.environ)
     env.setdefault("OMP_NUM_THREADS", str(min(4, os.cpu_count() or 1)))
     env.setdefault("CCX_NPROC_EQUATION_SOLVER", env["OMP_NUM_THREADS"])
+    # CalculiX 2.21's multithreaded stress recovery once returned wrong stresses at half the integration
+    # points (correct displacements) in a busy test run on mochi: the stress step runs single-threaded
+    # (it is a small part of the time); recompute_stresses() checks every result anyway
+    env["CCX_NPROC_RESULTS"] = "1"
     if serial:
         env["OMP_NUM_THREADS"] = env["CCX_NPROC_EQUATION_SOLVER"] = "1"
     # CalculiX is OpenMP-parallel and its eigenvalue solver (ARPACK) calls BLAS inside it; a threaded
@@ -153,6 +157,19 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, b
         peaks = {}
         if sb:
             rows = np.array(sb["rows"])
+            try:
+                ours = recompute_stresses(mesh, np.nan_to_num(U), study, plan)
+                chk = check_stresses(rows, ours)
+            except Exception as exc:  # noqa: BLE001
+                ours, chk = None, {"error": f"{type(exc).__name__}: {exc}"[:200]}
+            out["stress_check"] = chk
+            if ours is not None and not chk.get("agree", True):
+                # CalculiX's stress step disagrees with its own displacements: use the recomputed stresses
+                q = ours.shape[1]
+                rows = np.column_stack([np.repeat(np.arange(1, len(mesh.tets) + 1), q), np.tile(np.arange(1, q + 1), len(mesh.tets)),
+                                        ours.reshape(-1, 6)])
+                frd = None   # its nodal stresses come from the same wrong values
+                chk["used"] = "stresses recomputed from the displacements (nodal values dropped)"
             el = rows[:, 0].astype(int) - 1
             vm = results.von_mises(rows[:, 2:8])
             j = int(np.argmax(vm))
@@ -282,6 +299,66 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, b
             tgt[key] = {"mean_T": round(float(_face_mean(mesh, tags, T[:, None])[0]), 6),
                         "max_T": round(float(np.nanmax(T[nodes])), 6), "min_T": round(float(np.nanmin(T[nodes])), 6)}
     return out
+
+
+GAUSS4 = np.array([[0.5854101966249685, 0.1381966011250105, 0.1381966011250105, 0.1381966011250105],
+                   [0.1381966011250105, 0.5854101966249685, 0.1381966011250105, 0.1381966011250105],
+                   [0.1381966011250105, 0.1381966011250105, 0.5854101966249685, 0.1381966011250105],
+                   [0.1381966011250105, 0.1381966011250105, 0.1381966011250105, 0.5854101966249685]])
+
+
+def recompute_stresses(mesh: Mesh, U: np.ndarray, study: dict, plan: dict) -> np.ndarray:
+    """Stresses (E, q, 6: sxx, syy, szz, sxy, sxz, syz) at CalculiX's integration points (4 for 10-node
+    tetrahedra, 1 for 4-node), from the displacements: sigma = D (B u - thermal strain). The same element
+    formulation as CalculiX, so they agree to its printed digits unless its stress step went wrong."""
+    from .meshdata import EDGES, simplex_shape
+
+    mat = material_of(study)
+    E, nu = float(mat["E"]), float(mat["nu"])
+    lam, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
+    L = GAUSS4 if mesh.order == 2 else np.full((1, 4), 0.25)
+    N, dN = simplex_shape(L, mesh.order == 2, EDGES)
+    X = mesh.nodes[mesh.tets]
+    dNdxi = dN[:, :, 1:] - dN[:, :, :1]
+    J = np.einsum("qnj,enk->eqjk", dNdxi, X)
+    G = np.einsum("eqkj,qnj->eqnk", np.linalg.inv(J), dNdxi)          # dN/dx (E, q, n, 3)
+    gu = np.einsum("eqnk,enc->eqck", G, U[mesh.tets])                 # du_c/dx_k
+    eps = np.stack([gu[..., 0, 0], gu[..., 1, 1], gu[..., 2, 2], gu[..., 0, 1] + gu[..., 1, 0],
+                    gu[..., 0, 2] + gu[..., 2, 0], gu[..., 1, 2] + gu[..., 2, 1]], axis=-1)
+    if plan.get("temperatures") is not None:
+        dT = np.einsum("qa,ea->eq", N, np.asarray(plan["temperatures"], float)[mesh.tets]) - float(plan["T_ref"])
+        eps[..., :3] -= float(mat["alpha"]) * dT[..., None]
+    tr = eps[..., :3].sum(axis=-1)
+    sig = np.empty_like(eps)
+    sig[..., :3] = lam * tr[..., None] + 2 * mu * eps[..., :3]
+    sig[..., 3:] = mu * eps[..., 3:]
+    return sig
+
+
+def check_stresses(rows: np.ndarray, ours: np.ndarray) -> dict:
+    """Compares CalculiX's integration-point stresses (rows: elem, ip, 6 components) with ours, element by
+    element (sorted von Mises values, so the point order does not matter)."""
+    el = rows[:, 0].astype(int) - 1
+    vm_c = results.von_mises(rows[:, 2:8])
+    vm_o = results.von_mises(ours.reshape(-1, 6)).reshape(ours.shape[0], ours.shape[1])
+    q = ours.shape[1]
+    # the .dat prints displacements to 7 digits: allow 0.1 % of the peak (the race's errors were 4x)
+    tol = 1e-3 * max(float(vm_o.max()), 1e-12) + 1e-6
+    by_el = {}
+    for e, v in zip(el, vm_c):
+        by_el.setdefault(int(e), []).append(v)
+    bad, worst = [], 0.0
+    for e, vals in by_el.items():
+        if len(vals) != q:
+            bad.append(e)
+            continue
+        d = float(np.abs(np.sort(vals) - np.sort(vm_o[e])).max())
+        worst = max(worst, d)
+        if d > tol:
+            bad.append(e)
+    missing = ours.shape[0] - len(by_el)
+    return {"elements_disagreeing": len(bad) + max(missing, 0), "max_difference_MPa": round(worst, 6),
+            "agree": not bad and missing <= 0}
 
 
 def _field_results(study: dict, mesh: Mesh, plan: dict, dat: dict, band: float | None) -> dict:
@@ -587,6 +664,12 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
             warn.append("stress: the peak von Mises stress is at a support, where stresses are singular; judge the "
                         "design on stress.peak_von_mises_off_bc / stress.safety_factor_off_bc")
         warn += res.pop("_selection_warnings", [])
+        for where, r_ in (("", res), ("stress: ", res.get("stress", {}))):
+            sc = r_.get("stress_check", {})
+            if sc and not sc.get("agree", True) and "elements_disagreeing" in sc:
+                warn.append(f"{where}CalculiX's stresses disagreed with its own displacements in "
+                            f"{sc['elements_disagreeing']} elements (up to {sc['max_difference_MPa']:.4g} MPa): "
+                            "the peaks and safety factors use the stresses recomputed from the displacements")
         ns = res.get("mesh", {}).get("straightened_elements", 0)
         if ns:
             warn.append(f"{ns} curved second-order elements were inverted after meshing and were straightened "
