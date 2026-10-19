@@ -1,8 +1,9 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.18.7
+Version: 2026.10.19.1
 """
 import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -452,3 +453,32 @@ def test_unbalanced_solve_is_rerun_single_threaded(tmp_path, monkeypatch):
     assert calls == [False, True], calls
     assert r["solver_reruns"][0]["balance_error"] > 1e-3 and r["equilibrium_error"] < 1e-6
     assert any("rerun single-threaded" in w for w in r["warnings"])
+
+
+def test_run_ccx_records_peak_memory(tmp_path, monkeypatch):
+    """run_ccx waits with wait4 and records the child's peak memory (for sizing SLURM jobs' --mem)."""
+    import sys
+
+    from fea_translator import runner
+
+    fake = tmp_path / "ccx"
+    fake.write_text(f"#!{sys.executable}\n"
+                    "import sys, pathlib\n"
+                    "buf = bytearray(200 * 1024 * 1024)   # 200 MB resident\n"
+                    "for i in range(0, len(buf), 4096): buf[i] = 1\n"
+                    "pathlib.Path(sys.argv[2] + '.dat').write_text('ok')\n"
+                    "print('Job finished')\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("FEAT_CCX", str(fake))
+    inp = tmp_path / "job.inp"
+    inp.write_text("*HEADING\n")
+    runner.PEAK.update(rss_mb=0.0, threads=0)
+    log = runner.run_ccx(inp, timeout=60)
+    assert "Job finished" in log and (tmp_path / "job.log").is_file()
+    assert runner.PEAK["rss_mb"] > 190, runner.PEAK
+    slow = tmp_path / "slow"
+    slow.write_text("#!/bin/sh\nsleep 30\n")
+    slow.chmod(0o755)
+    monkeypatch.setenv("FEAT_CCX", str(slow))
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner.run_ccx(inp, timeout=1)

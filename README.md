@@ -31,7 +31,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 66 tests: 46 run anywhere (17 with fake SLURM commands), 20 need ccx (and Gmsh)
+pytest -q                      # 67 tests: 47 run anywhere (17 with fake SLURM commands), 20 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -185,7 +185,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `runner.py` | 2026.10.18.7 (CalculiX 2.21's multithreaded stiffness assembly gave wrong displacements near the hole of `plate_hole` (equilibrium error 1.4e-3; exact in 4 reruns) while two 16-CPU jobs ran on mochi: the assembly runs single-threaded (`CCX_NPROC_STIFFNESS=1`, like the stress step), and a solve whose balance check is off (direct solver: equilibrium above 1e-5, heat or current balance above 1e-4; iterative: 1e-3) is rerun once fully single-threaded, reported in `solver_reruns` and a warning) |
+| Package, `runner.py`, `tools/measure_threads.py` (new) | 2026.10.19.1 (CalculiX runs are waited for with `wait4`, which records each run's peak memory: `seconds.ccx_peak_rss_mb` and `ccx_threads` in the result, `rss_mb`, `threads` and `equation_solver` in `timing.jsonl`; `tools/measure_threads.py` measures how CalculiX scales with threads on a SLURM machine (large and small box, direct and iterative solver, a pair side by side) to set the thread cap and the memory formula of SLURM jobs) |
+| `runner.py` (before) | 2026.10.18.7 (CalculiX 2.21's multithreaded stiffness assembly gave wrong displacements near the hole of `plate_hole` (equilibrium error 1.4e-3; exact in 4 reruns) while two 16-CPU jobs ran on mochi: the assembly runs single-threaded (`CCX_NPROC_STIFFNESS=1`, like the stress step), and a solve whose balance check is off (direct solver: equilibrium above 1e-5, heat or current balance above 1e-4; iterative: 1e-3) is rerun once fully single-threaded, reported in `solver_reruns` and a warning) |
 | `api.py` | 2026.10.18.6 (a queued SLURM study's expected start is when the request's first running study is expected to end, if sooner than SLURM's planned start, which comes from the time limits of the jobs ahead and is kept as the latest; mochi: expected finish 22:13 for a study that would start about 21:49) |
 | `api.py` (before) | 2026.10.18.5 (from the SLURM tests on mochi: `FEAT_SLURM_MEM` (auto: each job asks for the memory CalculiX needs; with SLURM's default every job took the node's 60 GB and they ran one at a time); the expected time never exceeds the time limit (it showed 16.3 min against a 15 min limit); a study not yet started is estimated from its mesh size when that is known before meshing (box parts), else its expected time is unknown (it showed 0.0); with SLURM jobs the request's finish is SLURM's expected start of each queued job plus its run time, and `next` gives 'around HH:MM (at the latest HH:MM)'; joule and stress studies count all their solves in the upper bound) |
 | `runner.py`, `deck.py` | 2026.10.18.4 (CalculiX 2.21's multithreaded stress step returned wrong stresses at 504 of 960 integration points of `axial_bar` (correct displacements) in a busy test run on mochi, and was right in 10 reruns: the stress step runs single-threaded (`CCX_NPROC_RESULTS=1`), and every static result recomputes the integration-point stresses from the displacements (`stress_check`); if CalculiX's disagree, the recomputed ones give the peaks and safety factors, with a warning) |

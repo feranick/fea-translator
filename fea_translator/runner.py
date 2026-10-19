@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.18.7
+Version: 2026.10.19.1
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -50,6 +51,31 @@ def find_ccx() -> str | None:
     return None
 
 
+PEAK = {"rss_mb": 0.0, "threads": 0}   # this process's CalculiX runs: largest resident memory, threads
+
+
+def _wait_rss(p: subprocess.Popen, timeout: float) -> int:
+    """Waits for the child (killing it after `timeout` s) and records its peak resident memory; returns
+    its exit code. os.wait4 reports the child's own peak, even in a process that runs many studies."""
+    t_end = time.time() + timeout
+    while True:
+        try:
+            pid, status, ru = os.wait4(p.pid, os.WNOHANG)
+        except ChildProcessError:
+            return p.poll() or 0
+        if pid:
+            p.returncode = os.waitstatus_to_exitcode(status)
+            # ru_maxrss: kilobytes on Linux, bytes on macOS
+            mb = ru.ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024)
+            PEAK["rss_mb"] = max(PEAK["rss_mb"], mb)
+            return p.returncode
+        if time.time() > t_end:
+            p.kill()
+            p.wait()
+            raise subprocess.TimeoutExpired(p.args, timeout)
+        time.sleep(0.2)
+
+
 def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
     """Runs ccx on the deck. serial: one thread (buckling: the eigenvalues then do not depend on the
     machine's load; with several threads, 1 in 4 concurrent runs of euler_column returned a wrong factor)."""
@@ -74,11 +100,14 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
     # jobs run at once: the pump test got a buckling factor of 10.07 for 674.7. One BLAS thread per job.
     for k in ("OPENBLAS_NUM_THREADS", "GOTO_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
         env[k] = "1"
-    p = subprocess.run([exe, "-i", inp.stem], cwd=inp.parent, capture_output=True, text=True, timeout=timeout, env=env)
-    log = p.stdout + p.stderr
-    (inp.parent / f"{inp.stem}.log").write_text(log)
+    log_path = inp.parent / f"{inp.stem}.log"
+    with open(log_path, "w") as fh:
+        p = subprocess.Popen([exe, "-i", inp.stem], cwd=inp.parent, stdout=fh, stderr=subprocess.STDOUT, env=env)
+        code = _wait_rss(p, timeout)    # waits with wait4, which also gives the child's peak memory
+    log = log_path.read_text(errors="replace")
+    PEAK["threads"] = max(PEAK["threads"], int(env.get("OMP_NUM_THREADS", "1")))
     errs = [ln.strip() for ln in log.splitlines() if "*ERROR" in ln.upper()]
-    if errs or p.returncode != 0 or not inp.with_suffix(".dat").is_file():
+    if errs or code != 0 or not inp.with_suffix(".dat").is_file():
         raise SolverError("CalculiX failed: " + ("; ".join(errs[:5]) if errs else log[-800:]))
     return log
 
@@ -487,7 +516,9 @@ def _record_timing(study: dict, solver: str, minfo: dict, mesh_s: float, solve_s
         p.parent.mkdir(parents=True, exist_ok=True)
         rec = {"analysis": study["analysis"], "solver": solver, "nodes": int(minfo.get("nodes", 0)),
                "order": int(minfo.get("order", 2)), "mesh_s": round(mesh_s, 3), "solve_s": round(solve_s, 3),
-               "t": round(time.time(), 1)}
+               "t": round(time.time(), 1), "threads": PEAK["threads"] or None,
+               "equation_solver": minfo.get("equation_solver"),
+               "rss_mb": round(PEAK["rss_mb"], 1) if PEAK["rss_mb"] else None}
         with p.open("a") as fh:
             fh.write(json.dumps(rec) + "\n")
     except OSError:
@@ -576,6 +607,7 @@ def joule_heat(study: dict, mesh: Mesh, dat: dict) -> np.ndarray:
 def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float, size_factor: float = 1.0,
                progress: Progress | None = None) -> dict:
     fine = size_factor != 1.0
+    PEAK.update(rss_mb=0.0, threads=0)
     if progress:
         progress.stage("mesh_fine" if fine else "mesh")
     t0 = time.perf_counter()
@@ -637,11 +669,15 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     if reruns:
         res["solver_reruns"] = reruns
     t2 = time.perf_counter()
+    minfo["equation_solver"] = deck.equation_solver(study, len(mesh.nodes))
     _record_timing(study, solver, minfo, t1 - t0, t2 - t1)
     res["selection"] = sel
     res["_selection_warnings"] = warns
     res["mesh"] = dict(minfo, equation_solver=deck.equation_solver(study, len(mesh.nodes)))
     res["seconds"] = {"mesh": round(t1 - t0, 3), "solve": round(t2 - t1, 3), "total": round(time.perf_counter() - t0, 3)}
+    if PEAK["rss_mb"]:
+        res["seconds"]["ccx_peak_rss_mb"] = round(PEAK["rss_mb"], 1)
+        res["seconds"]["ccx_threads"] = PEAK["threads"]
     for k, p in (("msh", folder / "mesh.msh"), ("step", Path(minfo.get("step", "")))):
         if p.is_file():
             files[k] = str(p)
