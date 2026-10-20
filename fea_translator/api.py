@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.20.1
+Version: 2026.10.20.3
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -105,10 +105,9 @@ class _Pool:
 
     def submit(self, folder: Path, jobs: list[dict]) -> None:
         workers = int(os.environ.get("FEAT_WORKERS", "2"))
-        timeout = float(os.environ.get("FEAT_TIMEOUT", "900"))
         if self.pool is None:
             self.pool = mp.get_context("spawn").Pool(workers, maxtasksperchild=20)
-        self.jobs[str(folder)] = {j["name"]: self.pool.apply_async(_run_one, (dict(j, timeout=timeout),)) for j in jobs}
+        self.jobs[str(folder)] = {j["name"]: self.pool.apply_async(_run_one, (dict(j, timeout=executor.timeout_s(j["study"])),)) for j in jobs}
 
 
 _POOL = _Pool()
@@ -163,10 +162,11 @@ def _collect(folder: Path) -> dict:
            "pending": pending, "elapsed_s": round(time.time() - started, 1), "studies": out}
     if pending:
         studies = json.loads((folder / "studies.json").read_text()) if (folder / "studies.json").is_file() else {}
-        timeout = float(meta.get("timeout", os.environ.get("FEAT_TIMEOUT", "900")))
         res["progress"] = {}
-        for n in pending:
-            pr = _progress(folder / n, studies.get(n, {}), meta["solver"], timeout)
+        for n in pending:   # each study's own time limit (run.timeout_s), else the request's default
+            st_ = studies.get(n, {})
+            t_ = executor.timeout_s(st_) if executor.run_of(st_).get("timeout_s") else float(meta.get("timeout", executor.timeout_s()))
+            pr = _progress(folder / n, st_, meta["solver"], t_)
             if n in slurm:
                 st = states.get(n, {})
                 pr.update({k: v for k, v in st.items() if k != "state"})
@@ -380,7 +380,7 @@ def start(studies: dict, solver: str | None = None, prefix: str = "run") -> Path
     (folder / "request.json").write_text(json.dumps({"names": [j["name"] for j in jobs], "invalid": invalid,
                                                      "solver": s, "started": time.time(), "slurm": slurm,
                                                      "executor": executor.kind(),
-                                                     "timeout": float(os.environ.get("FEAT_TIMEOUT", "900"))}))
+                                                     "timeout": executor.timeout_s()}))
     for n in slurm:   # one SLURM job per study; a failed submission is that study's result (no local fallback)
         info = executor.submit(folder, n, studies[n])
         if info.get("ok") is False:

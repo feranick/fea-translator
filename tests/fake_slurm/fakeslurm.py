@@ -57,7 +57,11 @@ def sbatch(args):
     jid = int(counter.read_text()) + 1 if counter.is_file() else 1001
     counter.write_text(str(jid))
     rec = {"name": opt.get("job-name", script.name), "cpus": int(opt.get("cpus-per-task", 1)), "t0": time.time(),
-           "log": opt.get("output", str(script.parent / f"slurm-{jid}.out")), "pid": 0}
+           "log": opt.get("output", str(script.parent / f"slurm-{jid}.out")), "pid": 0, "args": args}
+    for a in args:   # command-line options override the script's, as in sbatch
+        if a.startswith("--") and "=" in a:
+            opt[a[2:].split("=", 1)[0]] = a.split("=", 1)[1]
+    mem = opt.get("mem")
     if os.environ.get("FAKE_SBATCH_PENDING"):
         rec["state"] = "PENDING"
     else:
@@ -65,6 +69,10 @@ def sbatch(args):
         cmd = ["bash", "-c", f"sleep {delay}; exec bash {script}"] if delay else ["bash", str(script)]
         log = open(rec["log"], "a")
         env = dict(os.environ, SLURM_JOB_ID=str(jid), SLURM_CPUS_PER_TASK=str(rec["cpus"]), SLURM_NTASKS="1")
+        env.pop("SLURM_MEM_PER_NODE", None)
+        if mem:   # SLURM gives the job's --mem in MB
+            m = re.fullmatch(r"(\d+)([KMGT]?)", mem.upper())
+            env["SLURM_MEM_PER_NODE"] = str(int(int(m.group(1)) * {"K": 1 / 1024, "": 1, "M": 1, "G": 1024, "T": 1024 ** 2}[m.group(2)]))
         p = subprocess.Popen(cmd, cwd=opt.get("chdir", str(script.parent)), stdout=log, stderr=subprocess.STDOUT,
                              env=env, start_new_session=True)
         rec["pid"] = p.pid

@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.10.18.2
+Version: 2026.10.20.3
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -155,6 +155,8 @@ def study_format() -> dict:
                            "procs": "CalculiX threads for this study (default FEAT_PROCS, 1; buckling always 1)",
                            "queue": "true: always a SLURM job; false: always local (with FEAT_EXECUTOR=slurm; "
                                     "otherwise studies estimated above FEAT_SLURM_MIN_MINUTES go to SLURM)",
+                           "run": "{timeout_s, mem ('12G'), procs, queue}: this study's solver time limit, SLURM memory, "
+                                  "threads and queue, overriding the machine's defaults within the caps in status",
                            "mesh": "{size, order (1|2), refine: [{at, r, size}]}", "bcs": "list of boundary conditions",
                            "probes": "[{name, faces}]: mean and largest displacement (or temperature) there",
                            "expect": "[{quantity, value, tol}]", "converge": "true: rerun at 0.6 x size and report the change",
@@ -244,6 +246,52 @@ def _selector(sel) -> str | None:
 
 def bc_name(i: int, bc: dict) -> str:
     return str(bc.get("name") or f"{bc.get('kind', 'bc')}{i + 1}")
+
+
+RUN_KEYS = ("timeout_s", "mem", "procs", "queue")
+
+
+def _run_errors(st: dict) -> list[str]:
+    """The study's "run" settings (docs/EXECUTION.md, 'Per-study run settings') and the machine's caps
+    FEAT_MAX_TIMEOUT, FEAT_MAX_MEM, FEAT_MAX_PROCS (unset: no limit; FEAT_MAX_PROCS bounds the top-level procs too)."""
+    from . import executor
+
+    errs, cap = [], executor.caps()
+    if _num(st.get("procs")) and "procs" in cap and st["procs"] > cap["procs"]:
+        errs.append(f"procs: {st['procs']} is above FEAT_MAX_PROCS={cap['procs']}")
+    if "run" not in st:
+        return errs
+    r = st["run"]
+    if not isinstance(r, dict):
+        return errs + ["run: an object {timeout_s, mem, procs, queue} (all optional)"]
+    extra = set(r) - set(RUN_KEYS)
+    if extra:
+        errs.append(f"run: unknown keys {sorted(extra)} (allowed: {', '.join(RUN_KEYS)})")
+    if "timeout_s" in r:
+        if not _num(r["timeout_s"]) or r["timeout_s"] <= 0:
+            errs.append("run.timeout_s: seconds per solve, > 0")
+        elif "timeout_s" in cap and r["timeout_s"] > cap["timeout_s"]:
+            errs.append(f"run.timeout_s: {r['timeout_s']} s is above FEAT_MAX_TIMEOUT={cap['timeout_s']:g}")
+    if "mem" in r:
+        mb = executor.mem_mb(r["mem"]) if isinstance(r["mem"], str) else None
+        if not mb:
+            errs.append(f"run.mem: {r['mem']!r} is not a SLURM memory size such as '500M' or '12G'")
+        elif "mem" in cap and executor.mem_mb(cap["mem"]) and mb > executor.mem_mb(cap["mem"]):
+            errs.append(f"run.mem: {r['mem']} is above FEAT_MAX_MEM={cap['mem']}")
+    if "procs" in r:
+        p = r["procs"]
+        if not _num(p) or int(p) != p or p < 1:
+            errs.append("run.procs: a whole number of threads, at least 1")
+        elif "procs" in cap and p > cap["procs"]:
+            errs.append(f"run.procs: {p} is above FEAT_MAX_PROCS={cap['procs']}")
+        elif "procs" in st and st["procs"] != p:
+            errs.append(f"run.procs ({p}) disagrees with procs ({st['procs']}): set one")
+    if "queue" in r:
+        if not isinstance(r["queue"], bool):
+            errs.append("run.queue: true or false")
+        elif "queue" in st and st["queue"] != r["queue"]:
+            errs.append(f"run.queue ({r['queue']}) disagrees with queue ({st['queue']}): set one")
+    return errs
 
 
 def validate_study(st: dict) -> dict:
@@ -366,6 +414,7 @@ def validate_study(st: dict) -> dict:
         errors.append("queue: true or false")
     if "procs" in st and (not _num(st["procs"]) or int(st["procs"]) != st["procs"] or st["procs"] < 1):
         errors.append("procs: a whole number of threads, at least 1")
+    errors += _run_errors(st)
     if "T_ref" in st and not _num(st["T_ref"]):
         errors.append("T_ref: a temperature in degrees C")
     if an in ("static", "buckling", "modal") or st.get("stress"):
@@ -405,7 +454,7 @@ def validate_study(st: dict) -> dict:
     if "stress_band" in st and (not _num(st["stress_band"]) or st["stress_band"] < 0):
         errors.append("stress_band: a distance in mm (>= 0)")
     extra = set(st) - {"part", "material", "analysis", "modes", "mesh", "bcs", "probes", "expect", "converge", "notes",
-                       "equation_solver", "stress_band", "stress", "T_ref", "procs", "queue"}
+                       "equation_solver", "stress_band", "stress", "T_ref", "procs", "queue", "run"}
     if extra:
         warnings.append(f"unknown study keys ignored: {sorted(extra)}")
     return {"ok": not errors, "errors": errors, "warnings": warnings}

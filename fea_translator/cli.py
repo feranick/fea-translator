@@ -1,5 +1,5 @@
 """cli.py — the `feat` command line. Every command prints JSON.
-Version: 2026.10.20.1
+Version: 2026.10.20.3
 
     feat status                          versions; CalculiX and Gmsh found or not
     feat format > study_format.json      the study format
@@ -44,7 +44,7 @@ def run_study(request: str, name: str) -> int:
     os.environ.setdefault("FEAT_OUT", str(folder.parent))   # timing records next to the request
     n = os.environ.get("SLURM_CPUS_PER_TASK") or str(executor.procs_for(study))
     os.environ["OMP_NUM_THREADS"] = os.environ["CCX_NPROC_EQUATION_SOLVER"] = str(n)
-    _run(name, study, folder / name, meta.get("solver", "ccx"), float(meta.get("timeout", executor.timeout_s())))
+    _run(name, study, folder / name, meta.get("solver", "ccx"), executor.timeout_s(study))   # the study's run.timeout_s, else FEAT_TIMEOUT
     return 0 if (folder / name / f"{name}.json").is_file() else 1
 
 

@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.10.20.1
+Version: 2026.10.20.3
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -52,7 +52,8 @@ are singular: judge designs on peak_von_mises_off_bc and safety_factor_off_bc.
 Long studies run as SLURM jobs on the machine (when FEAT_EXECUTOR=slurm): run_studies returns them pending
 with job ids. They do not depend on this conversation. Report the expected finish time and stop; do not poll.
 Later, study_status(request) collects them; jobs() lists recent and active runs (also those started in other
-conversations); cancel(request) stops them.
+conversations); cancel(request) stops them. A study's "run": {timeout_s, mem, procs, queue} overrides the
+machine's defaults for that study, within the caps in study_format's status.
 Units: mm, N, MPa, kg/m3, W, degrees C; V, A, ohm m, kV/mm."""
 
 server = _Server("fea-translator", instructions=INSTRUCTIONS)

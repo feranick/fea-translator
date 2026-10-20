@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.20.2
+Version: 2026.10.20.3
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -692,6 +692,15 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     return res
 
 
+def limits(study: dict, timeout: float) -> dict:
+    """The limits this study ran under (docs/EXECUTION.md, 'Per-study run settings'): the solver's time
+    limit, the job's memory (SLURM_MEM_PER_NODE, in MB; None outside a SLURM job) and the run keys the study set."""
+    r = (study or {}).get("run")
+    mem = os.environ.get("SLURM_MEM_PER_NODE")
+    return {"timeout_s": float(timeout), "mem": f"{mem}M" if mem else None,
+            "from_study": sorted(r) if isinstance(r, dict) else []}
+
+
 def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout: float = 600) -> dict:
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
@@ -777,6 +786,7 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
         res = {"ok": False, "why": type(exc).__name__, "error": str(exc)[:2000]}
     res["translator"] = __version__
     res["solver"] = solver
+    res["execution"] = {**(res.get("execution") or {}), "limits": limits(study, timeout)}
     tmp = folder / f".{name}.json.tmp"   # atomic: study_status never reads half a file
     tmp.write_text(json.dumps(res, indent=1))
     tmp.replace(folder / f"{name}.json")

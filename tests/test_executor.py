@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.10.20.1
+Version: 2026.10.20.3
 """
 import json
 import os
@@ -241,3 +241,67 @@ def test_benchmarks_return_at_once_and_bench_status_collects(slurm, monkeypatch)
     monkeypatch.setenv("FEAT_EXECUTOR", "local")
     s = api.bench(["axial_bar"], "ref", wait=120)
     assert s["done"] and s["passed"] == ["axial_bar"]
+
+
+def _job(req: Path, n: str) -> tuple[str, list]:
+    info = json.loads((req / n / "job.json").read_text())
+    rec = json.loads((Path(os.environ["FAKE_SLURM_DIR"]) / "jobs" / f"{info['job_id']}.json").read_text())
+    return (req / n / "job.sh").read_text(), rec["args"]
+
+
+def test_per_study_run_settings(slurm, monkeypatch):
+    """A study's "run" sets its solver timeout, the job's --time, --mem and threads (docs/EXECUTION.md,
+    'Per-study run settings'); a sibling in the same request keeps the machine's defaults."""
+    monkeypatch.setenv("FEAT_SLURM_ARGS", "--mem=64G --nice=100")
+    run = {"timeout_s": 30000, "mem": "12G", "procs": 4}
+    r = api.run({"big": _bar(queue=True, run=run), "sib": _bar(queue=True)}, "ref", wait=0)
+    req = Path(r["request"])
+    s, args = _job(req, "big")
+    assert "#SBATCH --time=510" in s and "#SBATCH --mem=12G" in s     # ceil(30000 / 60) + 10
+    assert "--nice=100" in args and not any(a.startswith("--mem") for a in args)
+    assert json.loads((req / "big" / "job.json").read_text())["run"] == run
+    s, args = _job(req, "sib")
+    assert "#SBATCH --time=25" in s and "#SBATCH --mem" not in s      # FEAT_TIMEOUT 900; the args' --mem
+    assert "--nice=100" in args and "--mem=64G" in args
+    res = api.status(str(req), wait=120)
+    assert res["done"], res
+    lim = res["studies"]["big"]["execution"]["limits"]
+    assert lim == {"timeout_s": 30000.0, "mem": "12288M", "from_study": ["mem", "procs", "timeout_s"]}
+    assert res["studies"]["sib"]["execution"]["limits"] == {"timeout_s": 900.0, "mem": "65536M", "from_study": []}
+    # threads: run.procs, as --cpus-per-task (feat's --ntasks), still under the size cap
+    goal = {"analysis": "static", "part": {"goal": {"features": []}}}
+    assert "#SBATCH --cpus-per-task=4" in executor.job_script(req, "g", dict(goal, run={"procs": 4}))
+    assert executor.procs_for(dict(_bar(), run={"procs": 4})) == 1    # 99 nodes: one thread is plenty
+    assert executor.queue_of({"run": {"queue": False}}) is False and executor.use_slurm({"run": {"queue": True}}, 0.1)
+
+
+def test_run_settings_validation_and_caps(slurm, monkeypatch):
+    monkeypatch.setenv("FEAT_MAX_TIMEOUT", "3600")
+    monkeypatch.setenv("FEAT_MAX_MEM", "32G")
+    monkeypatch.setenv("FEAT_MAX_PROCS", "8")
+
+    def errs(**kw):
+        return " | ".join(api.validate({"s": _bar(**kw)})["s"]["errors"])
+
+    assert errs(run={"timeout_s": 3000, "mem": "500M", "procs": 8, "queue": True}) == ""
+    assert "FEAT_MAX_TIMEOUT" in errs(run={"timeout_s": 30000})
+    assert "FEAT_MAX_MEM" in errs(run={"mem": "33G"}) and errs(run={"mem": "32768M"}) == ""
+    assert "FEAT_MAX_PROCS" in errs(run={"procs": 10}) and "FEAT_MAX_PROCS" in errs(procs=10)
+    assert "unknown keys ['sbatch']" in errs(run={"sbatch": "--exclusive"})
+    assert "not a SLURM memory size" in errs(run={"mem": "lots"}) and "not a SLURM memory size" in errs(run={"mem": 12})
+    assert "disagrees with procs" in errs(procs=2, run={"procs": 4}) and errs(procs=4, run={"procs": 4}) == ""
+    assert "disagrees with queue" in errs(queue=False, run={"queue": True})
+    assert "run.timeout_s" in errs(run={"timeout_s": -1}) and "run: an object" in errs(run=5)
+    st = api.study_format()["status"]["executor"]
+    assert st["caps"] == {"timeout_s": 3600.0, "mem": "32G", "procs": 8} and st["timeout_s"] == 900.0
+
+
+def test_run_by_hand_and_local_pool_record_limits(slurm, monkeypatch, tmp_path):
+    from fea_translator.runner import run_study
+
+    monkeypatch.delenv("SLURM_MEM_PER_NODE", raising=False)
+    r = run_study("bar", _bar(), tmp_path / "hand", "ref", 321)
+    assert r["execution"]["limits"] == {"timeout_s": 321.0, "mem": None, "from_study": []}
+    monkeypatch.setenv("FEAT_EXECUTOR", "local")
+    r = api.run({"bar": _bar(run={"timeout_s": 123})}, "ref", wait=120)
+    assert r["done"] and r["studies"]["bar"]["execution"]["limits"]["timeout_s"] == 123.0

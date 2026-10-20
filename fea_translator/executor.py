@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.20.1
+Version: 2026.10.20.3
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (5): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments;
@@ -9,6 +9,11 @@ FEAT_EXECUTOR=local, which is always local). FEAT_SLURM_MEM: auto (default) | a 
 the job's memory. Where SLURM gives a job without --mem the whole node (CR_Core_Memory with
 DefMemPerNode=UNLIMITED, as on mochi: 60000M each), only one job runs at a time; auto asks for what
 CalculiX needs, from the study's node count when it is known before meshing, else 8G.
+
+Per study (docs/EXECUTION.md "Per-study run settings"): "run": {"timeout_s", "mem", "procs", "queue"}
+overrides FEAT_TIMEOUT, the job's --mem (any --mem/--mem-per-cpu in FEAT_SLURM_ARGS is dropped, the
+other arguments kept), the threads (still size-capped) and queue, within FEAT_MAX_TIMEOUT (s),
+FEAT_MAX_MEM and FEAT_MAX_PROCS from config/env (unset: no cap).
 
 One SLURM job per study: <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns it) runs
 `python -m fea_translator.cli run-study REQUEST NAME` with --ntasks=1 --cpus-per-task=N (1 for buckling:
@@ -53,12 +58,72 @@ def default_procs() -> int:
         return 1
 
 
-def timeout_s() -> float:
-    return float(os.environ.get("FEAT_TIMEOUT", "900"))
+def run_of(study: dict | None) -> dict:
+    r = (study or {}).get("run")
+    return r if isinstance(r, dict) else {}
+
+
+def timeout_s(study: dict | None = None) -> float:
+    """Seconds per CalculiX solve: the study's run.timeout_s, else FEAT_TIMEOUT (900)."""
+    t = run_of(study).get("timeout_s")
+    return float(t) if t else float(os.environ.get("FEAT_TIMEOUT", "900"))
+
+
+def mem_mb(v) -> float | None:
+    """A SLURM memory size (500M, 8G, 1T, a plain number in MB) in MB; None if malformed."""
+    import re
+
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?)B?\s*", str(v), re.I)
+    if not m:
+        return None
+    return float(m.group(1)) * {"K": 1 / 1024, "": 1, "M": 1, "G": 1024, "T": 1024 ** 2}[m.group(2).upper()]
+
+
+def caps() -> dict:
+    """Ceilings on what a study may ask (config/env): FEAT_MAX_TIMEOUT (s), FEAT_MAX_MEM, FEAT_MAX_PROCS."""
+    out = {}
+    for key, var in (("timeout_s", "FEAT_MAX_TIMEOUT"), ("mem", "FEAT_MAX_MEM"), ("procs", "FEAT_MAX_PROCS")):
+        v = os.environ.get(var, "").strip()
+        if v:
+            out[key] = v if key == "mem" else (float(v) if key == "timeout_s" else int(float(v)))
+    return out
+
+
+def procs_of(study: dict) -> int:
+    """Threads asked for: run.procs, then the study's procs, then FEAT_PROCS (before the size cap)."""
+    try:
+        return max(1, int(run_of(study).get("procs") or study.get("procs") or default_procs()))
+    except (TypeError, ValueError):
+        return default_procs()
+
+
+def queue_of(study: dict):
+    """run.queue, then the study's queue; None: decided by the time estimate."""
+    q = run_of(study).get("queue")
+    return q if q is not None else study.get("queue")
+
+
+def sbatch_args(study: dict) -> list[str]:
+    """FEAT_SLURM_ARGS for this study's sbatch: with run.mem, its --mem/--mem-per-cpu are dropped."""
+    args = shlex.split(os.environ.get("FEAT_SLURM_ARGS", ""))
+    if not run_of(study).get("mem"):
+        return args
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in ("--mem", "--mem-per-cpu"):
+            skip = True
+            continue
+        if a.startswith(("--mem=", "--mem-per-cpu=")):
+            continue
+        out.append(a)
+    return out
 
 
 def solves_of(study: dict) -> int:
-    """CalculiX runs of a study (each has FEAT_TIMEOUT): joule 2, +1 with stress, x2 with converge."""
+    """CalculiX runs of a study (each has its timeout_s): joule 2, +1 with stress, x2 with converge."""
     n = {"joule": 2}.get(study.get("analysis"), 1) + (1 if study.get("stress") else 0)
     return n * (2 if study.get("converge") else 1)
 
@@ -66,14 +131,14 @@ def solves_of(study: dict) -> int:
 def time_limit_min(study: dict | None = None) -> int:
     """The job's time limit: every solve's timeout plus 10 minutes, so the translator's own timeout
     (which writes a clean result) fires before SLURM's."""
-    return int(math.ceil(solves_of(study or {}) * timeout_s() / 60)) + 10
+    return int(math.ceil(solves_of(study or {}) * timeout_s(study) / 60)) + 10
 
 
 def status_key() -> dict:
     """The 'executor' key of tool_status (llmt status reads it)."""
     return {"kind": kind(), "sbatch": shutil.which("sbatch"), "min_minutes": min_minutes(),
-            "procs": default_procs(), "time_limit_min": time_limit_min(),
-            "mem": os.environ.get("FEAT_SLURM_MEM", "auto")}
+            "procs": default_procs(), "timeout_s": timeout_s(), "time_limit_min": time_limit_min(),
+            "mem": os.environ.get("FEAT_SLURM_MEM", "auto"), "caps": caps()}
 
 
 def nodes_hint(study: dict) -> int | None:
@@ -178,10 +243,7 @@ def procs_for(study: dict) -> int:
     capped at a thread per NODES_PER_THREAD nodes of its largest direct-solver mesh."""
     if study.get("analysis") == "buckling":
         return 1
-    try:
-        procs = max(1, int(study.get("procs") or default_procs()))
-    except (TypeError, ValueError):
-        procs = default_procs()
+    procs = procs_of(study)
     nodes = estimate_nodes(study)
     if nodes is None:
         return procs
@@ -201,7 +263,10 @@ def mem_gb(nodes: int, method: str, threads: int) -> float:
 
 
 def mem_for(study: dict) -> str | None:
-    """The --mem value of a study's job: FEAT_SLURM_MEM (auto | size | none); None: do not ask."""
+    """The --mem value of a study's job: its run.mem, else FEAT_SLURM_MEM (auto | size | none); None: do
+    not ask (also when FEAT_SLURM_ARGS has its own --mem)."""
+    if run_of(study).get("mem"):
+        return str(run_of(study)["mem"]).strip()
     v = os.environ.get("FEAT_SLURM_MEM", "auto").strip()
     if v.lower() == "none" or "--mem" in os.environ.get("FEAT_SLURM_ARGS", ""):
         return None
@@ -220,7 +285,7 @@ def use_slurm(study: dict, estimate_min: float | None) -> bool:
     given, else the estimate (no estimate: SLURM)."""
     if kind() != "slurm":
         return False
-    q = study.get("queue")
+    q = queue_of(study)
     if q is not None:
         return bool(q)
     return estimate_min is None or estimate_min >= min_minutes()
@@ -253,7 +318,7 @@ def submit(request: Path, name: str, study: dict) -> dict:
     script = d / "job.sh"
     script.write_text(job_script(request, name, study))
     script.chmod(0o755)
-    cmd = ["sbatch", "--parsable", *shlex.split(os.environ.get("FEAT_SLURM_ARGS", "")), str(script)]
+    cmd = ["sbatch", "--parsable", *sbatch_args(study), str(script)]
     exe = shutil.which("sbatch")
     if not exe:
         return {"ok": False, "why": "could not submit: sbatch not found (FEAT_EXECUTOR=slurm needs SLURM)"}
@@ -267,7 +332,7 @@ def submit(request: Path, name: str, study: dict) -> dict:
     n = estimate_nodes(study)
     info = {"executor": "slurm", "job_id": job_id, "submitted": round(time.time(), 1), "procs": procs_for(study),
             "time_min": time_limit_min(study), "mem": mem_for(study), "nodes_estimate": n,
-            "equation_solver": method_of(study, n) if n else None, "command": cmd}
+            "equation_solver": method_of(study, n) if n else None, "run": run_of(study), "command": cmd}
     (d / "job.json").write_text(json.dumps(info))
     return info
 
