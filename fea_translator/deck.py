@@ -1,5 +1,5 @@
 """deck.py — a study and its mesh as a CalculiX input deck (.inp).
-Version: 2026.10.18.4
+Version: 2026.10.20.1
 
     text, plan = write(name, study, mesh)
 
@@ -78,12 +78,16 @@ def resolve(study: dict, mesh: Mesh) -> dict:
     return out
 
 
-ITERATIVE_ABOVE = 150_000  # nodes: above this, static and thermal use CalculiX's iterative solver
+# nodes: above this, static, thermal and the electrical analyses use CalculiX's iterative solver (mochi,
+# 175k nodes: 167 s single-threaded with 0.64 GB, as fast as the direct solver on 10 threads with 12.5 GB;
+# the direct solver's threads are where CalculiX 2.21 went wrong under load)
+ITERATIVE_ABOVE = 50_000
 
 
 def equation_solver(study: dict, n_nodes: int) -> str:
     """'direct' (SPOOLES) or 'iterative' (preconditioned conjugate gradients: much less memory and time
-    on large solid meshes); eigenvalue analyses (modal, buckling) always use the direct solver."""
+    on large solid meshes); eigenvalue analyses (modal, buckling) always use the direct solver. Auto:
+    iterative above ITERATIVE_ABOVE nodes."""
     choice = study.get("equation_solver", "auto")
     if study["analysis"] not in ("static", "thermal", "electric", "electrostatic"):
         return "direct"

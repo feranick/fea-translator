@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.18.5
+Version: 2026.10.20.1
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (5): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments;
@@ -57,17 +57,6 @@ def timeout_s() -> float:
     return float(os.environ.get("FEAT_TIMEOUT", "900"))
 
 
-def procs_for(study: dict) -> int:
-    """CalculiX threads (CPUs) for a study: 1 for buckling (repeatable eigenvalues), else the study's
-    procs or FEAT_PROCS."""
-    if study.get("analysis") == "buckling":
-        return 1
-    try:
-        return max(1, int(study.get("procs") or default_procs()))
-    except (TypeError, ValueError):
-        return default_procs()
-
-
 def solves_of(study: dict) -> int:
     """CalculiX runs of a study (each has FEAT_TIMEOUT): joule 2, +1 with stress, x2 with converge."""
     n = {"joule": 2}.get(study.get("analysis"), 1) + (1 if study.get("stress") else 0)
@@ -108,8 +97,107 @@ def nodes_hint(study: dict) -> int | None:
         return None
 
 
-MEM_DEFAULT_GB = 8          # when the node count is not known before meshing
-MEM_BASE_GB, MEM_GB_PER_NODE = 2.0, 3e-5   # CalculiX (SPOOLES, 10-node tets): ~7 GB at 175k nodes, ~32 GB at 1M
+# ---- sizing from this machine's measurements (tools/measure_threads.py, mochi 2026-10-20: a 175k-node box,
+# direct solver 409 / 230 / 167 / 125 s at 1 / 6 / 10 / 19 threads with 6.6 / 12.2 / 12.5 / 14.0 GB; iterative
+# 167 s at 1 and at 10 threads, 0.64 GB; a 45k-node box 30 / 21 / 18 s, 1.1 / 1.9 / 2.0 GB)
+
+FINE = 1 / 0.6 ** 3          # converge: true meshes again at 0.6 x the size: ~4.6x the nodes
+NODES_PER_H3 = {2: 12.0, 1: 2.0}   # Gmsh tetrahedra, nodes per (element size)^3 of volume: an upper estimate
+NODES_PER_THREAD = 10_000    # direct solver: a thread per 10k nodes at most (45k nodes gain 1.7x at 10 threads)
+MEM_DEFAULT_GB = 8           # when the size cannot be estimated
+_VOLUMES: dict = {}
+
+
+def _part_volume(part: dict) -> tuple[float, float, float] | None:
+    """(volume, bounding-box diagonal, smallest bounding-box side) of a goal (built with build123d-translator, milliseconds) or a STEP
+    file (read with build123d, about a second); None if it cannot be read here."""
+    key = json.dumps(part, sort_keys=True, default=str)
+    if key in _VOLUMES:
+        return _VOLUMES[key]
+    out = None
+    try:
+        if "goal" in part:
+            from build123d_translator import translate as T
+
+            solid, _ = T.build(part["goal"])
+        elif "step" in part:
+            from build123d import import_step
+
+            solid = import_step(str(Path(part["step"]).expanduser()))
+        else:
+            solid = None
+        if solid is not None:
+            bb = solid.bounding_box()
+            out = (float(solid.volume), float(bb.diagonal), float(min(bb.size.X, bb.size.Y, bb.size.Z)))
+    except Exception:  # noqa: BLE001
+        out = None
+    _VOLUMES[key] = out
+    return out
+
+
+def estimate_nodes(study: dict) -> int | None:
+    """Nodes of a study's (first) mesh before meshing: exact for box parts, else an upper estimate from the
+    part's volume and the element size (plus the refinement spheres); None if it cannot be told."""
+    n = nodes_hint(study)
+    if n is not None:
+        return n
+    part = study.get("part", {})
+    if not isinstance(part, dict):
+        return None
+    vd = _part_volume(part)
+    if vd is None or vd[0] <= 0:
+        return None
+    vol, diag, thin = vd
+    mesh = study.get("mesh", {}) if isinstance(study.get("mesh"), dict) else {}
+    k = NODES_PER_H3[2 if int(mesh.get("order", 2)) == 2 else 1]
+    h = float(mesh.get("size") or diag / 20)
+    n = k * vol / h ** 3
+    for r in mesh.get("refine", []) or []:
+        try:
+            rr = float(r["r"])   # the part of the sphere inside the part: at most a slab as thick as its thinnest side
+            region = min(4 / 3 * math.pi * rr ** 3, (2 * rr) ** 2 * min(2 * rr, thin), vol)
+            n += k * region / float(r["size"]) ** 3
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            pass
+    return int(n)
+
+
+def _meshes(study: dict, nodes: int) -> list[int]:
+    return [nodes] + ([int(nodes * FINE)] if study.get("converge") else [])
+
+
+def method_of(study: dict, nodes: int) -> str:
+    from .deck import equation_solver
+
+    return equation_solver(study, nodes)
+
+
+def procs_for(study: dict) -> int:
+    """CalculiX threads (CPUs) for a study: 1 for buckling (repeatable eigenvalues); 1 when every solve
+    uses the iterative solver (single-threaded in CalculiX); else the study's procs or FEAT_PROCS (1),
+    capped at a thread per NODES_PER_THREAD nodes of its largest direct-solver mesh."""
+    if study.get("analysis") == "buckling":
+        return 1
+    try:
+        procs = max(1, int(study.get("procs") or default_procs()))
+    except (TypeError, ValueError):
+        procs = default_procs()
+    nodes = estimate_nodes(study)
+    if nodes is None:
+        return procs
+    direct = [n for n in _meshes(study, nodes) if method_of(study, n) == "direct"]
+    if not direct:
+        return 1
+    return max(1, min(procs, int(math.ceil(max(direct) / NODES_PER_THREAD))))
+
+
+def mem_gb(nodes: int, method: str, threads: int) -> float:
+    """Memory to ask for (GB), fitted to the measurements with a margin: the iterative solver needs ~3.7 kB
+    per node; the direct one grows as nodes^1.43 (2.0 GB at 45k, 14 GB at 175k), half that single-threaded."""
+    if method == "iterative":
+        return 1 + 1.5 * 3.7e-6 * nodes
+    gb = 2.3 * (nodes / 5e4) ** 1.43 * (0.5 if threads <= 1 else 1.0)
+    return 1 + 1.25 * gb
 
 
 def mem_for(study: dict) -> str | None:
@@ -119,12 +207,12 @@ def mem_for(study: dict) -> str | None:
         return None
     if v and v.lower() != "auto":
         return v
-    n = nodes_hint(study)
-    if n is None:
+    nodes = estimate_nodes(study)
+    if nodes is None:
         return f"{MEM_DEFAULT_GB}G"
-    if study.get("converge"):
-        n = int(n / 0.6 ** 3)   # the finer mesh of converge: true
-    return f"{max(2, int(math.ceil(MEM_BASE_GB + MEM_GB_PER_NODE * n)))}G"
+    t = procs_for(study)
+    gb = max(mem_gb(n, method_of(study, n), t) for n in _meshes(study, nodes))
+    return f"{max(2, int(math.ceil(gb)))}G"
 
 
 def use_slurm(study: dict, estimate_min: float | None) -> bool:
@@ -176,8 +264,10 @@ def submit(request: Path, name: str, study: dict) -> dict:
     if p.returncode != 0 or not p.stdout.strip():
         return {"ok": False, "why": f"could not submit: {(p.stderr or p.stdout).strip()[:500]}"}
     job_id = p.stdout.strip().split(";")[0].split()[0]
+    n = estimate_nodes(study)
     info = {"executor": "slurm", "job_id": job_id, "submitted": round(time.time(), 1), "procs": procs_for(study),
-            "time_min": time_limit_min(study), "mem": mem_for(study), "command": cmd}
+            "time_min": time_limit_min(study), "mem": mem_for(study), "nodes_estimate": n,
+            "equation_solver": method_of(study, n) if n else None, "command": cmd}
     (d / "job.json").write_text(json.dumps(info))
     return info
 

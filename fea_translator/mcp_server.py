@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.10.18.2
+Version: 2026.10.20.1
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -8,7 +8,9 @@ Tools (all JSON):
                     long studies stay pending)
   study_status      collects the pending studies of a run_studies request (progress, time left, advice)
   get_deck          the CalculiX input deck of one study, as text
-  run_benchmarks    the benchmark studies with closed-form answers (is the toolchain right?)
+  run_benchmarks    the benchmark studies with closed-form answers (is the toolchain right?); returns
+                    within 30 s
+  bench_status      collects a run_benchmarks request
   get_file          a written file as base64 (for callers on another machine)
   jobs              recent requests with SLURM jobs (also from other conversations) and the queue
   cancel            stops a request's studies
@@ -99,10 +101,19 @@ def get_deck(study: dict, name: str = "study") -> dict:
 
 
 @server.tool()
-def run_benchmarks(names: list[str] | None = None, solver: str = "auto") -> dict:
-    """Runs the benchmark studies with closed-form answers (axial bar, cantilever, natural
-    frequency, Euler column, conduction, Lame ring, plate with a hole) and reports pass or fail."""
-    return api.bench(names, solver)
+def run_benchmarks(names: list[str] | None = None, solver: str = "auto", wait_s: float = 30) -> dict:
+    """Runs the benchmark studies with closed-form answers (axial bar, cantilever, natural frequency,
+    Euler column, conduction, Lame ring, plate with a hole, electrical cases) as one request, and
+    returns within wait_s seconds (at most 50): passed, failed, skipped and still pending cases. Collect
+    the pending ones with bench_status(bench); do not poll long runs: follow 'next'."""
+    return api.bench(names, solver, wait=min(max(float(wait_s), 0.0), 50.0))
+
+
+@server.tool()
+def bench_status(bench: str, wait_s: float = 30) -> dict:
+    """A run_benchmarks request (its 'bench' path): passed, failed, skipped and pending cases, with
+    progress for the pending ones. Waits up to wait_s seconds (at most 50)."""
+    return api.bench_status(bench, min(max(float(wait_s), 0.0), 50.0))
 
 
 @server.tool()

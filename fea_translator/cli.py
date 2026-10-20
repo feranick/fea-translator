@@ -1,5 +1,5 @@
 """cli.py — the `feat` command line. Every command prints JSON.
-Version: 2026.10.18.2
+Version: 2026.10.20.1
 
     feat status                          versions; CalculiX and Gmsh found or not
     feat format > study_format.json      the study format
@@ -7,7 +7,8 @@ Version: 2026.10.18.2
     feat run studies.json [--solver S]   mesh, solve, check (S: auto | ccx | ref); waits for all
     feat status REQUEST                  results of a request folder (finished and pending studies)
     feat deck studies.json NAME          write the CalculiX deck of one study (no solve)
-    feat bench [NAMES...] [--solver S]   the benchmark studies with closed-form answers
+    feat bench [NAMES...] [--solver S]   the benchmark studies with closed-form answers (waits for all)
+    feat bench-status BENCH              a benchmark request's passed, failed and pending cases
     feat run-study REQUEST NAME          run one study of a request folder (what a SLURM job runs)
     feat jobs [--limit N] [--active]     recent requests with SLURM jobs, their states, the queue
     feat cancel REQUEST [NAMES...]       stop a request's studies
@@ -64,6 +65,8 @@ def main(argv=None) -> None:
     p = sub.add_parser("bench")
     p.add_argument("names", nargs="*")
     p.add_argument("--solver", default=None)
+    p = sub.add_parser("bench-status")
+    p.add_argument("bench")
     p = sub.add_parser("run-study")
     p.add_argument("request")
     p.add_argument("name")
@@ -87,6 +90,8 @@ def main(argv=None) -> None:
     elif a.cmd == "deck":
         st = _load(a.studies)
         out = api.deck(st[a.name], a.name)
+    elif a.cmd == "bench-status":
+        out = api.bench_status(a.bench)
     elif a.cmd == "jobs":
         out = api.jobs(a.limit, a.active)
     elif a.cmd == "cancel":

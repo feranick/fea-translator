@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.10.18.6
+Version: 2026.10.20.1
 """
 import json
 import os
@@ -185,15 +185,19 @@ def test_queued_estimate_and_slurm_finish_times(slurm, monkeypatch):
 
 
 def test_job_memory(slurm, monkeypatch):
-    """Where SLURM gives a job without --mem the whole node, only one runs at a time (mochi): jobs ask for
-    memory from the node count when known (box parts), else 8G; FEAT_SLURM_MEM and FEAT_SLURM_ARGS override."""
+    """Jobs ask for the memory CalculiX needs (measured on mochi): the iterative solver little, the direct one
+    ~nodes^1.43 (half single-threaded); FEAT_SLURM_MEM and FEAT_SLURM_ARGS override."""
     req = Path(os.environ["FEAT_OUT"]) / "run_m"
     box = {"analysis": "static", "part": {"box": [100, 10, 10], "divisions": [80, 16, 16]}}   # 175,329 nodes
     assert executor.nodes_hint(box) == 161 * 33 * 33
-    assert executor.mem_for(box) == "8G"                          # 2 + 3e-5 x 175k = 7.3 -> 8
-    assert executor.mem_for(dict(box, converge=True)) == "27G"    # the finer mesh: 4.6x the nodes
-    assert executor.mem_for({"analysis": "static", "part": {"goal": {}}}) == "8G"
-    assert "#SBATCH --mem=8G" in executor.job_script(req, "a", box)
+    assert executor.method_of(box, 175329) == "iterative"
+    assert executor.mem_for(box) == "2G"                          # iterative: 0.64 GB measured
+    assert executor.mem_for(dict(box, converge=True)) == "6G"     # the finer mesh: 4.6x the nodes
+    modal = dict(box, analysis="modal", procs=16)                 # eigenvalues need the direct solver
+    assert executor.mem_for(modal) == "19G"                       # 14 GB measured at 19 threads
+    assert executor.mem_for(dict(modal, procs=1)) == "10G"        # 6.6 GB measured single-threaded
+    assert executor.mem_for({"analysis": "static", "part": {"goal": {"features": []}}}) == "8G"   # unknown size
+    assert "#SBATCH --mem=2G" in executor.job_script(req, "a", box)
     monkeypatch.setenv("FEAT_SLURM_MEM", "20G")
     assert "#SBATCH --mem=20G" in executor.job_script(req, "a", box)
     monkeypatch.setenv("FEAT_SLURM_MEM", "none")
@@ -201,3 +205,39 @@ def test_job_memory(slurm, monkeypatch):
     monkeypatch.setenv("FEAT_SLURM_MEM", "auto")
     monkeypatch.setenv("FEAT_SLURM_ARGS", "--mem=64G --nice=10")
     assert "#SBATCH --mem" not in executor.job_script(req, "a", box)  # the args' --mem wins
+
+
+def test_threads_only_where_they_help(slurm):
+    """Iterative solves (single-threaded in CalculiX) ask for 1 CPU; direct ones at most a thread per 10k nodes."""
+    large = {"analysis": "static", "procs": 16, "part": {"box": [100, 10, 10], "divisions": [80, 16, 16]}}
+    small = {"analysis": "static", "procs": 16, "part": {"box": [100, 10, 10], "divisions": [50, 10, 10]}}  # 44,541 nodes
+    assert executor.procs_for(large) == 1                          # iterative above 50k nodes
+    assert executor.procs_for(small) == 5                          # direct: ceil(44,541 / 10k)
+    assert executor.procs_for(dict(large, analysis="modal")) == 16  # direct, 18 allowed
+    assert executor.procs_for(dict(large, equation_solver="direct", procs=32)) == 18
+    assert executor.procs_for({"analysis": "static", "procs": 6, "part": {"goal": {"features": []}}}) == 6  # unknown size
+    assert executor.procs_for(dict(small, procs=None)) == 1         # FEAT_PROCS default 1
+    assert "--cpus-per-task=1" in executor.job_script(Path(os.environ["FEAT_OUT"]) / "r", "a", large)
+
+
+def test_size_estimate_from_a_goal(slurm):
+    pytest.importorskip("build123d_translator")
+    goal = {"features": [{"kind": "base_box", "params": {"w": 100, "d": 50, "h": 20}}]}
+    st = {"analysis": "static", "part": {"goal": goal}, "mesh": {"size": 5}}
+    n = executor.estimate_nodes(st)
+    assert abs(n - 12 * 100 * 50 * 20 / 5 ** 3) <= 1                # 12 nodes per h^3 of volume (upper estimate)
+    assert executor.estimate_nodes(dict(st, mesh={"size": 5, "refine": [{"at": [0, 0, 10], "r": 5, "size": 1}]})) > n
+
+
+def test_benchmarks_return_at_once_and_bench_status_collects(slurm, monkeypatch):
+    """run_benchmarks submits and returns within its wait (cfdt's waited for every job and timed out);
+    bench_status collects them, here from SLURM jobs (fake) and from the local pool."""
+    r = api.bench(["axial_bar", "slab", "euler_column"], "ref", wait=0)
+    assert r["skipped"] == {"euler_column": "needs CalculiX"} and set(r["pending"]) == {"axial_bar", "slab"}
+    assert "bench_status(bench=" in r["next"]
+    assert any(x["request"] == r["bench"] for x in api.jobs()["requests"])
+    s = api.bench_status(r["bench"], wait=120)
+    assert s["done"] and sorted(s["passed"]) == ["axial_bar", "slab"] and not s["failed"]
+    monkeypatch.setenv("FEAT_EXECUTOR", "local")
+    s = api.bench(["axial_bar"], "ref", wait=120)
+    assert s["done"] and s["passed"] == ["axial_bar"]

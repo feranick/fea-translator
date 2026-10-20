@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.18.6
+Version: 2026.10.20.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -9,7 +9,8 @@ Version: 2026.10.18.6
     status(request, wait)            finished studies with results, the others pending with their
                                      progress and time left (expected and at most), and when to look again
     deck(study, name)                the CalculiX input deck of one study, as text (meshes the part)
-    bench(names, solver)             the benchmark studies with closed-form answers
+    bench(names, solver, wait)       the benchmark studies with closed-form answers, as one request
+    bench_status(bench, wait)        passed, failed, pending benchmark cases
     read_file(path)                  a written file as base64 (only under the output folder)
     jobs(limit, active)              recent requests with SLURM jobs and their states; the queue
     cancel(request, names)           stops a request's studies (scancel)
@@ -82,10 +83,9 @@ def _run_one(job: dict) -> dict:
 
     if job.get("out"):  # the worker may outlive a change of FEAT_OUT: timing records go with the request
         os.environ["FEAT_OUT"] = job["out"]
-    # CalculiX threads: the study's procs or FEAT_PROCS when given, else up to 4 (set every time: the
-    # worker process runs one study after another)
-    given = job["study"].get("procs") or os.environ.get("FEAT_PROCS")
-    os.environ["OMP_NUM_THREADS"] = str(int(given) if given else min(4, os.cpu_count() or 1))
+    # CalculiX threads, sized as for a SLURM job (executor.procs_for: 1 by default, 1 for the iterative
+    # solver; set every time: the worker process runs one study after another)
+    os.environ["OMP_NUM_THREADS"] = str(executor.procs_for(job["study"]))
     os.environ["CCX_NPROC_EQUATION_SOLVER"] = os.environ["OMP_NUM_THREADS"]
     t0 = time.perf_counter()
     r = run_study(job["name"], job["study"], Path(job["folder"]) / job["name"], job["solver"], job.get("timeout", 900))
@@ -235,7 +235,7 @@ def _stage_s(stage: str, nodes: int | None, rt: dict | None) -> float | None:
 
 
 def _nodes_hint(study: dict) -> int | None:
-    return executor.nodes_hint(study)
+    return executor.estimate_nodes(study)
 
 
 def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
@@ -364,9 +364,9 @@ def _timing(folder: Path, progress: dict) -> tuple[dict, str]:
     return t, nxt
 
 
-def start(studies: dict, solver: str | None = None) -> Path:
+def start(studies: dict, solver: str | None = None, prefix: str = "run") -> Path:
     """Validates and starts the studies in the background; returns the request folder."""
-    folder = _request_dir("run")
+    folder = _request_dir(prefix)
     (folder / "studies.json").write_text(json.dumps(studies, indent=1))
     s = _solver(solver)
     invalid, jobs = {}, []
@@ -433,7 +433,7 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
     the translator's queue (running, queued, CPUs) and the machine's CPUs. active: only requests with
     queued or running studies."""
     root = out_root()
-    reqs = sorted((d for d in root.glob("run_*") if (d / "request.json").is_file()),
+    reqs = sorted((d for g in ("run_*", "bench_*") for d in root.glob(g) if (d / "request.json").is_file()),
                   key=lambda d: d.stat().st_mtime, reverse=True) if root.is_dir() else []
     out = []
     for d in reqs:
@@ -534,17 +534,55 @@ def deck(study: dict, name: str = "study") -> dict:
     return {"path": str(p), "mesh": info, "bytes": len(text), "deck": head}
 
 
-def bench(names=None, solver: str | None = None) -> dict:
+def bench(names=None, solver: str | None = None, wait: float | None = None) -> dict:
+    """Runs the benchmark studies as one request (SLURM jobs or the local pool, as any study) and
+    returns after at most `wait` seconds (None: when all are done); bench_status(bench) collects the rest."""
     from . import bench as B
 
     s = _solver(solver)
-    folder = _request_dir("bench")
-    r = B.run(s, names, folder)
-    passed = [k for k, v in r.items() if v.get("passed")]
-    failed = [k for k, v in r.items() if v.get("passed") is False or v.get("ok") is False]
-    out = {"request": str(folder), "solver": s, "passed": passed, "failed": failed,
-           "skipped": [k for k, v in r.items() if "skipped" in v], "cases": r}
-    (folder / "bench.json").write_text(json.dumps(out, indent=1))
+    try:
+        import gmsh  # noqa: F401
+        have_gmsh = True
+    except ImportError:
+        have_gmsh = False
+    cases, skipped = {}, {}
+    for n, st in B.cases(s).items():
+        if names and n not in names:
+            continue
+        need = B.NEEDS.get(n, set())
+        if "ccx" in need and s != "ccx":
+            skipped[n] = "needs CalculiX"
+        elif "gmsh" in need and not have_gmsh:
+            skipped[n] = "needs Gmsh"
+        else:
+            cases[n] = st
+    folder = start(cases, s, prefix="bench")
+    (folder / "bench_meta.json").write_text(json.dumps({"skipped": skipped, "names": list(cases)}))
+    return bench_status(str(folder), 1e9 if wait is None else wait)
+
+
+def bench_status(bench: str, wait: float = 0.0) -> dict:
+    """A benchmark request: passed, failed, skipped and pending cases (waits up to `wait` s for the pending)."""
+    folder = Path(bench).expanduser()
+    try:
+        meta = json.loads((folder / "bench_meta.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"error": f"no benchmark request {folder}"}
+    st = status(str(folder), wait)
+    cases = {k: {x: v.get(x) for x in ("ok", "passed", "checks", "error", "why", "state", "seconds", "mesh",
+                                     "warnings", "solver_reruns") if x in v}
+             for k, v in st.get("studies", {}).items()}
+    out = {"bench": str(folder), "solver": st.get("solver"), "done": st.get("done"),
+           "passed": [k for k, v in cases.items() if v.get("passed")],
+           "failed": [k for k, v in cases.items() if v.get("passed") is False or v.get("ok") is False],
+           "pending": st.get("pending", []), "skipped": meta.get("skipped", {}), "cases": cases}
+    for k in ("progress", "time_left"):
+        if k in st:
+            out[k] = st[k]
+    if st.get("next"):
+        out["next"] = st["next"].replace(f"study_status(request='{folder}')", f"bench_status(bench='{folder}')")
+    if out["done"]:
+        (folder / "bench.json").write_text(json.dumps(out, indent=1))
     return out
 
 
