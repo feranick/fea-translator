@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.19.1
+Version: 2026.10.20.2
 """
 import shutil
 import subprocess
@@ -482,3 +482,13 @@ def test_run_ccx_records_peak_memory(tmp_path, monkeypatch):
     monkeypatch.setenv("FEAT_CCX", str(slow))
     with pytest.raises(subprocess.TimeoutExpired):
         runner.run_ccx(inp, timeout=1)
+
+
+def test_symmetry_and_pressure_are_not_singular(tmp_path):
+    """Sliders (symmetry), pressure and gravity do not make stresses singular: no 'peak at a support' for them,
+    and the off-bc peak keeps their regions (plate_hole's Kt peak lies on a symmetry plane)."""
+    st = bench.cases("ref")["axial_bar"]                          # sliders on three faces, a force on the fourth
+    r = run_study("a", st, tmp_path / "a", solver="ref")
+    assert not r.get("peak_at_bc") and r["peak_von_mises_off_bc"] == pytest.approx(10.0, rel=1e-4)
+    c = run_study("c", bench.cases("ref")["cantilever"], tmp_path / "c", solver="ref")
+    assert c["peak_at_bc"] == ["wall"]                            # a clamp is singular

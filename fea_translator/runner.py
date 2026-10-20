@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.19.1
+Version: 2026.10.20.2
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -145,6 +145,9 @@ def _get(res: dict, path: str):
     return float(cur)
 
 
+SINGULAR_BCS = ("fixed", "displacement", "force")
+
+
 def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, band: float | None = None) -> dict:
     """Results of one solved study. band (mm): peaks 'off_bc' leave out the material within this
     distance of support and load nodes (default here: the median element edge; runs pass two
@@ -163,7 +166,11 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, b
         out["max_displacement_components"] = {c: round(float(np.nanmax(np.abs(U[:, k]))), 9) for k, c in enumerate("xyz")}
         # elements touching a support or a load: fixed boundaries and point-like loads make stresses
         # singular there, so peaks are also reported away from them
-        bc_names = [s for s in plan["supports"] + plan["loads"] if s in sets]
+        # only the bcs that make stresses singular: clamps, prescribed displacements and forces on faces
+        # (their edges); symmetry sliders, pressure and gravity do not (a hole's Kt peak on a symmetry plane
+        # is the real peak: plate_hole)
+        bc_names = [s for s in plan["supports"] + plan["loads"] if s in sets
+                    and plan.get("kinds", {}).get(s, "fixed") in SINGULAR_BCS]
         bc_node = np.zeros(n, bool)
         owner = {}
         for s in bc_names:
@@ -747,7 +754,8 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
         if res.get("peak_at_bc"):
             at = res["peak_at_bc"]
             where = ", ".join(at) if isinstance(at, list) else "a support or load"
-            warn.append(f"the peak von Mises stress is at {where}: stresses at fixed or loaded edges are singular "
+            warn.append(f"the peak von Mises stress is at {where}: stresses at clamped edges and at the edges of "
+                        "force-loaded faces are singular "
                         "(they grow with refinement); judge the design on peak_von_mises_off_bc / safety_factor_off_bc, "
                         "or model the support more realistically (contact faces, a fillet at the corner)")
         conv = res.get("convergence", {})

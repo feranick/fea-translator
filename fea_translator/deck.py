@@ -1,5 +1,5 @@
 """deck.py — a study and its mesh as a CalculiX input deck (.inp).
-Version: 2026.10.20.1
+Version: 2026.10.20.2
 
     text, plan = write(name, study, mesh)
 
@@ -117,7 +117,7 @@ def write(name: str, study: dict, mesh: Mesh, extra: dict | None = None) -> tupl
     L.append(f"*ELEMENT, TYPE={etype}, ELSET=EALL")
     L += [f"{e + 1}, " + ", ".join(str(n + 1) for n in row) for e, row in enumerate(mesh.tets)]
     plan = {"analysis": an, "sets": {}, "applied_force": [0.0, 0.0, 0.0], "supports": [], "loads": [],
-            "heat_in_W": 0.0, "films": [], "fluxes": [], "tags": tags, "dofs": {},
+            "heat_in_W": 0.0, "films": [], "fluxes": [], "tags": tags, "dofs": {}, "kinds": {},
             # equivalent nodal loads (N) and heat (mW): CalculiX's RF / RFL at a node include them
             "nodal_load": np.zeros((len(mesh.nodes), 3)), "nodal_heat": np.zeros(len(mesh.nodes)),
             "current_in_A": 0.0, "terminals": {}}
@@ -164,6 +164,7 @@ def write(name: str, study: dict, mesh: Mesh, extra: dict | None = None) -> tupl
     bnd, cload, dload, dflux, film = [], {}, [], [], []
     for i, bc in enumerate(study.get("bcs", [])):
         k, bname = bc["kind"], bc_name(i, bc)
+        plan["kinds"][bname] = k
         sname = plan["sets"].get(bname, {}).get("nset")
         tg = tags.get(bname)
         if k == "fixed":
