@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.10.20.3
+Version: 2026.10.22.2
 """
 import json
 import os
@@ -193,9 +193,9 @@ def test_job_memory(slurm, monkeypatch):
     assert executor.method_of(box, 175329) == "iterative"
     assert executor.mem_for(box) == "2G"                          # iterative: 0.64 GB measured
     assert executor.mem_for(dict(box, converge=True)) == "6G"     # the finer mesh: 4.6x the nodes
-    modal = dict(box, analysis="modal", procs=16)                 # eigenvalues need the direct solver
-    assert executor.mem_for(modal) == "19G"                       # 14 GB measured at 19 threads
-    assert executor.mem_for(dict(modal, procs=1)) == "10G"        # 6.6 GB measured single-threaded
+    modal = dict(box, analysis="modal", procs=16)                 # eigenvalues: the direct solver, single-threaded
+    assert executor.mem_for(modal) == "10G"                       # 6.6 GB measured single-threaded
+    assert executor.mem_for(dict(box, equation_solver="direct", procs=16)) == "19G"   # 14 GB measured at 19 threads
     assert executor.mem_for({"analysis": "static", "part": {"goal": {"features": []}}}) == "8G"   # unknown size
     assert "#SBATCH --mem=2G" in executor.job_script(req, "a", box)
     monkeypatch.setenv("FEAT_SLURM_MEM", "20G")
@@ -213,7 +213,8 @@ def test_threads_only_where_they_help(slurm):
     small = {"analysis": "static", "procs": 16, "part": {"box": [100, 10, 10], "divisions": [50, 10, 10]}}  # 44,541 nodes
     assert executor.procs_for(large) == 1                          # iterative above 50k nodes
     assert executor.procs_for(small) == 5                          # direct: ceil(44,541 / 10k)
-    assert executor.procs_for(dict(large, analysis="modal")) == 16  # direct, 18 allowed
+    assert executor.procs_for(dict(large, analysis="modal")) == 1   # eigenvalues: single-threaded
+    assert executor.procs_for(dict(large, equation_solver="direct")) == 16  # direct, 18 allowed
     assert executor.procs_for(dict(large, equation_solver="direct", procs=32)) == 18
     assert executor.procs_for({"analysis": "static", "procs": 6, "part": {"goal": {"features": []}}}) == 6  # unknown size
     assert executor.procs_for(dict(small, procs=None)) == 1         # FEAT_PROCS default 1

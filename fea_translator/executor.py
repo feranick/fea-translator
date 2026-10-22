@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.20.3
+Version: 2026.10.22.2
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (5): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments;
@@ -16,8 +16,8 @@ other arguments kept), the threads (still size-capped) and queue, within FEAT_MA
 FEAT_MAX_MEM and FEAT_MAX_PROCS from config/env (unset: no cap).
 
 One SLURM job per study: <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns it) runs
-`python -m fea_translator.cli run-study REQUEST NAME` with --ntasks=1 --cpus-per-task=N (1 for buckling:
-its eigenvalues are only repeatable single-threaded); job.json records the id. The state of a study is
+`python -m fea_translator.cli run-study REQUEST NAME` with --ntasks=1 --cpus-per-task=N (1 for modal and
+buckling: their eigenvalues are only repeatable single-threaded); job.json records the id. The state of a study is
 read from the files and the queue (squeue once per call; sacct, else job.log, for jobs that ended
 without a result), never from this process, so it works after restarts and from other conversations.
 """
@@ -238,10 +238,10 @@ def method_of(study: dict, nodes: int) -> str:
 
 
 def procs_for(study: dict) -> int:
-    """CalculiX threads (CPUs) for a study: 1 for buckling (repeatable eigenvalues); 1 when every solve
+    """CalculiX threads (CPUs) for a study: 1 for modal and buckling (repeatable eigenvalues); 1 when every solve
     uses the iterative solver (single-threaded in CalculiX); else the study's procs or FEAT_PROCS (1),
     capped at a thread per NODES_PER_THREAD nodes of its largest direct-solver mesh."""
-    if study.get("analysis") == "buckling":
+    if study.get("analysis") in ("modal", "buckling"):
         return 1
     procs = procs_of(study)
     nodes = estimate_nodes(study)

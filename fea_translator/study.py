@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.10.20.3
+Version: 2026.10.22.2
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -152,7 +152,7 @@ def study_format() -> dict:
                            "analysis": "|".join(ANALYSES), "modes": "number of modes or buckling factors (6; 3)",
                            "stress": "thermal, joule: true adds the thermal-stress static solve",
                            "T_ref": "thermal, joule with stress: stress-free temperature, degrees C (20)",
-                           "procs": "CalculiX threads for this study (default FEAT_PROCS, 1; buckling always 1)",
+                           "procs": "CalculiX threads for this study (default FEAT_PROCS, 1; modal and buckling always 1)",
                            "queue": "true: always a SLURM job; false: always local (with FEAT_EXECUTOR=slurm; "
                                     "otherwise studies estimated above FEAT_SLURM_MIN_MINUTES go to SLURM)",
                            "run": "{timeout_s, mem ('12G'), procs, queue}: this study's solver time limit, SLURM memory, "

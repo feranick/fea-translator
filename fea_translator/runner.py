@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.22.1
+Version: 2026.10.22.2
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -52,6 +52,10 @@ def find_ccx() -> str | None:
 
 
 PEAK = {"rss_mb": 0.0, "threads": 0}   # this process's CalculiX runs: largest resident memory, threads
+# eigenvalue analyses run single-threaded: CalculiX's threaded eigenvalue step returned wrong buckling factors
+# under load on mochi, and on a 4-thread setup machine crashed in it (modal) and then returned 946 Hz for the
+# second of two equal bending modes at 835.5 Hz (cantilever_modal); single-threaded it is repeatable
+EIGEN = ("modal", "buckling")
 CRASHES: list[dict] = []   # threaded CalculiX runs that died without an error and were rerun single-threaded
 
 
@@ -90,7 +94,7 @@ def _wait_rss(p: subprocess.Popen, timeout: float) -> int:
 
 
 def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
-    """Runs ccx on the deck. serial: one thread (buckling: the eigenvalues then do not depend on the
+    """Runs ccx on the deck. serial: one thread (modal, buckling: the eigenvalues then do not depend on the
     machine's load; with several threads, 1 in 4 concurrent runs of euler_column returned a wrong factor)."""
     exe = find_ccx()
     if not exe:
@@ -611,7 +615,7 @@ def _solve(name: str, study: dict, mesh: Mesh, folder: Path, solver: str, timeou
         from . import refsolver
         refsolver.run(inp)
     else:
-        run_ccx(inp, timeout, serial=serial or study["analysis"] == "buckling")
+        run_ccx(inp, timeout, serial=serial or study["analysis"] in EIGEN)
     plan["equation_solver"] = deck.equation_solver(study, len(mesh.nodes))
     dat = results.parse_dat(inp.with_suffix(".dat").read_text())
     frd_path = inp.with_suffix(".frd")
