@@ -31,7 +31,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 74 tests: 54 run anywhere (23 with fake SLURM commands; one needs build123d-translator), 20 need ccx (and Gmsh)
+pytest -q                      # 75 tests: 55 run anywhere (23 with fake SLURM commands; one needs build123d-translator), 20 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -188,7 +188,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `executor.py`, `study.py`, `runner.py`, `api.py`, `cli.py`, `mcp_server.py` | 2026.10.20.3 (per-study run settings: `"run": {timeout_s, mem, procs, queue}` with the caps `FEAT_MAX_TIMEOUT`, `FEAT_MAX_MEM`, `FEAT_MAX_PROCS`; `execution.limits` in every result; the local pool and `run-study` use the study's timeout) |
+| Package, `runner.py` | 2026.10.22.1 (a threaded CalculiX run that dies with no error of its own is rerun once single-threaded and reported in `solver_crashes` and the warnings; a failure names the exit code or signal) |
+| `executor.py`, `study.py`, `runner.py`, `api.py`, `cli.py`, `mcp_server.py` | 2026.10.20.3 (per-study run settings: `"run": {timeout_s, mem, procs, queue}` with the caps `FEAT_MAX_TIMEOUT`, `FEAT_MAX_MEM`, `FEAT_MAX_PROCS`; `execution.limits` in every result; the local pool and `run-study` use the study's timeout) |
 | `runner.py` (before), `deck.py` | 2026.10.20.2 (only clamps, prescribed displacements and forces count as singular for `peak_at_bc` and the off-bc band; symmetry sliders, pressure and gravity do not: `plate_hole`'s Kt peak on its symmetry plane was flagged as a support peak and left out of `peak_von_mises_off_bc`) |
 | `executor.py`, `deck.py`, `api.py`, `cli.py`, `mcp_server.py` | 2026.10.20.1 (SLURM jobs sized from the measurements: node estimate before submitting (goals and STEP files from their volume), 1 CPU for iterative solves, direct solves capped at a thread per 10k nodes, memory fitted to the measured peaks; iterative solver from 50k nodes (was 150k); local workers use the same thread count (1 by default, was 4); `run_benchmarks` submits the benchmarks as a request and returns within 30 s, `bench_status` collects them (`feat bench-status`)) |
 | `runner.py`, `tools/measure_threads.py` (new) | 2026.10.19.1 (CalculiX runs are waited for with `wait4`, which records each run's peak memory: `seconds.ccx_peak_rss_mb` and `ccx_threads` in the result, `rss_mb`, `threads` and `equation_solver` in `timing.jsonl`; `tools/measure_threads.py` measures how CalculiX scales with threads on a SLURM machine (large and small box, direct and iterative solver, a pair side by side) to set the thread cap and the memory formula of SLURM jobs) |

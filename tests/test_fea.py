@@ -492,3 +492,28 @@ def test_symmetry_and_pressure_are_not_singular(tmp_path):
     assert not r.get("peak_at_bc") and r["peak_von_mises_off_bc"] == pytest.approx(10.0, rel=1e-4)
     c = run_study("c", bench.cases("ref")["cantilever"], tmp_path / "c", solver="ref")
     assert c["peak_at_bc"] == ["wall"]                            # a clamp is singular
+
+
+def test_a_crashed_threaded_calculix_run_is_rerun_single_threaded(tmp_path, monkeypatch):
+    """CalculiX that dies with no error of its own (the modal benchmark on a 4-thread setup machine, in the
+    eigenvalue step) is rerun once single-threaded; the failure names the exit code or signal."""
+    from fea_translator import runner
+
+    fake = tmp_path / "ccx"
+    fake.write_text('#!/bin/bash\necho "Calculating the eigenvalues and the eigenmodes"\n'
+                    'if [ "$OMP_NUM_THREADS" != "1" ] || [ -n "$ALWAYS_CRASH" ]; then kill -SEGV $$; fi\n'
+                    'touch "$2.dat"\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("FEAT_CCX", str(fake))
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    inp = tmp_path / "m.inp"
+    inp.write_text("*HEADING\n")
+    runner.CRASHES.clear()
+    runner.run_ccx(inp, 30)
+    assert runner.CRASHES == [{"solve": "m", "crash": "signal 11 (SIGSEGV)", "threads": 4, "after_rerun": "ok"}]
+    (tmp_path / "m.dat").unlink()
+    monkeypatch.setenv("ALWAYS_CRASH", "1")
+    with pytest.raises(runner.SolverError) as e:
+        runner.run_ccx(inp, 30)
+    assert "signal 11 (SIGSEGV), no error message" in str(e.value) and "eigenvalues" in str(e.value)
+    assert "failed again" not in str(e.value) and runner.CRASHES[-1]["after_rerun"].startswith("CalculiX failed")

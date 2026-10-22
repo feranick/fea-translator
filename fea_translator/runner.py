@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.20.3
+Version: 2026.10.22.1
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -52,6 +52,19 @@ def find_ccx() -> str | None:
 
 
 PEAK = {"rss_mb": 0.0, "threads": 0}   # this process's CalculiX runs: largest resident memory, threads
+CRASHES: list[dict] = []   # threaded CalculiX runs that died without an error and were rerun single-threaded
+
+
+def _exit_text(code: int) -> str:
+    """'exit code 3', or the signal that killed the process ('signal 11 (SIGSEGV)')."""
+    if code < 0:
+        import signal
+
+        try:
+            return f"signal {-code} ({signal.Signals(-code).name})"
+        except ValueError:
+            return f"signal {-code}"
+    return f"exit code {code}"
 
 
 def _wait_rss(p: subprocess.Popen, timeout: float) -> int:
@@ -107,8 +120,19 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
     log = log_path.read_text(errors="replace")
     PEAK["threads"] = max(PEAK["threads"], int(env.get("OMP_NUM_THREADS", "1")))
     errs = [ln.strip() for ln in log.splitlines() if "*ERROR" in ln.upper()]
+    threads = int(env.get("OMP_NUM_THREADS", "1"))
+    if not errs and (code != 0 or not inp.with_suffix(".dat").is_file()) and threads > 1:
+        # it died with no error of its own (a crash in the threaded solver: the eigenvalue step on a
+        # 4-thread setup machine): once more single-threaded, as for solves that do not balance
+        CRASHES.append({"solve": inp.stem, "crash": _exit_text(code), "threads": threads, "after_rerun": "ok"})
+        try:
+            return run_ccx(inp, timeout, serial=True)
+        except SolverError as exc:
+            CRASHES[-1]["after_rerun"] = str(exc)[:300]
+            raise
     if errs or code != 0 or not inp.with_suffix(".dat").is_file():
-        raise SolverError("CalculiX failed: " + ("; ".join(errs[:5]) if errs else log[-800:]))
+        why = "; ".join(errs[:5]) if errs else f"{_exit_text(code)}, no error message; the log ends: {log[-800:]}"
+        raise SolverError("CalculiX failed: " + why)
     return log
 
 
@@ -615,6 +639,7 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
                progress: Progress | None = None) -> dict:
     fine = size_factor != 1.0
     PEAK.update(rss_mb=0.0, threads=0)
+    CRASHES.clear()
     if progress:
         progress.stage("mesh_fine" if fine else "mesh")
     t0 = time.perf_counter()
@@ -675,6 +700,8 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
         res["stress"] = rs
     if reruns:
         res["solver_reruns"] = reruns
+    if CRASHES:
+        res["solver_crashes"] = list(CRASHES)
     t2 = time.perf_counter()
     minfo["equation_solver"] = deck.equation_solver(study, len(mesh.nodes))
     _record_timing(study, solver, minfo, t1 - t0, t2 - t1)
@@ -744,6 +771,9 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
             warn.append("stress: the peak von Mises stress is at a support, where stresses are singular; judge the "
                         "design on stress.peak_von_mises_off_bc / stress.safety_factor_off_bc")
         warn += res.pop("_selection_warnings", [])
+        for rr in res.get("solver_crashes", []):
+            warn.append(f"CalculiX's {rr['threads']}-thread solve of {rr['solve']} crashed ({rr['crash']}, no error message); "
+                        "it was rerun single-threaded" + ("" if rr["after_rerun"] == "ok" else f" and failed again: {rr['after_rerun']}"))
         for rr in res.get("solver_reruns", []):
             ok_ = rr["after_rerun"] <= rr["balance_error"] / 100 or rr["after_rerun"] < 1e-5
             warn.append(f"CalculiX's multithreaded solve of {rr['solve']} did not balance (error {rr['balance_error']:.2g}); "
