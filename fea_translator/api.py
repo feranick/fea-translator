@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.20.3
+Version: 2026.10.22.3
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -75,7 +75,39 @@ def study_format() -> dict:
 
 
 def validate(studies: dict) -> dict:
-    return _validate(studies)
+    """Static checks; each valid study also gets "estimate": {minutes, procs, mem_mb} (llm-translators
+    docs/EXECUTION.md, "Estimates in validation"), the sizing its SLURM job would get."""
+    out = _validate(studies)
+    for name, v in out.items():
+        if v.get("ok"):
+            try:
+                v["estimate"] = estimate(studies[name])
+            except Exception:  # noqa: BLE001 (an estimate is advice; validation stands without it)
+                pass
+    return out
+
+
+def estimate(study: dict, solver: str | None = None) -> dict:
+    """{minutes, procs, mem_mb} of a study, from the functions that size its SLURM job: procs after the size
+    cap (executor.procs_for), memory as its --mem (or what CalculiX needs when the job asks for none),
+    minutes from this machine's timing records scaled to the study's estimated mesh (when they include
+    meshes within 10x of its size: small benchmark meshes scaled as nodes^1.5 overshoot), else from the
+    mochi measurements, else the time limit (every solve's timeout); never above the time limit."""
+    s = _solver(solver)
+    limit = executor.solves_of(study) * executor.timeout_s(study) / 60
+    rt = _rates(study.get("analysis", ""), s)
+    nodes = executor.estimate_nodes(study)
+    stages = ["mesh", "solve"] + (["mesh_fine", "solve_fine"] if study.get("converge") else [])
+    if rt is not None and (nodes is None or rt["max_nodes"] * 10 >= nodes or s != "ccx"):
+        sec = sum(_stage_s(st, nodes, rt) or 0 for st in stages)
+    elif s == "ccx":
+        sec = executor.measured_seconds(study)
+    else:
+        sec = None
+    minutes = limit if sec is None else min(limit, sec / 60)
+    mem = executor.mem_for(study) or executor.mem_auto(study)
+    return {"minutes": round(max(minutes, 0.1), 1), "procs": executor.procs_for(study),
+            "mem_mb": int(round(executor.mem_mb(mem) or executor.MEM_DEFAULT_GB * 1024))}
 
 
 def _run_one(job: dict) -> dict:
@@ -218,7 +250,7 @@ def _rates(analysis: str, solver: str) -> dict | None:
     return {"solve_k": median(r["solve_s"] / r["nodes"] ** SOLVE_EXP for r in recs),
             "mesh_k": median(r["mesh_s"] / r["nodes"] for r in recs),
             "mesh_s": median(r["mesh_s"] for r in recs), "solve_s": median(r["solve_s"] for r in recs),
-            "runs": len(recs)}
+            "runs": len(recs), "max_nodes": max(r["nodes"] for r in recs)}
 
 
 def _stage_s(stage: str, nodes: int | None, rt: dict | None) -> float | None:

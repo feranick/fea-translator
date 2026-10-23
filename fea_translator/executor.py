@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.22.2
+Version: 2026.10.22.3
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (5): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments;
@@ -272,12 +272,41 @@ def mem_for(study: dict) -> str | None:
         return None
     if v and v.lower() != "auto":
         return v
+    return mem_auto(study)
+
+
+def mem_auto(study: dict) -> str:
+    """The memory CalculiX needs for a study (FEAT_SLURM_MEM=auto): from its estimated size, else MEM_DEFAULT_GB."""
     nodes = estimate_nodes(study)
     if nodes is None:
         return f"{MEM_DEFAULT_GB}G"
     t = procs_for(study)
     gb = max(mem_gb(n, method_of(study, n), t) for n in _meshes(study, nodes))
     return f"{max(2, int(math.ceil(gb)))}G"
+
+
+# single-threaded CalculiX on mochi (tools/measure_threads.py, 2026-10-20): a 175,329-node box took 409 s with
+# the direct solver (~nodes^1.43) and 167 s with the iterative one (~nodes); threads speed the direct solver
+# up ~threads^0.4 (1.8 / 2.5 / 3.3 x at 6 / 10 / 19). For estimates before this machine has timing records.
+MEASURED_NODES, MEASURED_DIRECT_S, MEASURED_ITERATIVE_S = 175_329, 409.0, 167.0
+
+
+def measured_seconds(study: dict) -> float | None:
+    """Seconds of a study's CalculiX solves from the mochi measurements (meshing ~0.1 ms per node, plus
+    30 s of start-up per solve); None if its size cannot be estimated."""
+    nodes = estimate_nodes(study)
+    if nodes is None:
+        return None
+    t = procs_for(study)
+    per_mesh = solves_of(study) // (2 if study.get("converge") else 1)
+    s = 0.0
+    for n in _meshes(study, nodes):
+        if method_of(study, n) == "iterative":
+            solve = MEASURED_ITERATIVE_S * n / MEASURED_NODES
+        else:
+            solve = MEASURED_DIRECT_S * (n / MEASURED_NODES) ** 1.43 / max(1, t) ** 0.4
+        s += 1e-4 * n + per_mesh * (solve + 30.0)
+    return s
 
 
 def use_slurm(study: dict, estimate_min: float | None) -> bool:

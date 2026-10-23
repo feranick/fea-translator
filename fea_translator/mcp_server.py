@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.10.20.3
+Version: 2026.10.22.3
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -68,7 +68,8 @@ def study_format() -> dict:
 
 @server.tool()
 def validate_studies(studies: dict) -> dict:
-    """Static checks of studies given as {name: study}. Returns per study ok, errors, warnings."""
+    """Static checks of studies given as {name: study}. Returns per study ok, errors, warnings, and for a valid
+    study "estimate": {minutes, procs, mem_mb} (expected run time, at most its time limit; threads; memory)."""
     return api.validate(studies)
 
 

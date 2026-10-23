@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.10.22.2
+Version: 2026.10.22.3
 """
 import json
 import os
@@ -306,3 +306,40 @@ def test_run_by_hand_and_local_pool_record_limits(slurm, monkeypatch, tmp_path):
     monkeypatch.setenv("FEAT_EXECUTOR", "local")
     r = api.run({"bar": _bar(run={"timeout_s": 123})}, "ref", wait=120)
     assert r["done"] and r["studies"]["bar"]["execution"]["limits"]["timeout_s"] == 123.0
+
+
+def test_estimates_in_validation(slurm, monkeypatch):
+    """validate() gives each valid study {minutes, procs, mem_mb} from the job sizing (llm-translators
+    docs/EXECUTION.md, 'Estimates in validation'), for the router."""
+    big = {"analysis": "static", "material": "steel", "part": {"box": [100, 10, 10], "divisions": [80, 16, 16]},
+           "bcs": [{"kind": "fixed", "name": "w", "faces": {"nx": -1}}, {"kind": "force", "name": "t", "faces": {"nx": 1}, "fz": -100}]}
+    direct = dict(big, equation_solver="direct", procs=19)
+    v = api.validate({"big": big, "direct": direct, "bad": dict(big, analysis="nope")})
+    assert "estimate" not in v["bad"] and not v["bad"]["ok"]
+    for n, st in (("big", big), ("direct", direct)):
+        e = v[n]["estimate"]
+        assert set(e) == {"minutes", "procs", "mem_mb"} and e["procs"] == executor.procs_for(st)
+        assert e["mem_mb"] == executor.mem_mb(executor.mem_for(st)) and 0 < e["minutes"] <= 15
+    # no timing records: the mochi measurements (CalculiX); 409 s direct single-threaded, 125 s at 19 threads
+    assert api.estimate(big, "ccx") == {"minutes": 3.6, "procs": 1, "mem_mb": 2048}                 # iterative, 167 s
+    assert api.estimate(dict(direct, procs=1), "ccx")["minutes"] == 7.6
+    assert api.estimate(direct, "ccx") == {"minutes": 2.9, "procs": 18, "mem_mb": 19456}
+    assert api.estimate(big, "ref")["minutes"] == 15.0                                              # the time limit
+    goal = dict(big, part={"goal": {"features": []}})                                               # size unknown
+    assert api.estimate(goal, "ccx") == {"minutes": 15.0, "procs": 1, "mem_mb": 8192}
+    # the job's --mem: run.mem, FEAT_SLURM_MEM; with none, what CalculiX needs
+    assert api.estimate(dict(big, run={"mem": "12G", "timeout_s": 60}), "ccx") == {"minutes": 1.0, "procs": 1, "mem_mb": 12288}
+    monkeypatch.setenv("FEAT_SLURM_MEM", "20G")
+    assert api.estimate(big, "ccx")["mem_mb"] == 20480
+    monkeypatch.setenv("FEAT_SLURM_MEM", "none")
+    assert api.estimate(big, "ccx")["mem_mb"] == 2048
+    # this machine's records, when they include meshes of a comparable size (solve ~ nodes^1.5)
+    out = Path(os.environ["FEAT_OUT"])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "timing.jsonl").write_text(json.dumps({"analysis": "static", "solver": "ccx", "nodes": 50000,
+                                                  "mesh_s": 5.0, "solve_s": 60.0}) + "\n")
+    n = executor.estimate_nodes(big)
+    assert api.estimate(big, "ccx")["minutes"] == round((5.0 * n / 5e4 + 60.0 * (n / 5e4) ** 1.5) / 60, 1)
+    (out / "timing.jsonl").write_text(json.dumps({"analysis": "static", "solver": "ccx", "nodes": 500,
+                                                  "mesh_s": 0.1, "solve_s": 1.0}) + "\n")
+    assert api.estimate(big, "ccx")["minutes"] == 3.6       # 350x smaller meshes: the measurements instead
