@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.10.22.3
+Version: 2026.10.25.1
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -17,19 +17,42 @@ Tools (all JSON):
 
 Run:  feat-mcp                       (stdio)
       feat-mcp --http 8767 [--host 0.0.0.0]
+
+Time: every tool answers within its wait (at most 50 s): tools run in a worker thread under a deadline that
+      bounds SLURM commands and submissions; CAD (part sizes) and meshing (get_deck) run in worker processes,
+      solves in the worker pool or in SLURM jobs.
+Stale: a server keeps the code it started with. When a newer release is installed (shared install: <prefix>/current
+      points elsewhere; checkout: __init__.py has another version), a call that finds the server idle is refused
+      with STALE_SERVER (llm-translators' router repeats it on a new server) and the server exits; an idle stale
+      server exits within ~20 s by itself. Busy servers answer (old code, with a server_stale note) and exit once
+      idle. Only a server started by main() refuses or exits (tests and run-study in a release that is not yet
+      current run normally). FEAT_EXIT_WHEN_STALE=1 always, 0 never; default: shared installs only.
 """
 from __future__ import annotations
 
 import argparse
+import functools
+import os
+import re
+import sys
+import threading
+import time
+from pathlib import Path
 
-from . import api
+import anyio.to_thread
+
+from . import api, executor
 
 try:  # MCP Python SDK 2.x
     from mcp.server.mcpserver import MCPServer as _Server
+    from mcp.server.mcpserver.exceptions import ToolError
     _V2 = True
 except ImportError:  # 1.x
     from mcp.server.fastmcp import FastMCP as _Server
+    from mcp.server.fastmcp.exceptions import ToolError
     _V2 = False
+
+BUDGET_S = 48.0   # a call's deadline: the router (and the Claude app) count on an answer within 50 s
 
 INSTRUCTIONS = """fea-translator runs finite-element analyses of one solid part: linear static (stresses,
 displacements, reactions, safety factor), modal (natural frequencies), linear buckling (load factors)
@@ -59,7 +82,133 @@ Units: mm, N, MPa, kg/m3, W, degrees C; V, A, ohm m, kV/mm."""
 server = _Server("fea-translator", instructions=INSTRUCTIONS)
 
 
+# ---- a stale server: a newer version installed since this process started (llm-translators docs/SHARED.md) ----
+STALE_MARK = "STALE_SERVER"
+VERSION_RE = re.compile(r'^__version__\s*=\s*"([^"]+)"', re.M)
+_STATE = {"inflight": 0, "exiting": False, "checked": 0.0, "why": None, "shared": False, "serving": False}
+_LOCK = threading.Lock()
+
+
+def stale_reason(pkg_dir: Path, running: str) -> tuple[str | None, bool]:
+    """(why this process runs old code or None, shared install?). Shared install (a release under
+    <prefix>/releases with RELEASE.json): <prefix>/current now points to another release. Otherwise: the
+    package's __init__.py on disk carries another version (a checkout or editable install updated in place)."""
+    rel = pkg_dir.parent.parent
+    if (rel / "RELEASE.json").is_file() and rel.parent.name == "releases":
+        cur = rel.parent.parent / "current"
+        try:
+            if cur.exists() and cur.resolve() != rel.resolve():
+                return f"release {cur.resolve().name} is installed; this server runs {rel.name} ({running})", True
+        except OSError:
+            pass
+        return None, True
+    try:
+        m = VERSION_RE.search((pkg_dir / "__init__.py").read_text())
+    except OSError:
+        return None, False
+    if m and m.group(1) != running:
+        return f"version {m.group(1)} is installed; this server runs {running}", False
+    return None, False
+
+
+def _stale() -> str | None:
+    """stale_reason for this process, checked at most every 2 s."""
+    now = time.time()
+    if now - _STATE["checked"] > 2.0:
+        _STATE["why"], _STATE["shared"] = stale_reason(Path(api.__file__).resolve().parent, api.__version__)
+        _STATE["checked"] = now
+    return _STATE["why"]
+
+
+def _may_exit() -> bool:
+    """Only a server started by main() (never tools called in-process: tests, scripts, llmt deploy --test before
+    current is switched). Then FEAT_EXIT_WHEN_STALE: 1 always, 0 never; default: in a shared install."""
+    if not _STATE["serving"]:
+        return False
+    v = os.environ.get("FEAT_EXIT_WHEN_STALE", "").strip()
+    return v == "1" or (v != "0" and _STATE["shared"])
+
+
+def _pool_busy() -> bool:
+    """Studies still running in this process's worker pool (they would die with it)."""
+    return any(not r.ready() for jobs in api._POOL.jobs.values() for r in jobs.values())
+
+
+def _exit_soon(why: str, delay: float) -> None:
+    """Exits in `delay` s (an answer in flight reaches the caller first). Caller holds _LOCK."""
+    if _STATE["exiting"]:
+        return
+    _STATE["exiting"] = True
+    sys.stderr.write(f"feat: {STALE_MARK}: exiting to pick up the new code: {why}\n")
+    sys.stderr.flush()
+
+    def go():
+        time.sleep(delay)
+        if api._POOL.pool is not None:
+            api._POOL.pool.terminate()
+        os._exit(0)
+    threading.Thread(target=go, daemon=True, name="feat-exit").start()
+
+
+def _enter_call() -> str | None:
+    """Counts a call in. Returns a STALE_MARK message (the call is refused) when this server is stale, may exit
+    and has nothing else running; otherwise None."""
+    with _LOCK:
+        why = _stale()
+        if why and _may_exit() and (_STATE["exiting"] or (not _STATE["inflight"] and not _pool_busy())):
+            _exit_soon(why, 1.0)
+            return (f"{STALE_MARK}: {why}. This server is exiting so that the next one runs the installed version: "
+                    "call again.")
+        _STATE["inflight"] += 1
+        return None
+
+
+def _leave_call() -> None:
+    with _LOCK:
+        _STATE["inflight"] -= 1
+
+
+def _watch_install(period: float = 10.0) -> None:
+    """Exits this server when it is stale, may exit and is idle (no calls, no pool studies): within ~20 s."""
+    def loop():
+        while True:
+            time.sleep(period)
+            with _LOCK:
+                if _stale() and _may_exit() and not _STATE["inflight"] and not _pool_busy():
+                    _exit_soon(_STATE["why"], 0.0)
+    threading.Thread(target=loop, daemon=True, name="feat-watch-install").start()
+
+
+def _tool(fn):
+    """Every tool: refused with STALE_SERVER when the server is stale and idle; otherwise run in a worker thread
+    (a blocking call must not stop the server's other requests) under a deadline of BUDGET_S, so it answers in
+    time; errors come back with their text (SDK 2.x hides the text of other exceptions)."""
+    def bounded(*args, **kwargs):
+        with executor.deadline(BUDGET_S):
+            return fn(*args, **kwargs)
+
+    @functools.wraps(fn)
+    async def wrap(*args, **kwargs):
+        refused = _enter_call()
+        if refused:
+            raise ToolError(refused)
+        try:
+            r = await anyio.to_thread.run_sync(functools.partial(bounded, *args, **kwargs))
+        except ToolError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+        finally:
+            _leave_call()
+        if _STATE["why"] and isinstance(r, dict):
+            r = {**r, "server_stale": f"{_STATE['why']}: this answer comes from the old code"
+                                      + ("; the server restarts when idle" if _may_exit() else "; restart the MCP server")}
+        return r
+    return wrap
+
+
 @server.tool()
+@_tool
 def study_format() -> dict:
     """The study format: analyses, materials, boundary-condition kinds with their parameters,
     face selectors, conventions, an example; and which solver and mesher are installed."""
@@ -67,6 +216,7 @@ def study_format() -> dict:
 
 
 @server.tool()
+@_tool
 def validate_studies(studies: dict) -> dict:
     """Static checks of studies given as {name: study}. Returns per study ok, errors, warnings, and for a valid
     study "estimate": {minutes, procs, mem_mb} (expected run time, at most its time limit; threads; memory)."""
@@ -74,6 +224,7 @@ def validate_studies(studies: dict) -> dict:
 
 
 @server.tool()
+@_tool
 def run_studies(studies: dict, solver: str = "auto", wait_s: float = 45) -> dict:
     """Meshes, solves and checks each study. Per study: results (max displacement, von Mises peaks
     with and without the support/load regions, safety factors, reactions, frequencies, buckling
@@ -89,6 +240,7 @@ def run_studies(studies: dict, solver: str = "auto", wait_s: float = 45) -> dict
 
 
 @server.tool()
+@_tool
 def study_status(request: str, wait_s: float = 45) -> dict:
     """The studies of a run_studies request (its 'request' path): finished ones with their results,
     the others in 'pending' with progress and time left. Waits up to wait_s seconds (at most 50) for
@@ -97,12 +249,15 @@ def study_status(request: str, wait_s: float = 45) -> dict:
 
 
 @server.tool()
+@_tool
 def get_deck(study: dict, name: str = "study") -> dict:
-    """Meshes the part and returns the CalculiX input deck (.inp) of one study, without solving."""
-    return api.deck(study, name)
+    """Meshes the part and returns the CalculiX input deck (.inp) of one study, without solving. Returns within
+    45 s: a part that takes longer to mesh comes back 'pending' with the path where the deck will be."""
+    return api.deck(study, name, wait=45.0)
 
 
 @server.tool()
+@_tool
 def run_benchmarks(names: list[str] | None = None, solver: str = "auto", wait_s: float = 30) -> dict:
     """Runs the benchmark studies with closed-form answers (axial bar, cantilever, natural frequency,
     Euler column, conduction, Lame ring, plate with a hole, electrical cases) as one request, and
@@ -112,6 +267,7 @@ def run_benchmarks(names: list[str] | None = None, solver: str = "auto", wait_s:
 
 
 @server.tool()
+@_tool
 def bench_status(bench: str, wait_s: float = 30) -> dict:
     """A run_benchmarks request (its 'bench' path): passed, failed, skipped and pending cases, with
     progress for the pending ones. Waits up to wait_s seconds (at most 50)."""
@@ -119,12 +275,14 @@ def bench_status(bench: str, wait_s: float = 30) -> dict:
 
 
 @server.tool()
+@_tool
 def get_file(path: str, max_mb: float = 20) -> dict:
     """A file written by run_studies (a path from its result) as base64."""
     return api.read_file(path, max_mb)
 
 
 @server.tool()
+@_tool
 def jobs(limit: int = 20, active: bool = False) -> dict:
     """Recent requests that have SLURM jobs, with each study's state (queued, running, done, timed_out,
     out_of_memory, cancelled, failed), job id and expected time; the translator's queue and the machine's
@@ -134,6 +292,7 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
 
 
 @server.tool()
+@_tool
 def cancel(request: str, names: list[str] | None = None) -> dict:
     """Stops a request's studies (or the named ones): their SLURM jobs are cancelled. Returns their states."""
     return api.cancel(request, names)
@@ -144,6 +303,8 @@ def main() -> None:
     ap.add_argument("--http", type=int, help="serve MCP over streamable HTTP on this port (default: stdio)")
     ap.add_argument("--host", default="127.0.0.1")
     a = ap.parse_args()
+    _STATE["serving"] = True
+    _watch_install()
     if a.http is None:
         server.run()
     elif _V2:

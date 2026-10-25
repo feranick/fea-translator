@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Fake SLURM commands for the tests (sbatch, squeue, scancel, sacct, sinfo): one script, called by the
+"""Fake SLURM commands for the tests (sbatch, squeue, scancel, sacct, sinfo, scontrol): one script, called by the
 name it is invoked as. State lives in $FAKE_SLURM_DIR. sbatch starts job.sh in the background (honouring
 --chdir and --output from its #SBATCH lines), prints an id and records the pid; squeue reports RUNNING while
 the pid lives (PENDING with FAKE_SBATCH_PENDING=1); scancel kills the job and writes SLURM's CANCELLED line to
 its log; sacct answers from recorded states (FAKE_SACCT_FAIL=1: it fails, as without accounting).
-Other knobs: FAKE_SBATCH_FAIL=1 (sbatch refuses), FAKE_SBATCH_DELAY=s (the job sleeps first)."""
+Other knobs: FAKE_SBATCH_FAIL=1 (sbatch refuses), FAKE_SBATCH_DELAY=s (the job sleeps first), FAKE_SQUEUE_FAIL=1
+(squeue cannot reach the controller), FAKE_SCONTROL_NODES=file (`scontrol -o show node` prints its lines; default:
+one node with 40 CPUs, 2 threads per core), FAKE_SCONTROL_FAIL=1 (scontrol cannot reach the controller)."""
 import json
 import os
 import re
@@ -89,6 +91,9 @@ def _fmt(fmt: str, jid: str, rec: dict, state: str) -> str:
 
 
 def squeue(args):
+    if os.environ.get("FAKE_SQUEUE_FAIL"):
+        print("slurm_load_jobs error: Unable to contact slurm controller (connect failure)", file=sys.stderr)
+        return 1
     fmt, ids, states = "%i %T", None, None
     for i, a in enumerate(args):
         if a == "-o":
@@ -144,6 +149,19 @@ def sinfo(args):
     return 0
 
 
+def scontrol(args):
+    if os.environ.get("FAKE_SCONTROL_FAIL"):
+        print("slurm_load_node error: Unable to contact slurm controller (connect failure)", file=sys.stderr)
+        return 1
+    f = os.environ.get("FAKE_SCONTROL_NODES")
+    if f:
+        print(Path(f).read_text().rstrip("\n"))
+    else:
+        print("NodeName=fake1 Arch=x86_64 CoresPerSocket=20 CPUAlloc=0 CPUTot=40 NodeAddr=fake1 NodeHostName=fake1 "
+              "OS=Linux 6.8.0 RealMemory=64000 Sockets=1 State=IDLE ThreadsPerCore=2")
+    return 0
+
+
 if __name__ == "__main__":
     cmd = Path(sys.argv[0]).name
-    sys.exit({"sbatch": sbatch, "squeue": squeue, "scancel": scancel, "sacct": sacct, "sinfo": sinfo}[cmd](sys.argv[1:]))
+    sys.exit({"sbatch": sbatch, "squeue": squeue, "scancel": scancel, "sacct": sacct, "sinfo": sinfo, "scontrol": scontrol}[cmd](sys.argv[1:]))

@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.10.22.3
+Version: 2026.10.25.1
 """
 import json
 import os
@@ -25,7 +25,8 @@ def slurm(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_SLURM_DIR", str(tmp_path / "fake"))
     monkeypatch.setenv("PATH", f"{FAKE}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("PYTHONPATH", f"{ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
-    for k in ("FAKE_SBATCH_FAIL", "FAKE_SBATCH_PENDING", "FAKE_SBATCH_DELAY", "FAKE_SACCT_FAIL", "FEAT_PROCS"):
+    for k in ("FAKE_SBATCH_FAIL", "FAKE_SBATCH_PENDING", "FAKE_SBATCH_DELAY", "FAKE_SACCT_FAIL", "FEAT_PROCS",
+              "FAKE_SQUEUE_FAIL", "FAKE_SCONTROL_NODES", "FAKE_SCONTROL_FAIL"):
         monkeypatch.delenv(k, raising=False)
     return tmp_path
 
@@ -343,3 +344,139 @@ def test_estimates_in_validation(slurm, monkeypatch):
     (out / "timing.jsonl").write_text(json.dumps({"analysis": "static", "solver": "ccx", "nodes": 500,
                                                   "mesh_s": 0.1, "solve_s": 1.0}) + "\n")
     assert api.estimate(big, "ccx")["minutes"] == 3.6       # 350x smaller meshes: the measurements instead
+
+
+# ---- 2026.10.25.1: clusters of several nodes, settings parsing, SLURM that does not answer --------------------
+
+SPARKS = ("NodeName=spark-5da5 Arch=aarch64 CoresPerSocket=20 CPUAlloc=0 CPUTot=20 NodeAddr=100.77.175.91 "
+          "NodeHostName=spark-5da5 OS=Linux 6.11.0 #1 SMP RealMemory=120000 State=IDLE ThreadsPerCore=1\n"
+          "NodeName=spark-0808 Arch=aarch64 CoresPerSocket=8 CPUAlloc=0 CPUTot=8 NodeAddr=100.76.107.42 "
+          "NodeHostName=spark-0808 OS=Linux 6.11.0 #1 SMP RealMemory=120000 State=IDLE ThreadsPerCore=1\n")
+
+
+@pytest.fixture()
+def sparks(slurm, monkeypatch):
+    """A fake two-node cluster (the DGX Sparks); this machine is spark-0808 by its Tailscale address."""
+    f = slurm / "nodes.txt"
+    f.write_text(SPARKS)
+    monkeypatch.setenv("FAKE_SCONTROL_NODES", str(f))
+    monkeypatch.setattr(executor.socket, "gethostname", lambda: "claude-test-host")
+    monkeypatch.setattr(executor, "_addresses", lambda: {"192.168.1.20", "100.76.107.42"})
+    return slurm
+
+
+def test_node_pinning_in_a_two_node_cluster(sparks, monkeypatch):
+    req = Path(os.environ["FEAT_OUT"]) / "run_n"
+    st = {"analysis": "static", "part": {"goal": {"features": []}}, "procs": 16}
+    # local (default): this node, by address; its 8 cores cap the threads (not the cluster's 28)
+    assert executor.node_status() == {"setting": "local", "nodelist": "spark-0808", "cluster_nodes": 2,
+                                      "this_node": "spark-0808"}
+    assert api.tool_status()["executor"]["node"]["nodelist"] == "spark-0808"
+    s = executor.job_script(req, "a", st)
+    assert "#SBATCH --nodelist=spark-0808" in s and "#SBATCH --cpus-per-task=8" in s
+    # by host name (NodeHostName, also with a domain)
+    monkeypatch.setattr(executor.socket, "gethostname", lambda: "spark-5da5.tail1234.ts.net")
+    executor._NODES.update(t=0.0, nodes=None)
+    assert executor.node_status()["nodelist"] == "spark-5da5" and "--cpus-per-task=16" in executor.job_script(req, "a", st)
+    # any: SLURM chooses; a node list: as given
+    monkeypatch.setenv("FEAT_SLURM_NODE", "any")
+    assert executor.node_status()["nodelist"] is None and "--nodelist" not in executor.job_script(req, "a", st)
+    monkeypatch.setenv("FEAT_SLURM_NODE", "spark-5da5,spark-0808")
+    assert "#SBATCH --nodelist=spark-5da5,spark-0808" in executor.job_script(req, "a", st)
+    # a --nodelist / -w in FEAT_SLURM_ARGS wins (nothing added; status reports it)
+    for args, nl in (("--nice=10 -w spark-0808", "spark-0808"), ("-wspark-5da5", "spark-5da5"),
+                     ("--nodelist spark-0808", "spark-0808")):
+        monkeypatch.setenv("FEAT_SLURM_ARGS", args)
+        ns = executor.node_status()
+        assert ns["nodelist"] == nl and ns["from_args"] and ns["setting"] == "spark-5da5,spark-0808"
+        assert "--nodelist" not in executor.job_script(req, "a", st)
+    # this machine not among the nodes: no pin, and a warning
+    monkeypatch.delenv("FEAT_SLURM_ARGS")
+    monkeypatch.delenv("FEAT_SLURM_NODE")
+    monkeypatch.setattr(executor.socket, "gethostname", lambda: "elsewhere")
+    monkeypatch.setattr(executor, "_addresses", lambda: {"10.0.0.9"})
+    ns = executor.node_status()
+    assert ns["nodelist"] is None and "none of the cluster's nodes" in ns["warning"]
+
+
+def test_a_one_node_cluster_adds_no_nodelist(slurm):
+    assert executor.node_status() == {"setting": "local", "nodelist": None, "cluster_nodes": 1, "this_node": None}
+    assert "--nodelist" not in executor.job_script(Path(os.environ["FEAT_OUT"]) / "r", "a", {"analysis": "static"})
+    assert executor.node_cores() == 20     # the only node: 40 CPUs, 2 threads per core
+
+
+def test_submitted_job_asks_for_this_node_and_two_options_in_one_setting(sparks, monkeypatch):
+    """FEAT_SLURM_ARGS with several options is split as a shell does: its --mem wins over FEAT_SLURM_MEM and its
+    --nodelist over FEAT_SLURM_NODE; both reach sbatch as separate arguments."""
+    r = api.run({"bar": _bar(queue=True)}, "ref", wait=0)
+    req = Path(r["request"])
+    s, args = _job(req, "bar")
+    assert "#SBATCH --nodelist=spark-0808" in s
+    assert json.loads((req / "bar" / "job.json").read_text())["nodelist"] == "spark-0808"
+    monkeypatch.setenv("FEAT_SLURM_ARGS", "--mem=8G --nodelist=spark-5da5")
+    assert executor.args_mem() == "8G" and executor.args_nodelist() == "spark-5da5"
+    assert executor.mem_for(_bar()) is None and executor.node_status()["nodelist"] == "spark-5da5"
+    r = api.run({"bar": _bar(queue=True)}, "ref", wait=0)
+    s, args = _job(Path(r["request"]), "bar")
+    assert "--mem=8G" in args and "--nodelist=spark-5da5" in args          # two arguments, not one
+    assert "#SBATCH --mem" not in s and "#SBATCH --nodelist" not in s
+    monkeypatch.setenv("FEAT_SLURM_ARGS", "--mem-per-cpu=2G --comment='a --mem in words'")
+    assert executor.args_mem() == "2G" and executor.args_nodelist() is None
+
+
+def test_slurm_that_does_not_answer_is_asked_again(sparks, monkeypatch):
+    """A failed scontrol is not remembered (a controller down at start must not mean 'no SLURM' for the
+    server's lifetime), and a failed squeue leaves jobs 'unknown', never 'failed'."""
+    monkeypatch.setenv("FAKE_SCONTROL_FAIL", "1")
+    assert executor.cluster_nodes() is None and executor.node_status()["cluster_nodes"] is None
+    monkeypatch.delenv("FAKE_SCONTROL_FAIL")
+    assert executor.node_status()["cluster_nodes"] == 2           # at once, not after a cache expires
+    monkeypatch.setenv("FAKE_SBATCH_DELAY", "3")                   # the job is still running when squeue fails
+    r = api.run({"bar": _bar(queue=True)}, "ref", wait=0)
+    req = Path(r["request"])
+    monkeypatch.setenv("FAKE_SQUEUE_FAIL", "1")
+    monkeypatch.setenv("FAKE_SACCT_FAIL", "1")
+    st = executor.job_states(req, ["bar"])["bar"]
+    assert st["state"] == "unknown" and "did not answer" in st["why"], st
+    res = api.status(str(req))
+    assert "bar" in res["pending"] and res["progress"]["bar"]["state"] == "unknown"
+    monkeypatch.delenv("FAKE_SQUEUE_FAIL")
+    assert api.status(str(req), wait=120)["done"]
+
+
+def test_calls_keep_to_their_deadline(slurm, monkeypatch, tmp_path):
+    """Inside an MCP call (a deadline), SLURM commands, submissions and CAD estimates use only the time left."""
+    t0 = time.time()
+    with executor.deadline(1.5):
+        assert executor._run(["sleep", "10"]) is None
+        assert executor.submit(tmp_path, "x", _bar())["why"].startswith("could not submit: SLURM was too slow")
+    assert time.time() - t0 < 3
+
+
+def test_deck_meshes_in_a_worker_and_returns_in_time(slurm):
+    st = _bar()
+    r = api.deck(st, "bar", wait=0.0)              # not done at once: where the deck will be
+    assert r.get("pending") and r["path"].endswith("bar.inp")
+    t_end = time.time() + 60
+    while time.time() < t_end and not Path(r["path"]).is_file():
+        time.sleep(0.2)
+    assert Path(r["path"]).read_text().startswith("**") or "*NODE" in Path(r["path"]).read_text()
+    r2 = api.deck(st, "bar", wait=45.0)
+    assert r2["bytes"] > 1000 and "*NODE" in r2["deck"]
+
+
+def test_part_size_in_a_call_does_not_wait_for_cad(slurm):
+    pytest.importorskip("build123d_translator")
+    goal = {"features": [{"kind": "base_box", "params": {"w": 30, "d": 20, "h": 10}}]}
+    st = {"analysis": "static", "part": {"goal": goal}, "mesh": {"size": 5}}
+    executor._VOLUMES.clear()
+    t0 = time.time()
+    with executor.deadline(5.5):                   # waits at most 0.5 s: the worker process is still starting
+        executor.estimate_nodes(st)
+    assert time.time() - t0 < 3
+    t_end = time.time() + 90                       # its answer is kept for next time
+    key = json.dumps(st["part"], sort_keys=True, default=str)
+    while time.time() < t_end and executor._VOLUMES.get(key) is None:
+        time.sleep(0.2)
+    assert abs(executor._VOLUMES[key][0] - 6000) < 1e-6
+    assert executor.estimate_nodes(st) == int(12 * 6000 / 125)

@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.22.3
+Version: 2026.10.25.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -20,7 +20,7 @@ Studies run in worker processes with a time limit each, or (FEAT_EXECUTOR=slurm,
 long ones as SLURM jobs. Environment: FEAT_OUT (default ~/feat_runs), FEAT_WORKERS (2), FEAT_TIMEOUT
 (seconds per CalculiX solve, 900), FEAT_CCX (path of ccx), FEAT_SOLVER (auto | ccx | ref; auto =
 CalculiX when found, else the reference solver), FEAT_PROCS (CalculiX threads, 1), FEAT_EXECUTOR,
-FEAT_SLURM_MIN_MINUTES (5), FEAT_SLURM_ARGS, FEAT_SLURM_MEM (auto).
+FEAT_SLURM_MIN_MINUTES (5), FEAT_SLURM_ARGS, FEAT_SLURM_MEM (auto), FEAT_SLURM_NODE (local).
 """
 from __future__ import annotations
 
@@ -143,6 +143,18 @@ class _Pool:
 
 
 _POOL = _Pool()
+
+
+def _close_pool() -> None:
+    """At exit: stop the worker pool quietly (no Pool.__del__ noise after the interpreter has torn down)."""
+    if _POOL.pool is not None:
+        _POOL.pool.terminate()
+        _POOL.pool = None
+
+
+import atexit  # noqa: E402
+
+atexit.register(_close_pool)
 
 
 def _request_dir(prefix: str) -> Path:
@@ -442,13 +454,21 @@ def status(request: str, wait: float = 0.0) -> dict:
     folder = Path(request).expanduser()
     if not (folder / "request.json").is_file():
         return {"error": f"no request {folder}"}
-    t_end = time.time() + max(0.0, float(wait))
+    t_end = _until(wait)
     while True:
         res = _collect(folder)
         if res["done"] or time.time() >= t_end:
             return res
         slurm = any(p.get("job_id") for p in res.get("progress", {}).values())
         time.sleep(min(5.0 if slurm else 1.0, max(0.1, t_end - time.time())))   # one squeue per look
+
+
+def _until(wait: float) -> float:
+    """When a wait of `wait` s ends: within the MCP call's own deadline (executor.deadline), 3 s to spare for the
+    answer."""
+    t = time.time() + max(0.0, float(wait))
+    left = executor.remaining()
+    return t if left is None else min(t, time.time() + left - 3.0)
 
 
 def run(studies: dict, solver: str | None = None, wait: float | None = None) -> dict:
@@ -477,6 +497,11 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
             continue
         names = meta.get("slurm", [])
         if not names or not any((d / n / "job.json").is_file() for n in names):
+            continue
+        left = executor.remaining()
+        if left is not None and left < 5:   # within the call's time: say so rather than answer late
+            out.append({"request": str(d), "started": _clock(meta.get("started", d.stat().st_mtime)),
+                        "note": "not checked: SLURM was slow and the call ran out of time; ask again"})
             continue
         st = executor.job_states(d, names)
         if active and not any(v["state"] in ("queued", "running") for v in st.values()):
@@ -540,8 +565,11 @@ def cancel(request: str, names: list[str] | None = None) -> dict:
                            "be stopped alone and end at their time limit: " + ", ".join(running))
         elif any(n not in handles for n in local if not (folder / n / f"{n}.json").is_file()):
             out["note"] = "local studies of this request are not run by this server process; they cannot be cancelled here"
-    t_end = time.time() + 10   # give SLURM a moment to end the jobs
-    while ids and time.time() < t_end and any(executor.squeue(ids)):
+    t_end = _until(10)   # give SLURM a moment to end the jobs
+    while ids and time.time() < t_end:
+        q = executor.squeue(ids)
+        if q is not None and not q:
+            break
         time.sleep(1)
     st = _collect(folder)
     out["states"] = {n: (st["progress"][n]["state"] if n in st.get("pending", []) else
@@ -550,14 +578,50 @@ def cancel(request: str, names: list[str] | None = None) -> dict:
     return out
 
 
-def deck(study: dict, name: str = "study") -> dict:
-    from . import deck as D
-    from .mesher import mesh_part
-
+def deck(study: dict, name: str = "study", wait: float | None = None) -> dict:
+    """The CalculiX deck of a study, meshed but not solved. With `wait` (the MCP tool) the meshing runs in a
+    worker process and the call returns after at most `wait` s: if it is not done by then, the answer says
+    where the deck will be (read it with get_file). Without (CLI): meshed here."""
     v = validate_study(study)
     if not v["ok"]:
         return {"error": "invalid study", "errors": v["errors"]}
     folder = _request_dir("deck")
+    if wait is None:
+        return _deck_into(study, name, folder)
+    proc = mp.get_context("spawn").Process(target=_deck_job, args=(study, name, str(folder), str(out_root())),
+                                           daemon=True, name="feat-deck")
+    proc.start()
+    t_end = _until(wait)
+    res = folder / "deck.json"
+    while time.time() < t_end and proc.is_alive() and not res.is_file():
+        time.sleep(0.2)
+    try:
+        return json.loads(res.read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    if not proc.is_alive():
+        return {"error": "meshing failed in the worker process", "folder": str(folder)}
+    return {"pending": True, "path": str(folder / f"{name}.inp"), "folder": str(folder),
+            "next": f"the part is still being meshed; the deck will be at {folder / (name + '.inp')} "
+                    "(read it with get_file when it exists), or ask get_deck again later"}
+
+
+def _deck_job(study: dict, name: str, folder: str, out: str) -> None:
+    """Worker process of deck(): writes deck.json (the answer) next to the deck, atomically."""
+    os.environ["FEAT_OUT"] = out
+    try:
+        r = _deck_into(study, name, Path(folder))
+    except Exception as exc:  # noqa: BLE001
+        r = {"error": f"{type(exc).__name__}: {exc}"[:2000]}
+    tmp = Path(folder) / ".deck.json.tmp"
+    tmp.write_text(json.dumps(r))
+    tmp.replace(Path(folder) / "deck.json")
+
+
+def _deck_into(study: dict, name: str, folder: Path) -> dict:
+    from . import deck as D
+    from .mesher import mesh_part
+
     mesh, info = mesh_part(study, folder)
     text, plan = D.write(name, study, mesh)
     p = folder / f"{name}.inp"
