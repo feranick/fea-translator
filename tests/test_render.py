@@ -1,7 +1,7 @@
 """Pictures (render.py, render_vtk.py; as cfd-translator 2026.10.28.1): fields from the saved state against hand
 values, validation, the setup view's colours, VTK where it can draw (skipped otherwise), the Matplotlib fallback,
 render_images and get_image.
-Version: 2026.10.28.1
+Version: 2026.10.28.2
 """
 import asyncio
 import json
@@ -214,3 +214,20 @@ def test_calculix_mode_shapes_for_pictures(out):
         n = len(r.get("frequencies") or r.get("buckling_factors"))
         assert s["fields"]["modes"].shape[0] == n and "mode1" in r["images"], (name, r.get("warnings"))
         assert np.abs(s["fields"]["modes"][0]).max() > 0
+
+
+def test_buckling_keeps_as_many_shapes_as_factors(tmp_path):
+    """CalculiX can print more buckling factors (and shapes) than asked for; the results keep the first `modes`
+    factors, and the saved state the same shapes (euler_column: 4 printed, 2 asked)."""
+    from fea_translator.mesher import mesh_part
+    from fea_translator.runner import collect_fields
+    st = dict(bench.cases("ccx")["euler_column"], modes=2)
+    mesh, _ = mesh_part(st, tmp_path)
+    n = len(mesh.nodes)
+    blocks = [{"what": "displacements", "components": "", "set": "NALL", "time": None,
+               "rows": [[i + 1, 0.0, float(k + 1), 0.0] for i in range(n)]} for k in range(4)]
+    dat = {"blocks": blocks, "eigen": [], "buckling": [{"mode": k + 1, "factor": 10.0 * (k + 1)} for k in range(4)]}
+    acc = {"fields": {}, "bcs": {}, "meta": {}}
+    collect_fields(acc, st, mesh, {"tags": {}, "kinds": {}}, dat, {})
+    assert acc["fields"]["modes"].shape == (2, n, 3) and acc["meta"]["mode_values"]["values"] == [10.0, 20.0]
+    assert np.allclose(acc["fields"]["modes"][1][:, 1], 2.0)          # mode 2 is the second printed block

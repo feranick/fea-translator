@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.28.1
+Version: 2026.10.28.2
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -777,8 +777,12 @@ def collect_fields(acc: dict, st: dict, mesh: Mesh, plan: dict, dat: dict, r_: d
     elif an in ("modal", "buckling"):
         vals = [e["hz"] for e in dat["eigen"]] if an == "modal" else [e["factor"] for e in dat["buckling"]]
         blocks = [b for b in (results.block(dat, "displacements", "NALL", last=False) or []) if b["rows"]]
+        blocks = blocks[-len(vals):] if vals else []          # one per printed mode, in order
+        if an == "buckling":   # the results keep the first `modes` factors (CalculiX can print more): the same shapes
+            keep = int(st.get("modes", 3))
+            vals, blocks = vals[:keep], blocks[:keep]
         modes = []
-        for b in blocks[-len(vals):] if vals else []:
+        for b in blocks:
             a = np.zeros((n, 3))
             for r in b["rows"]:
                 a[int(r[0]) - 1] = r[1:4]

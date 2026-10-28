@@ -34,7 +34,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 99 tests: 77 run anywhere (32 with fake SLURM commands, 6 of the MCP server, 9 of pictures; two need build123d-translator, one VTK), 21 need ccx (and Gmsh)
+pytest -q                      # 100 tests: 78 run anywhere (32 with fake SLURM commands, 6 of the MCP server, 9 of pictures; two need build123d-translator, one VTK), 21 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -216,7 +216,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `render.py`, `render_vtk.py` (new), `runner.py`, `study.py`, `api.py`, `cli.py`, `mcp_server.py`, `deck.py`, `refsolver.py` | 2026.10.28.1 (pictures, as cfd-translator 2026.10.28.1: `images` (fields on the deformed part, mode shapes, the setup view, section cuts, the off-BC peak marked), `state.npz` from every run, `render_images` and `get_image` tools, `feat images`; Matplotlib by default, VTK (`render` extra) for `quality: high` in a child process; `render` in `tool_status`; mode shapes in the `.dat` from both solvers; matplotlib a dependency) |
+| Package, `runner.py` | 2026.10.28.2 (buckling pictures keep as many mode shapes as the results keep factors: CalculiX printed 4 factors and shapes for `euler_column` where 2 were asked, and the state had 4) |
+| `render.py`, `render_vtk.py` (new), `runner.py`, `study.py`, `api.py`, `cli.py`, `mcp_server.py`, `deck.py`, `refsolver.py` | 2026.10.28.1 (pictures, as cfd-translator 2026.10.28.1: `images` (fields on the deformed part, mode shapes, the setup view, section cuts, the off-BC peak marked), `state.npz` from every run, `render_images` and `get_image` tools, `feat images`; Matplotlib by default, VTK (`render` extra) for `quality: high` in a child process; `render` in `tool_status`; mode shapes in the `.dat` from both solvers; matplotlib a dependency) |
 | `executor.py`, `mcp_server.py` (before), `api.py` (before) | 2026.10.25.1 (llm-translators `docs/EXECUTION.md` and `docs/SHARED.md`: `FEAT_SLURM_NODE` (local / any / a node list) pins jobs to this node of a cluster of several nodes, reported in `executor.node`; threads capped at this node's cores; `FEAT_SLURM_ARGS` options read from its shell-split words; a SLURM that does not answer is asked again (not "no SLURM", not "job gone"); stale servers refuse with `STALE_SERVER` and exit after a deploy; every tool answers within its wait, with CAD estimates and `get_deck`'s meshing in worker processes) |
 | `api.py`, `executor.py`, `mcp_server.py` (before) | 2026.10.22.3 (estimates in validation, llm-translators `docs/EXECUTION.md`: each valid study gets `"estimate": {minutes, procs, mem_mb}` for the router; procs after the size cap, memory as the job's `--mem`, minutes from this machine's timing records when they include meshes within 10× of the study's, else from the mochi measurements, else the time limit, and never above it) |
 | `runner.py`, `executor.py` (before), `study.py` | 2026.10.22.2 (modal studies run single-threaded like buckling, and ask SLURM for 1 CPU: on one of four setup machines CalculiX's threaded eigenvalue step crashed once and then returned 946 Hz for the second of the two equal 835.5 Hz bending modes of `cantilever_modal`) |
