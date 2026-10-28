@@ -1,5 +1,5 @@
 """cli.py — the `feat` command line. Every command prints JSON.
-Version: 2026.10.20.3
+Version: 2026.10.28.1
 
     feat status                          versions; CalculiX and Gmsh found or not
     feat format > study_format.json      the study format
@@ -12,6 +12,8 @@ Version: 2026.10.20.3
     feat run-study REQUEST NAME          run one study of a request folder (what a SLURM job runs)
     feat jobs [--limit N] [--active]     recent requests with SLURM jobs, their states, the queue
     feat cancel REQUEST [NAMES...]       stop a request's studies
+    feat images STUDY_FOLDER [IMAGES]    new pictures of a finished study (IMAGES: a JSON list or file; default:
+                                         the default views), from its saved state, without solving
 
 '-' reads the studies from stdin.
 """
@@ -76,6 +78,9 @@ def main(argv=None) -> None:
     p = sub.add_parser("cancel")
     p.add_argument("request")
     p.add_argument("names", nargs="*")
+    p = sub.add_parser("images")
+    p.add_argument("study_folder")
+    p.add_argument("images", nargs="?")
     a = ap.parse_args(argv)
     if a.cmd == "run-study":
         sys.exit(run_study(a.request, a.name))
@@ -96,6 +101,11 @@ def main(argv=None) -> None:
         out = api.jobs(a.limit, a.active)
     elif a.cmd == "cancel":
         out = api.cancel(a.request, a.names or None)
+    elif a.cmd == "images":
+        im = True
+        if a.images:
+            im = json.loads(a.images) if a.images.lstrip().startswith("[") else _load(a.images)
+        out = api.render_images(a.study_folder, im)
     else:
         out = api.bench(a.names or None, a.solver)
     print(json.dumps(out, indent=1))

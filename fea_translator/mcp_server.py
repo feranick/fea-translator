@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.10.25.1
+Version: 2026.10.28.1
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -14,6 +14,8 @@ Tools (all JSON):
   get_file          a written file as base64 (for callers on another machine)
   jobs              recent requests with SLURM jobs (also from other conversations) and the queue
   cancel            stops a request's studies
+  render_images     new pictures of a finished study from its saved state (no solving; in a worker)
+  get_image         a PNG written by run_studies or render_images, as an image
 
 Run:  feat-mcp                       (stdio)
       feat-mcp --http 8767 [--host 0.0.0.0]
@@ -44,11 +46,13 @@ import anyio.to_thread
 from . import api, executor
 
 try:  # MCP Python SDK 2.x
+    from mcp.server.mcpserver import Image
     from mcp.server.mcpserver import MCPServer as _Server
     from mcp.server.mcpserver.exceptions import ToolError
     _V2 = True
 except ImportError:  # 1.x
     from mcp.server.fastmcp import FastMCP as _Server
+    from mcp.server.fastmcp import Image
     from mcp.server.fastmcp.exceptions import ToolError
     _V2 = False
 
@@ -77,6 +81,9 @@ with job ids. They do not depend on this conversation. Report the expected finis
 Later, study_status(request) collects them; jobs() lists recent and active runs (also those started in other
 conversations); cancel(request) stops them. A study's "run": {timeout_s, mem, procs, queue} overrides the
 machine's defaults for that study, within the caps in study_format's status.
+Pictures: "images": true (or views: a field on the deformed part, mode shapes, the setup view showing the faces each
+bc took, section cuts) writes PNGs (results images.<name>.path); get_image shows each; render_images draws other
+views of a finished study without solving again. Check 'selection' by eye with the setup view.
 Units: mm, N, MPa, kg/m3, W, degrees C; V, A, ohm m, kV/mm."""
 
 server = _Server("fea-translator", instructions=INSTRUCTIONS)
@@ -131,7 +138,7 @@ def _may_exit() -> bool:
 
 def _pool_busy() -> bool:
     """Studies still running in this process's worker pool (they would die with it)."""
-    return any(not r.ready() for jobs in api._POOL.jobs.values() for r in jobs.values())
+    return any(not r.ready() for jobs in api._POOL.jobs.values() for r in jobs.values()) or api.aux_busy()
 
 
 def _exit_soon(why: str, delay: float) -> None:
@@ -289,6 +296,26 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
     CPUs. active=True: only requests with queued or running studies. Finds runs started in other
     conversations too."""
     return api.jobs(limit, active)
+
+
+@server.tool()
+@_tool
+def get_image(path: str) -> Image:
+    """A PNG written by run_studies (a result's images.<name>.path) or render_images, as an image you can see and
+    show: fields on the (deformed) part, mode shapes, the setup view, section cuts."""
+    return Image(path=str(api.image_path(path)))
+
+
+@server.tool()
+@_tool
+def render_images(study_folder: str, images: list | bool = True, wait_s: float = 45) -> dict:
+    """New pictures of a finished study without solving again: study_folder is <request>/<study name> (the folder
+    holding <name>.json and state.npz). images: true (the defaults) or [{name, field | mode: n | setup: true,
+    surface: part | <bc name>, deformed: true | scale, view: [elev, azim], clim: [lo, hi] | full | robust, quality:
+    high (VTK: lit, smooth) | basic, slice: {axis, at}}] as in study_format. Returns within wait_s (at most 50): if
+    still drawing, state 'running' (call again with the same arguments). Then get_image each path."""
+    return api.in_worker("rendering", "render_images", {"study_folder": study_folder, "images": images},
+                         min(max(float(wait_s), 0.0), 50.0))
 
 
 @server.tool()

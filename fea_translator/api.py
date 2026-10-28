@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.25.1
+Version: 2026.10.28.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -14,13 +14,17 @@ Version: 2026.10.25.1
     read_file(path)                  a written file as base64 (only under the output folder)
     jobs(limit, active)              recent requests with SLURM jobs and their states; the queue
     cancel(request, names)           stops a request's studies (scancel)
-    tool_status()                    versions, solver and mesher found, the executor
+    tool_status()                    versions, solver and mesher found, the executor, the renderers
+    render_images(study_folder, images)  new pictures of a finished study from its saved state (no solving)
+    in_worker(what, fn_name, kwargs, wait)  slow work of a tool call in a worker process, within wait
+    image_path(path)                 a PNG written by a run or render_images (only under the output folder)
 
 Studies run in worker processes with a time limit each, or (FEAT_EXECUTOR=slurm, executor.py) the
 long ones as SLURM jobs. Environment: FEAT_OUT (default ~/feat_runs), FEAT_WORKERS (2), FEAT_TIMEOUT
 (seconds per CalculiX solve, 900), FEAT_CCX (path of ccx), FEAT_SOLVER (auto | ccx | ref; auto =
 CalculiX when found, else the reference solver), FEAT_PROCS (CalculiX threads, 1), FEAT_EXECUTOR,
-FEAT_SLURM_MIN_MINUTES (5), FEAT_SLURM_ARGS, FEAT_SLURM_MEM (auto), FEAT_SLURM_NODE (local).
+FEAT_SLURM_MIN_MINUTES (5), FEAT_SLURM_ARGS, FEAT_SLURM_MEM (auto), FEAT_SLURM_NODE (local), FEAT_RENDER
+(matplotlib: no VTK), FEAT_RENDER_TIMEOUT (900 s), FEAT_AUX_WORKERS (2: rendering workers).
 """
 from __future__ import annotations
 
@@ -67,6 +71,8 @@ def tool_status() -> dict:
     except ImportError:
         out["build123d_translator"] = None
     out["executor"] = executor.status_key()
+    from .render_vtk import status as render_status
+    out["render"] = render_status()
     return out
 
 
@@ -146,10 +152,79 @@ _POOL = _Pool()
 
 
 def _close_pool() -> None:
-    """At exit: stop the worker pool quietly (no Pool.__del__ noise after the interpreter has torn down)."""
+    """At exit: stop the worker pools quietly (no Pool.__del__ noise after the interpreter has torn down)."""
     if _POOL.pool is not None:
         _POOL.pool.terminate()
         _POOL.pool = None
+    if _AUX["pool"] is not None:
+        _AUX["pool"].terminate()
+        _AUX["pool"] = None
+
+
+# ---- other slow work of a tool call (rendering) in worker processes, as cfd-translator's in_worker: a call
+# returns within its wait (at most 50 s) and a repeated call with the same arguments picks the result up
+_AUX: dict = {"pool": None, "pending": {}}
+
+
+def _aux_pool():
+    if _AUX["pool"] is None:
+        _AUX["pool"] = mp.get_context("spawn").Pool(int(os.environ.get("FEAT_AUX_WORKERS", "2") or 2), maxtasksperchild=20)
+    return _AUX["pool"]
+
+
+def _aux_run(fn_name: str, kwargs: dict, out: str | None = None):
+    if out:   # the worker may outlive a change of FEAT_OUT
+        os.environ["FEAT_OUT"] = out
+    return globals()[fn_name](**kwargs)
+
+
+def aux_busy() -> bool:
+    return any(not h.ready() for h, _ in _AUX["pending"].values())
+
+
+def in_worker(what: str, fn_name: str, kwargs: dict, wait: float) -> dict:
+    """fn_name(**kwargs) in a worker; waits at most `wait` s (<= 50, and within the call's deadline). Unfinished:
+    {state: running, ...}; the same call again waits for the same work."""
+    key = f"{fn_name}:{json.dumps(kwargs, sort_keys=True, default=str)}"
+    if key not in _AUX["pending"]:
+        _AUX["pending"][key] = (_aux_pool().apply_async(_aux_run, (fn_name, kwargs, str(out_root()))), time.time())
+    h, t0 = _AUX["pending"][key]
+    h.wait(max(0.0, _until(min(float(wait), 50.0)) - time.time()))
+    if not h.ready():
+        return {"state": "running", "what": what, "elapsed_s": round(time.time() - t0, 1),
+                "next": f"still {what}: call {fn_name} again with the same arguments (the work goes on meanwhile)"}
+    _AUX["pending"].pop(key, None)
+    try:
+        return h.get()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def render_images(study_folder: str, images=True) -> dict:
+    """New pictures of a finished study (its folder: <request>/<name>) from the saved state, without solving."""
+    from .render import image_errors, load_state, render
+
+    d = Path(study_folder).expanduser().resolve()
+    root = out_root().resolve()
+    if root not in d.parents:
+        return {"error": f"only study folders under {root}"}
+    if not (d / "state.npz").is_file():
+        return {"error": f"no saved state in {d} (a finished study's folder: <request>/<name>, holding <name>.json)"}
+    study = load_state(d)["meta"].get("study", {})
+    errs = image_errors(images, study)
+    if errs:
+        return {"error": "invalid images", "errors": errs}
+    out, warns = render(d, images, d.name)
+    return {"images": out, "warnings": warns}
+
+
+def image_path(path: str) -> Path:
+    """A PNG written by a run or by render_images (only under the output folder)."""
+    p = Path(path).expanduser().resolve()
+    root = out_root().resolve()
+    if root not in p.parents or p.suffix.lower() != ".png" or not p.is_file():
+        raise ValueError(f"no image {p} under {root}")
+    return p
 
 
 import atexit  # noqa: E402

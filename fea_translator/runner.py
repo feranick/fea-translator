@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.22.2
+Version: 2026.10.28.1
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -661,6 +661,7 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     files, warns, sel = {}, [], {}
 
     reruns = []
+    acc = {"fields": {}, "bcs": {}, "meta": {}}   # for the pictures: nodal fields of every solve (state.npz)
 
     def run(sname, st, extra=None):
         """One solve, evaluated; rerun once fully single-threaded if its balance check is off."""
@@ -671,6 +672,11 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
             plan, dat, frd, inp = _solve(sname, st, mesh, folder, solver, timeout, extra, serial=True)
             r_ = evaluate(st, mesh, plan, dat, frd, band)
             reruns.append({"solve": sname, "balance_error": round(first, 8), "after_rerun": round(_balance(r_), 8)})
+        if not fine:
+            try:
+                collect_fields(acc, st, mesh, plan, dat, r_)
+            except Exception as exc:  # noqa: BLE001 (pictures are extra: the results stand without them)
+                acc["meta"].setdefault("errors", []).append(f"{sname}: {type(exc).__name__}: {exc}"[:300])
         for k, p in (("inp", inp), ("dat", inp.with_suffix(".dat")), ("frd", inp.with_suffix(".frd"))):
             if p.is_file():
                 files[k if sname == name else f"{k}_{sname[len(name) + 1:]}"] = str(p)
@@ -720,7 +726,66 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
         if p.is_file():
             files[k] = str(p)
     res["files"] = files
+    if not fine:
+        try:
+            from .render import save_state
+            meta = dict(acc["meta"], bcs=[dict(acc["bcs"][n], name=n) for n in bc_names(study) if n in acc["bcs"]])
+            try:
+                meta["yield"] = material_of(study).get("yield")
+            except Exception:  # noqa: BLE001
+                pass
+            save_state(folder, mesh, acc["fields"], study, meta)
+            files["state"] = str(folder / "state.npz")
+            for e in acc["meta"].get("errors", []):
+                warns.append(f"pictures: a field could not be saved ({e})")
+        except Exception as exc:  # noqa: BLE001
+            warns.append(f"could not save the state for pictures (render_images): {type(exc).__name__}: {exc}"[:300])
     return res
+
+
+def collect_fields(acc: dict, st: dict, mesh: Mesh, plan: dict, dat: dict, r_: dict) -> None:
+    """The nodal fields of one solve, for state.npz: U and the stress tensor S (static), T and the heat flux q
+    (W/m2, thermal), phi with E (kV/mm) and J (A/mm2) (electric, electrostatic), mode shapes (modal, buckling);
+    each bc's CAD-face tags and kind; the off-BC von Mises peak; mode values."""
+    from .render import nodal_gradient, nodal_stress
+    an = st["analysis"]
+    n = len(mesh.nodes)
+    f = acc["fields"]
+    for bname, tags in plan["tags"].items():
+        if not bname.startswith("probe:"):
+            acc["bcs"].setdefault(bname, {"kind": plan.get("kinds", {}).get(bname, "?"), "tags": [int(x) for x in tags]})
+    if an == "static":
+        U = _node_values(dat, "displacements", n, 3)
+        f["U"] = U
+        f["S"] = nodal_stress(mesh, U, st, plan)
+        at = r_.get("max_von_mises_off_bc_at") or r_.get("max_von_mises_at")
+        val = r_.get("max_von_mises_off_bc") or r_.get("max_von_mises")
+        if at is not None and val is not None:
+            acc["meta"]["peak"] = {"at": at, "value": val, "off_bc": "max_von_mises_off_bc" in r_}
+    elif an == "thermal":
+        T = _node_values(dat, "temperatures", n, 1)[:, 0]
+        f["T"] = T
+        k = float(material_of(st).get("k", 0.0))
+        f["q"] = -k * 1e3 * nodal_gradient(mesh, T)          # W/(m K) x K/mm = 1e3 W/m2
+    elif an in ("electric", "electrostatic"):
+        phi = _node_values(dat, "temperatures", n, 1)[:, 0]
+        f["phi"] = phi
+        E = -nodal_gradient(mesh, phi)                         # V/mm
+        f["E"] = E * 1e-3                                      # kV/mm
+        if an == "electric":
+            f["J"] = to_deck_units(material_of(st))["sigma"] * E   # S/mm x V/mm = A/mm2
+    elif an in ("modal", "buckling"):
+        vals = [e["hz"] for e in dat["eigen"]] if an == "modal" else [e["factor"] for e in dat["buckling"]]
+        blocks = [b for b in (results.block(dat, "displacements", "NALL", last=False) or []) if b["rows"]]
+        modes = []
+        for b in blocks[-len(vals):] if vals else []:
+            a = np.zeros((n, 3))
+            for r in b["rows"]:
+                a[int(r[0]) - 1] = r[1:4]
+            modes.append(a)
+        if modes:
+            f["modes"] = np.array(modes)
+        acc["meta"]["mode_values"] = {"values": vals, "unit": "Hz" if an == "modal" else "(buckling factor)"}
 
 
 def limits(study: dict, timeout: float) -> dict:
@@ -811,6 +876,13 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
         if d and p and d["rel_change"] < 0.02 and p["rel_change"] > 0.1:
             warn.append("the displacement has converged but the peak stress keeps growing on a finer mesh: a stress "
                         "singularity (sharp corner, fixed edge, point load); the peak there is not a design value")
+        if study.get("images"):
+            try:
+                from .render import render as draw
+                res["images"], w = draw(folder, study["images"], name)
+                warn += w
+            except Exception as exc:  # noqa: BLE001 (pictures must not fail the study)
+                warn.append(f"images: {type(exc).__name__}: {exc}"[:300])
         if warn:
             res["warnings"] = warn
         res["passed"] = all(c["pass"] for c in res["checks"]) if res["checks"] else None

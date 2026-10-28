@@ -1,5 +1,5 @@
 """refsolver.py — a small reference solver for the decks this package writes (not CalculiX).
-Version: 2026.10.18.1
+Version: 2026.10.28.1
 
     run(inp_path) -> writes <job>.dat in CalculiX's .dat layout (the parts results.py reads)
 
@@ -301,9 +301,9 @@ def run(inp: Path) -> Path:
             M = m.mass(d["mat"]["DENSITY"][0])
             free = np.setdiff1d(np.arange(3 * n), np.array(sorted(fixed), dtype=np.int64))
             k = min(d["modes"], len(free) - 2)
-            vals = spla.eigsh(K[free][:, free].tocsc(), k=k, M=M[free][:, free].tocsc(), sigma=0, which="LM",
-                              return_eigenvectors=False)
-            vals = np.sort(vals)
+            vals, vecs = spla.eigsh(K[free][:, free].tocsc(), k=k, M=M[free][:, free].tocsc(), sigma=0, which="LM")
+            o = np.argsort(vals)
+            vals, vecs = vals[o], vecs[:, o]
             out += ["     E I G E N V A L U E   O U T P U T", "",
                     " MODE NO    EIGENVALUE                       FREQUENCY",
                     "                                     REAL PART            IMAGINARY PART",
@@ -311,6 +311,12 @@ def run(inp: Path) -> Path:
             for j, lam in enumerate(vals):
                 om = np.sqrt(max(lam, 0))
                 out.append(f"{j + 1:7d}  {_fmt(lam)}  {_fmt(om)}  {_fmt(om / 2 / np.pi)}  {_fmt(0.0)}")
+            for j, lam in enumerate(vals):   # the mode shapes, one displacement block per mode (as CalculiX's NODE PRINT)
+                full = np.zeros(3 * n)
+                full[free] = vecs[:, j]
+                Um = full.reshape(-1, 3)
+                out += ["", f" displacements (vx,vy,vz) for set NALL and time  {_fmt(np.sqrt(max(lam, 0)) / 2 / np.pi)}", ""]
+                out += [f"{m.ids[i]:10d} {_fmt(Um[i, 0])} {_fmt(Um[i, 1])} {_fmt(Um[i, 2])}" for i in range(n)]
         else:
             f = np.zeros(3 * n)
             for nid, dof, val in d["cload"]:

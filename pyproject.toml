@@ -4,18 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fea-translator"
-version = "2026.10.25.1"
+version = "2026.10.28.1"
 description = "FEA studies (part, material, supports, loads) to Gmsh meshes, CalculiX decks and checked results; MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Nicola Ferralis", email = "ferralis@generalflash.com" }]
-dependencies = ["numpy>=1.22", "scipy>=1.8"]
+dependencies = ["numpy>=1.22", "scipy>=1.8", "matplotlib>=3.5"]
 
 [project.optional-dependencies]
 # PyPI has no Gmsh wheels for Linux on ARM (aarch64): there, install python3-gmsh with apt and link
 # gmsh.py into the venv (README, Install)
 mesh = ["gmsh>=4.11; sys_platform != 'linux' or platform_machine != 'aarch64'"]
 mcp = ["mcp>=1.2"]
+# VTK pictures ("quality": "high"): also an offscreen OpenGL (libosmesa6, libegl1) or xvfb (README, Pictures)
+render = ["pyvista>=0.43"]
 test = ["pytest"]
 
 [project.scripts]

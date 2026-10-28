@@ -11,9 +11,12 @@ Analyses: **linear static** (displacements, von Mises stress, reactions, safety 
 ```bash
 cd ~/Desktop/fea-translator
 python3 -m venv .venv && source .venv/bin/activate        # Python 3.10+
-pip install -e ".[mesh,mcp,test]"                          # numpy, scipy, gmsh, MCP SDK, pytest
+pip install -e ".[mesh,mcp,test]"                          # numpy, scipy, matplotlib, gmsh, MCP SDK, pytest
+pip install -e ".[render]"                                 # optional: VTK pictures (PyVista), "quality": "high"
 pip install -e ../build123d-translator                     # optional: parts as goals
 ```
+
+VTK draws offscreen, so a server without a display needs one of: a GPU driver's EGL (`sudo apt install libegl1`), OSMesa (`sudo apt install libosmesa6`), or Xvfb (`sudo apt install xvfb`: the renderer then runs under `xvfb-run -a`). `feat status` shows what it found under `render` once a picture has been drawn. Matplotlib needs nothing more.
 
 On **Linux ARM (aarch64**, e.g. DGX Spark) PyPI has no Gmsh wheels, so the `mesh` extra skips it; use Ubuntu's (Gmsh 4.12 on 24.04) and link its Python module into the venv (same Python version as the system's):
 
@@ -31,7 +34,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 89 tests: 69 run anywhere (32 with fake SLURM commands, 6 of the MCP server; two need build123d-translator), 20 need ccx (and Gmsh)
+pytest -q                      # 99 tests: 77 run anywhere (32 with fake SLURM commands, 6 of the MCP server, 9 of pictures; two need build123d-translator, one VTK), 21 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -145,6 +148,20 @@ The reference solver (`refsolver.py`) is independent element code (isoparametric
 | `get_file` | A written file as base64. |
 | `jobs` | Recent requests with SLURM jobs (also from other conversations), each study's state, job id and expected time; the translator's queue and the machine's CPUs. `active=True`: only queued or running ones. |
 | `cancel` | Stops a request's studies (or the named ones): `scancel` for SLURM jobs. |
+| `render_images` | New pictures of a finished study (`study_folder` = `<request>/<name>`) from its saved state, without solving; in a worker process, returns within `wait_s` (state `running` until done: call again). |
+| `get_image` | A PNG of a run or of `render_images` (under the output folder), as an image. |
+
+**Pictures** (2026.10.28.1, as cfd-translator 2026.10.28.1). `"images": true` (the defaults) or a list of views writes `<study folder>/images/<name>.png` after the solve; the result lists them under `images` with what each shows, its colour range, the renderer and the deformation scale. Every run also saves `state.npz` and `state.json` (nodes, elements, the boundary triangles with their CAD-face tags, the nodal fields, each bc's faces and kind, the mode values, the off-BC peak), so `render_images` draws other views later.
+- *Views:* `{name, field | mode: n | setup: true, surface: part | <bc name>, deformed: true | scale, view: [elev, azim], clim: [lo, hi] | full | robust, quality: high | basic, slice: {axis, at}}`. Fields: `von_mises`, `displacement` (magnitude, mm), `ux`/`uy`/`uz`, `max_principal`, `safety_factor` (yield / von Mises), `temperature`, `heat_flux` (W/m²), `potential` (V), `current_density` (A/mm²), `e_field` (kV/mm), each where its analysis has it (thermal and joule with `stress: true` add the mechanical ones); validation names the fields a study has. `deformed: true` scales the largest displacement to 5 % of the part's size (the scale is reported); mode views are always deformed and coloured by the relative displacement magnitude; von Mises and safety-factor views mark the off-BC peak. `setup` colours the faces each support and load took, one colour per bc with a legend, to check `selection` by eye. `slice` keeps the part on the low side of the plane and shows the field on the cut.
+- *Defaults:* static: von Mises on the deformed part and the setup view; modal: the first 3 modes; buckling: mode 1; thermal: temperature (with `stress`: also von Mises); electric: potential and current density; electrostatic: potential and electric field; joule: temperature, potential, current density.
+- *Fields* come from the nodal solution, the same for CalculiX and the reference solver: stresses from the displacements (CalculiX's element formulation, thermal strain included), element means averaged to the nodes by volume; gradients at element centroids, averaged the same way. Mode shapes: the deck now prints each mode's displacements to the `.dat` (`*NODE PRINT U`), and the reference solver writes its eigenvectors.
+- *Renderers:* Matplotlib (Agg) by default and as the fallback; VTK through PyVista for `"quality": "high"` (lit, smooth shading with sharp edges kept, curved tet10 surfaces, the volume clipped for slices, white background, vertical scalar bar). VTK draws in a child process (`python -m fea_translator.render_vtk <state dir> <specs.json> <out dir> <name>`, one JSON line back), so an OpenGL crash cannot take down a server or a SLURM job; `probe()` (cached per process) finds EGL, OSMesa or X, else runs the child under `xvfb-run -a`. Without VTK a high-quality view is drawn with Matplotlib, with a warning.
+
+| Setting | Default | What |
+|---|---|---|
+| `FEAT_RENDER` | (VTK when it can draw) | `matplotlib`: never VTK |
+| `FEAT_RENDER_TIMEOUT` | 900 | seconds for the VTK child process |
+| `FEAT_AUX_WORKERS` | 2 | worker processes of `render_images` |
 
 **Long runs.** Polling costs the calling model tokens on every call, so pending studies say where they are and how long they still need, and long runs are not polled:
 
@@ -189,6 +206,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 | `fea_translator/runner.py` | One study end to end, checks |
 | `fea_translator/refsolver.py` | Reference solver (static, modal, thermal) |
 | `fea_translator/bench.py` | Benchmark studies with closed-form answers |
+| `fea_translator/render.py` | Pictures: fields from the nodal solution, the saved state, validation, defaults, Matplotlib |
+| `fea_translator/render_vtk.py` | Pictures with VTK (PyVista) in a child process; the offscreen probe |
 | `fea_translator/api.py`, `cli.py`, `mcp_server.py` | JSON API, `feat`, `feat-mcp` |
 | `examples/studies.json` | A bracket (static, modal), a finned plate (thermal), a column (buckling) |
 | `tests/` | Tests |
@@ -197,7 +216,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `api.py`, `executor.py`, `mcp_server.py` | 2026.10.25.1 (llm-translators `docs/EXECUTION.md` and `docs/SHARED.md`: `FEAT_SLURM_NODE` (local / any / a node list) pins jobs to this node of a cluster of several nodes, reported in `executor.node`; threads capped at this node's cores; `FEAT_SLURM_ARGS` options read from its shell-split words; a SLURM that does not answer is asked again (not "no SLURM", not "job gone"); stale servers refuse with `STALE_SERVER` and exit after a deploy; every tool answers within its wait, with CAD estimates and `get_deck`'s meshing in worker processes) |
+| Package, `render.py`, `render_vtk.py` (new), `runner.py`, `study.py`, `api.py`, `cli.py`, `mcp_server.py`, `deck.py`, `refsolver.py` | 2026.10.28.1 (pictures, as cfd-translator 2026.10.28.1: `images` (fields on the deformed part, mode shapes, the setup view, section cuts, the off-BC peak marked), `state.npz` from every run, `render_images` and `get_image` tools, `feat images`; Matplotlib by default, VTK (`render` extra) for `quality: high` in a child process; `render` in `tool_status`; mode shapes in the `.dat` from both solvers; matplotlib a dependency) |
+| `executor.py`, `mcp_server.py` (before), `api.py` (before) | 2026.10.25.1 (llm-translators `docs/EXECUTION.md` and `docs/SHARED.md`: `FEAT_SLURM_NODE` (local / any / a node list) pins jobs to this node of a cluster of several nodes, reported in `executor.node`; threads capped at this node's cores; `FEAT_SLURM_ARGS` options read from its shell-split words; a SLURM that does not answer is asked again (not "no SLURM", not "job gone"); stale servers refuse with `STALE_SERVER` and exit after a deploy; every tool answers within its wait, with CAD estimates and `get_deck`'s meshing in worker processes) |
 | `api.py`, `executor.py`, `mcp_server.py` (before) | 2026.10.22.3 (estimates in validation, llm-translators `docs/EXECUTION.md`: each valid study gets `"estimate": {minutes, procs, mem_mb}` for the router; procs after the size cap, memory as the job's `--mem`, minutes from this machine's timing records when they include meshes within 10× of the study's, else from the mochi measurements, else the time limit, and never above it) |
 | `runner.py`, `executor.py` (before), `study.py` | 2026.10.22.2 (modal studies run single-threaded like buckling, and ask SLURM for 1 CPU: on one of four setup machines CalculiX's threaded eigenvalue step crashed once and then returned 946 Hz for the second of the two equal 835.5 Hz bending modes of `cantilever_modal`) |
 | `runner.py` (before) | 2026.10.22.1 (a threaded run that dies with no error of its own is rerun once single-threaded and reported in `solver_crashes` and the warnings; a failure names the exit code or signal) |

@@ -1,5 +1,5 @@
 """deck.py — a study and its mesh as a CalculiX input deck (.inp).
-Version: 2026.10.20.2
+Version: 2026.10.28.1
 
     text, plan = write(name, study, mesh)
 
@@ -261,8 +261,8 @@ def write(name: str, study: dict, mesh: Mesh, extra: dict | None = None) -> tupl
         for s in plan["supports"]:
             L += [f"*NODE PRINT, NSET={plan['sets'][s]['nset']}", "RFL"]
         L += ["*NODE FILE", "NT", "*EL FILE", "HFL"]
-    else:
-        L += ["*NODE FILE", "U"]
+    else:   # modal, buckling: the mode shapes in the .dat too (one displacement block per mode, for pictures)
+        L += ["*NODE PRINT, NSET=NALL", "U", "*NODE FILE", "U"]
     L.append("*END STEP")
     plan["n_nodes"], plan["n_elements"], plan["element"] = len(mesh.nodes), len(mesh.tets), etype
     plan["selection"], plan["selection_warnings"] = selection_report(study, mesh, tags)

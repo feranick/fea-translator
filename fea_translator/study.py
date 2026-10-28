@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.10.22.2
+Version: 2026.10.28.1
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -107,20 +107,17 @@ CONVENTIONS = [
     "force is a total force spread uniformly over the faces' area; pressure acts normal to the faces (positive "
     "into the part); gravity uses the material density.",
     "buckling: the loads are a reference; the results are load factors (critical load = factor x reference load).",
-    "Electrical (DC): electric solves current flow (resistivity; voltage and current terminals; at least one voltage, "
-    "e.g. 0 V ground): current per terminal, resistance (two terminals), power, peak current density. electrostatic "
-    "solves the field in a dielectric (permittivity; voltage electrodes): charge per electrode, capacitance (two "
-    "electrodes), energy, peak field and the margin to dielectric_strength. Faces with no bc are insulated (electric) "
-    "or carry no charge (electrostatic). joule: electric, then the Joule heat (resistivity x current density squared) "
-    "into a thermal solve with the thermal bcs (temperature, convection, ...): the electric and thermal results and "
-    "the Joule heat (= I^2 R). Resistivity is taken at its room-temperature value.",
+    "Electrical (DC): electric: current flow (resistivity; voltage and current terminals, at least one voltage): "
+    "terminal currents, resistance, power, peak current density. electrostatic: a dielectric (permittivity; voltage "
+    "electrodes): charges, capacitance, energy, peak field, margin to dielectric_strength. Faces without a bc are "
+    "insulated / uncharged. joule: electric, then its Joule heat into a thermal solve with the thermal bcs "
+    "(resistivity at room temperature).",
     "stress: true on thermal or joule adds a static solve with the temperatures (thermal expansion alpha from T_ref, "
     "default 20 degrees C) and the mechanical bcs of the study (supports must stop rigid-body motion): stresses, "
     "displacements, reactions, safety factor, as in static.",
-    "Results: static: maximum displacement and von Mises stress (at integration points and at nodes), reaction "
-    "force of each support, mean displacement of each load face and probe, safety factor (with yield), "
-    "equilibrium check. modal: frequencies in Hz. buckling: load factors. thermal: temperature range, heat "
-    "flow through each temperature boundary, heat balance.",
+    "Results: static: peak displacement and von Mises (integration points and nodes), reactions, face and probe "
+    "displacements, safety factor, equilibrium; modal: Hz; buckling: load factors; thermal: temperatures, heat "
+    "flows, heat balance.",
     "mesh.size is the element size in mm (default: 1/20 of the part's bounding-box diagonal); order 2 "
     "(10-node tetrahedra, default) is accurate for bending and curved faces; refine adds finer spheres "
     "{at, r, size} at stress concentrations. Rerun with a smaller size to check convergence (converge: true does it).",
@@ -139,6 +136,10 @@ EXAMPLE = {"bracket_static": {
     "bcs": [{"kind": "fixed", "name": "wall", "faces": {"nx": -1}},
             {"kind": "force", "name": "load", "faces": {"cyl_r": 4, "side": "inner"}, "fz": -200}],
     "probes": [{"name": "tip", "faces": {"nx": 1}}]}}
+
+
+FIELD_NAMES = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal", "safety_factor", "temperature",
+               "heat_flux", "potential", "current_density", "e_field")
 
 
 def study_format() -> dict:
@@ -160,7 +161,10 @@ def study_format() -> dict:
                            "mesh": "{size, order (1|2), refine: [{at, r, size}]}", "bcs": "list of boundary conditions",
                            "probes": "[{name, faces}]: mean and largest displacement (or temperature) there",
                            "expect": "[{quantity, value, tol}]", "converge": "true: rerun at 0.6 x size and report the change",
-                           "equation_solver": "auto (iterative above 150k nodes for static and thermal) | direct | iterative",
+                           "equation_solver": "auto (iterative above 50k nodes for static and thermal) | direct | iterative",
+                           "images": "true (per analysis) or [{name, field | mode: n | setup: true, surface: part|<bc>, deformed: "
+                                     "true|scale, view: [elev, azim], clim: [lo, hi]|full|robust, quality: high (VTK)|basic, slice: "
+                                     "{axis, at}}]; fields: " + " ".join(FIELD_NAMES) + "; PNGs: get_image(path)",
                            "stress_band": "mm: *_off_bc peaks leave out material this close to supports and loads (default: 2 element sizes, "
                                           "the same on the converge mesh); widen it if peak_von_mises_off_bc does not converge"},
             "material_keys": MATERIAL_KEYS, "materials": MATERIALS, "bc_kinds": bcs, "selectors": SELECTOR_DOC,
@@ -453,8 +457,11 @@ def validate_study(st: dict) -> dict:
         errors.append("equation_solver: auto, direct or iterative")
     if "stress_band" in st and (not _num(st["stress_band"]) or st["stress_band"] < 0):
         errors.append("stress_band: a distance in mm (>= 0)")
+    if "images" in st:
+        from .render import image_errors
+        errors += image_errors(st["images"], st)
     extra = set(st) - {"part", "material", "analysis", "modes", "mesh", "bcs", "probes", "expect", "converge", "notes",
-                       "equation_solver", "stress_band", "stress", "T_ref", "procs", "queue", "run"}
+                       "equation_solver", "stress_band", "stress", "T_ref", "procs", "queue", "run", "images"}
     if extra:
         warnings.append(f"unknown study keys ignored: {sorted(extra)}")
     return {"ok": not errors, "errors": errors, "warnings": warnings}
