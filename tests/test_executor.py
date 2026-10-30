@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.10.25.1
+Version: 2026.10.30.1
 """
 import json
 import os
@@ -38,7 +38,7 @@ def _bar(**kw):
 def test_routing_and_job_script(slurm, monkeypatch):
     assert executor.use_slurm({"queue": True}, 0.1) and not executor.use_slurm({"queue": False}, 99)
     assert executor.use_slurm({}, None)                  # no estimate: SLURM
-    assert not executor.use_slurm({}, 1.0) and executor.use_slurm({}, 6.0)   # FEAT_SLURM_MIN_MINUTES 5
+    assert not executor.use_slurm({}, 0.5) and executor.use_slurm({}, 1.5)   # FEAT_SLURM_MIN_MINUTES 1
     monkeypatch.setenv("FEAT_EXECUTOR", "local")
     assert not executor.use_slurm({"queue": True}, None)  # local always wins
     monkeypatch.setenv("FEAT_EXECUTOR", "slurm")
@@ -52,7 +52,7 @@ def test_routing_and_job_script(slurm, monkeypatch):
     # time limit: every solve's timeout + 10 min (converge doubles the solves)
     assert executor.time_limit_min({"analysis": "static", "converge": True}) == 2 * 15 + 10
     st = api.tool_status()["executor"]
-    assert st["kind"] == "slurm" and st["sbatch"].endswith("sbatch") and st["min_minutes"] == 5 and st["procs"] == 6
+    assert st["kind"] == "slurm" and st["sbatch"].endswith("sbatch") and st["min_minutes"] == 1 and st["procs"] == 6
 
 
 def test_estimate_from_timing_records(slurm):
@@ -480,3 +480,85 @@ def test_part_size_in_a_call_does_not_wait_for_cad(slurm):
         time.sleep(0.2)
     assert abs(executor._VOLUMES[key][0] - 6000) < 1e-6
     assert executor.estimate_nodes(st) == int(12 * 6000 / 125)
+
+
+
+# ---- 2026.10.30.1: cancel in the local pool; routing by the size-scaled estimate ---------------------------
+
+def _hanging_ccx(tmp_path, monkeypatch):
+    """A fake ccx that never finishes and starts a child of its own: both pids go to $FAKE_PIDS."""
+    pids = tmp_path / "pids"
+    fake = tmp_path / "ccx"
+    fake.write_text('#!/bin/bash\necho $$ >> "$FAKE_PIDS"\nsleep 120 &\necho $! >> "$FAKE_PIDS"\nwait\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("FEAT_CCX", str(fake))
+    monkeypatch.setenv("FAKE_PIDS", str(pids))
+    return pids
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
+    except OSError:
+        return True
+
+
+def test_the_cancel_flag_stops_calculix_and_its_children(tmp_path, monkeypatch):
+    import threading
+    from fea_translator.runner import run_study
+    pids = _hanging_ccx(tmp_path, monkeypatch)
+    out = {}
+    th = threading.Thread(target=lambda: out.update(run_study("bar", _bar(), tmp_path / "s", "ccx", 300)))
+    th.start()
+    t_end = time.time() + 30
+    while time.time() < t_end and not (pids.is_file() and len(pids.read_text().split()) >= 2):
+        time.sleep(0.1)
+    (tmp_path / "s" / "cancel").write_text("now")
+    t0 = time.time()
+    th.join(30)
+    assert out["state"] == "cancelled" and "while CalculiX ran" in out["why"] and time.time() - t0 < 10
+    time.sleep(0.3)
+    assert not any(_alive(int(x)) for x in pids.read_text().split())        # the whole process group
+    assert json.loads((tmp_path / "s" / "bar.json").read_text())["state"] == "cancelled"
+    r = run_study("bar", _bar(), tmp_path / "s", "ccx", 300)                   # the flag is still there
+    assert r["state"] == "cancelled" and "before it started" in r["why"]
+
+
+def test_cancel_stops_studies_in_the_local_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv("FEAT_OUT", str(tmp_path / "out"))
+    pids = _hanging_ccx(tmp_path, monkeypatch)
+    pool = api._Pool()                                  # workers that see the fake ccx
+    monkeypatch.setattr(api, "_POOL", pool)
+    try:
+        r = api.run({"a": _bar(), "b": _bar()}, "ccx", wait=0)
+        t_end = time.time() + 60
+        while time.time() < t_end and not (pids.is_file() and len(pids.read_text().split()) >= 4):
+            time.sleep(0.2)
+        c = api.cancel(r["request"], ["a"])            # one of two studies running side by side
+        assert c["states"]["a"] == "cancelled" and c["cancelled_jobs"] == []
+        assert api.status(r["request"])["pending"] == ["b"]          # the other goes on
+        c = api.cancel(r["request"])
+        assert c["states"] == {"a": "cancelled", "b": "cancelled"} and c["already_finished"] == ["a"]
+        time.sleep(0.5)
+        assert not any(_alive(int(x)) for x in pids.read_text().split())
+    finally:
+        if pool.pool is not None:
+            pool.pool.terminate()
+
+
+def test_routing_follows_the_size_scaled_estimate(slurm):
+    """FEAT_SLURM_MIN_MINUTES 1 by default: short studies (the benchmarks' small meshes) stay local, longer ones and
+    those whose size is unknown become SLURM jobs (easier to cancel; they run on whatever happens to the server)."""
+    small = _bar()
+    big = {"analysis": "static", "material": "steel", "part": {"box": [100, 10, 10], "divisions": [80, 16, 16]},
+           "equation_solver": "direct",
+           "bcs": [{"kind": "fixed", "name": "w", "faces": {"nx": -1}}, {"kind": "force", "name": "t", "faces": {"nx": 1}, "fz": -1}]}
+    assert api._route_minutes(small, "ccx") < 1 and api._route_minutes(big, "ccx") > 1
+    assert not executor.use_slurm(small, api._route_minutes(small, "ccx"))
+    assert executor.use_slurm(big, api._route_minutes(big, "ccx"))
+    unknown = dict(small, part={"goal": {"features": []}})
+    assert executor.use_slurm(unknown, api._route_minutes(unknown, "ccx"))

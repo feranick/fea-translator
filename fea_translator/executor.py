@@ -1,7 +1,7 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.25.1
+Version: 2026.10.30.1
 
-Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (5): studies whose
+Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (1): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments, split as a shell
 does (a --mem there wins over FEAT_SLURM_MEM, a --nodelist/-w over FEAT_SLURM_NODE); FEAT_SLURM_NODE local
 (default: --nodelist=<this node> when the cluster has several nodes) | any | a node list;
@@ -54,9 +54,9 @@ def kind() -> str:
 
 def min_minutes() -> float:
     try:
-        return float(os.environ.get("FEAT_SLURM_MIN_MINUTES", "5"))
+        return float(os.environ.get("FEAT_SLURM_MIN_MINUTES", "1"))
     except ValueError:
-        return 5.0
+        return 1.0
 
 
 def default_procs() -> int:
@@ -747,6 +747,8 @@ def job_states(request: Path, names: list[str]) -> dict:
             out[n] = {"state": "done", "job_id": jid}
         else:
             state, why = ended_state(acct.get(jid), request / n / "job.log")
+            if state == "failed" and (request / n / "cancel").exists():
+                state, why = "cancelled", "cancelled with cancel(request) (it left the queue before running)"
             out[n] = {"state": state, "job_id": jid, "why": why}
     return out
 

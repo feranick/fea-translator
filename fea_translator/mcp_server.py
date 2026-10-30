@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.10.28.1
+Version: 2026.10.30.1
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -321,7 +321,8 @@ def render_images(study_folder: str, images: list | bool = True, wait_s: float =
 @server.tool()
 @_tool
 def cancel(request: str, names: list[str] | None = None) -> dict:
-    """Stops a request's studies (or the named ones): their SLURM jobs are cancelled. Returns their states."""
+    """Stops a request's studies (or the named ones), wherever they run: SLURM jobs are cancelled, and studies in a
+    local worker pool (of any server) stop within a second (CalculiX and its threads end). Returns their states."""
     return api.cancel(request, names)
 
 

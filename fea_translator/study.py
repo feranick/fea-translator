@@ -155,7 +155,7 @@ def study_format() -> dict:
                            "T_ref": "thermal, joule with stress: stress-free temperature, degrees C (20)",
                            "procs": "CalculiX threads for this study (default FEAT_PROCS, 1; modal and buckling always 1)",
                            "queue": "true: always a SLURM job; false: always local (with FEAT_EXECUTOR=slurm; "
-                                    "otherwise studies estimated above FEAT_SLURM_MIN_MINUTES go to SLURM)",
+                                    "otherwise studies estimated at FEAT_SLURM_MIN_MINUTES (1) or more go to SLURM)",
                            "run": "{timeout_s, mem ('12G'), procs, queue}: this study's solver time limit, SLURM memory, "
                                   "threads and queue, overriding the machine's defaults within the caps in status",
                            "mesh": "{size, order (1|2), refine: [{at, r, size}]}", "bcs": "list of boundary conditions",

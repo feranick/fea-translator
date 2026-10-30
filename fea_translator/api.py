@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.28.1
+Version: 2026.10.30.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -23,7 +23,7 @@ Studies run in worker processes with a time limit each, or (FEAT_EXECUTOR=slurm,
 long ones as SLURM jobs. Environment: FEAT_OUT (default ~/feat_runs), FEAT_WORKERS (2), FEAT_TIMEOUT
 (seconds per CalculiX solve, 900), FEAT_CCX (path of ccx), FEAT_SOLVER (auto | ccx | ref; auto =
 CalculiX when found, else the reference solver), FEAT_PROCS (CalculiX threads, 1), FEAT_EXECUTOR,
-FEAT_SLURM_MIN_MINUTES (5), FEAT_SLURM_ARGS, FEAT_SLURM_MEM (auto), FEAT_SLURM_NODE (local), FEAT_RENDER
+FEAT_SLURM_MIN_MINUTES (1), FEAT_SLURM_ARGS, FEAT_SLURM_MEM (auto), FEAT_SLURM_NODE (local), FEAT_RENDER
 (matplotlib: no VTK), FEAT_RENDER_TIMEOUT (900 s), FEAT_AUX_WORKERS (2: rendering workers).
 """
 from __future__ import annotations
@@ -495,7 +495,9 @@ def start(studies: dict, solver: str | None = None, prefix: str = "run") -> Path
             invalid[n] = {"ok": False, "why": "invalid study", "errors": v["errors"]}
         else:
             jobs.append({"name": n, "study": st, "folder": str(folder), "solver": s, "out": str(out_root())})
-    slurm = [j["name"] for j in jobs if executor.use_slurm(j["study"], estimate_min(j["study"], s))]
+    # SLURM unless the study is short (its estimate, as validate_studies reports it, below FEAT_SLURM_MIN_MINUTES):
+    # a SLURM job can be cancelled and runs on, whatever happens to this server
+    slurm = [j["name"] for j in jobs if executor.use_slurm(j["study"], _route_minutes(j["study"], s))]
     (folder / "request.json").write_text(json.dumps({"names": [j["name"] for j in jobs], "invalid": invalid,
                                                      "solver": s, "started": time.time(), "slurm": slurm,
                                                      "executor": executor.kind(),
@@ -509,6 +511,14 @@ def start(studies: dict, solver: str | None = None, prefix: str = "run") -> Path
     if local:
         _POOL.submit(folder, local)
     return folder
+
+
+def _route_minutes(study: dict, solver: str) -> float | None:
+    """The minutes routing goes by: estimate()'s (size-scaled; the time limit when the size is unknown)."""
+    try:
+        return float(estimate(study, solver)["minutes"])
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def estimate_min(study: dict, solver: str) -> float | None:
@@ -601,55 +611,52 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
 
 
 def cancel(request: str, names: list[str] | None = None) -> dict:
-    """Stops a request's studies (or the named ones): scancel for SLURM jobs; a local study only if
-    this server process runs it. Returns their states."""
+    """Stops a request's studies (or the named ones), wherever they run: a cancel flag in each unfinished study's
+    folder, which the runner checks while CalculiX runs (it ends CalculiX's process group within a second) and
+    before meshing and each solve, in any process (the local pool of this or another server, a SLURM job); and
+    scancel for SLURM jobs, queued or running. A study not started yet ends as cancelled when it would start.
+    Returns their states (after waiting up to 10 s for them to stop)."""
     folder = Path(request).expanduser()
     try:
         meta = json.loads((folder / "request.json").read_text())
     except (OSError, json.JSONDecodeError):
         return {"error": f"no request {folder}"}
     want = list(names) if names else list(meta.get("names", []))
-    slurm = [n for n in want if n in meta.get("slurm", [])]
+    unknown = [n for n in want if n not in meta.get("names", [])]
+    if unknown:
+        return {"error": f"no studies {unknown} in this request ({meta.get('names', [])})"}
+    todo = [n for n in want if not (folder / n / f"{n}.json").is_file()]
+    for n in todo:
+        (folder / n).mkdir(parents=True, exist_ok=True)
+        (folder / n / "cancel").write_text(str(time.time()))
+    slurm = [n for n in todo if n in meta.get("slurm", [])]
     ids = []
     for n in slurm:
         try:
-            if not (folder / n / f"{n}.json").is_file():
-                ids.append(json.loads((folder / n / "job.json").read_text())["job_id"])
+            ids.append(json.loads((folder / n / "job.json").read_text())["job_id"])
         except (OSError, json.JSONDecodeError, KeyError):
             pass
     err = executor.scancel(ids)
-    out = {"cancelled_jobs": ids}
+    out = {"request": str(folder), "cancelled_jobs": ids, "already_finished": [n for n in want if n not in todo]}
     if err:
         out["error"] = err
-    local = [n for n in want if n not in slurm]
-    if local:
-        handles = _POOL.jobs.get(str(folder), {})
-        running = [n for n in local if n in handles and not handles[n].ready()]
-        others = [h for f, hs in _POOL.jobs.items() for n, h in hs.items()
-                  if not h.ready() and not (f == str(folder) and n in running)]
-        if running and not others and _POOL.pool is not None:   # the pool runs only these: stop it
-            _POOL.pool.terminate()
-            _POOL.pool = None
-            for n in running:
-                (folder / n).mkdir(parents=True, exist_ok=True)
-                (folder / n / f"{n}.json").write_text(json.dumps({"ok": False, "state": "cancelled",
-                                                                  "why": "cancelled (local worker pool stopped)"}))
-            out["cancelled_local"] = running
-        elif running:
-            out["note"] = ("local studies run in this server's worker pool together with other studies; they cannot "
-                           "be stopped alone and end at their time limit: " + ", ".join(running))
-        elif any(n not in handles for n in local if not (folder / n / f"{n}.json").is_file()):
-            out["note"] = "local studies of this request are not run by this server process; they cannot be cancelled here"
-    t_end = _until(10)   # give SLURM a moment to end the jobs
-    while ids and time.time() < t_end:
-        q = executor.squeue(ids)
-        if q is not None and not q:
+    local = [n for n in todo if n not in slurm]
+    here = _POOL.jobs.get(str(folder), {})
+    t_end = _until(10)                       # give CalculiX and SLURM a moment to stop
+    while time.time() < t_end:
+        q = executor.squeue(ids) if ids else {}
+        if (q is not None and not q) and all((folder / n / f"{n}.json").is_file() or (n in here and here[n].ready())
+                                             or n not in here for n in local):
             break
-        time.sleep(1)
+        time.sleep(0.5)
     st = _collect(folder)
     out["states"] = {n: (st["progress"][n]["state"] if n in st.get("pending", []) else
                          st["studies"].get(n, {}).get("state", "done" if st["studies"].get(n, {}).get("ok") else "failed"))
                      for n in want}
+    elsewhere = [n for n in local if n not in here and n in st.get("pending", [])]
+    if elsewhere:
+        out["note"] = ("local studies not run by this server process: their cancel flag stops them within a second "
+                       "in the process that runs them (if one does): " + ", ".join(elsewhere))
     return out
 
 

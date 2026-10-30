@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.28.2
+Version: 2026.10.30.1
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -71,9 +71,48 @@ def _exit_text(code: int) -> str:
     return f"exit code {code}"
 
 
+class Cancelled(Exception):
+    """cancel(request) asked this study to stop: <study folder>/cancel exists."""
+
+
+CANCEL: dict = {"file": None}   # the running study's cancel flag (run_study sets it; any process may create it)
+
+
+def cancel_requested() -> bool:
+    f = CANCEL["file"]
+    return f is not None and Path(f).exists()
+
+
+def check_cancel() -> None:
+    """Between the steps of a study (before meshing, before each solve)."""
+    if cancel_requested():
+        raise Cancelled("cancelled with cancel(request)")
+
+
+def _kill_group(p: subprocess.Popen) -> None:
+    """Ends the child and everything it started (its own process group: CalculiX and its threads)."""
+    import signal
+    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(p.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            break
+        try:
+            p.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        p.kill()
+        p.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _wait_rss(p: subprocess.Popen, timeout: float) -> int:
-    """Waits for the child (killing it after `timeout` s) and records its peak resident memory; returns
-    its exit code. os.wait4 reports the child's own peak, even in a process that runs many studies."""
+    """Waits for the child (killing it after `timeout` s, or when the study's cancel flag appears) and records
+    its peak resident memory; returns its exit code. os.wait4 reports the child's own peak, even in a process
+    that runs many studies."""
     t_end = time.time() + timeout
     while True:
         try:
@@ -86,9 +125,11 @@ def _wait_rss(p: subprocess.Popen, timeout: float) -> int:
             mb = ru.ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024)
             PEAK["rss_mb"] = max(PEAK["rss_mb"], mb)
             return p.returncode
+        if cancel_requested():
+            _kill_group(p)
+            raise Cancelled("cancelled with cancel(request) while CalculiX ran")
         if time.time() > t_end:
-            p.kill()
-            p.wait()
+            _kill_group(p)
             raise subprocess.TimeoutExpired(p.args, timeout)
         time.sleep(0.2)
 
@@ -119,7 +160,8 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
         env[k] = "1"
     log_path = inp.parent / f"{inp.stem}.log"
     with open(log_path, "w") as fh:
-        p = subprocess.Popen([exe, "-i", inp.stem], cwd=inp.parent, stdout=fh, stderr=subprocess.STDOUT, env=env)
+        p = subprocess.Popen([exe, "-i", inp.stem], cwd=inp.parent, stdout=fh, stderr=subprocess.STDOUT, env=env,
+                             start_new_session=True)   # its own process group: a cancel or timeout ends all of it
         code = _wait_rss(p, timeout)    # waits with wait4, which also gives the child's peak memory
     log = log_path.read_text(errors="replace")
     PEAK["threads"] = max(PEAK["threads"], int(env.get("OMP_NUM_THREADS", "1")))
@@ -644,6 +686,7 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     fine = size_factor != 1.0
     PEAK.update(rss_mb=0.0, threads=0)
     CRASHES.clear()
+    check_cancel()
     if progress:
         progress.stage("mesh_fine" if fine else "mesh")
     t0 = time.perf_counter()
@@ -665,6 +708,7 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
 
     def run(sname, st, extra=None):
         """One solve, evaluated; rerun once fully single-threaded if its balance check is off."""
+        check_cancel()
         plan, dat, frd, inp = _solve(sname, st, mesh, folder, solver, timeout, extra)
         r_ = evaluate(st, mesh, plan, dat, frd, band)
         if solver == "ccx" and _suspect(r_, plan):
@@ -805,7 +849,10 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     prog = Progress(folder, study, solver, timeout)
+    CANCEL["file"] = folder / "cancel"
     try:
+        if cancel_requested():
+            raise Cancelled("cancelled with cancel(request) before it started")
         res = solve_once(name, study, folder, solver, timeout, progress=prog)
         res["ok"] = True
         if study.get("converge"):
@@ -890,10 +937,14 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
         if warn:
             res["warnings"] = warn
         res["passed"] = all(c["pass"] for c in res["checks"]) if res["checks"] else None
+    except Cancelled as exc:
+        res = {"ok": False, "state": "cancelled", "why": str(exc)}
     except (MeshError, SolverError, subprocess.TimeoutExpired) as exc:
         res = {"ok": False, "why": type(exc).__name__, "error": str(exc)[:2000]}
     except Exception as exc:  # noqa: BLE001
         res = {"ok": False, "why": type(exc).__name__, "error": str(exc)[:2000]}
+    finally:
+        CANCEL["file"] = None
     res["translator"] = __version__
     res["solver"] = solver
     res["execution"] = {**(res.get("execution") or {}), "limits": limits(study, timeout)}
