@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.10.30.1
+Version: 2026.11.01.1
 """
 import json
 import os
@@ -562,3 +562,18 @@ def test_routing_follows_the_size_scaled_estimate(slurm):
     assert executor.use_slurm(big, api._route_minutes(big, "ccx"))
     unknown = dict(small, part={"goal": {"features": []}})
     assert executor.use_slurm(unknown, api._route_minutes(unknown, "ccx"))
+
+
+def test_clock_labels_past_and_future_days():
+    """jobs() and the finish times: a start on an earlier day is not '(tomorrow)' (it read '12:52 (tomorrow)' for a
+    run of 31 October); across New Year too."""
+    import datetime as dt
+    now = dt.datetime(2026, 11, 1, 10, 0).timestamp()
+    at = lambda *a: dt.datetime(*a).timestamp()  # noqa: E731
+    assert api._clock(at(2026, 11, 1, 12, 52), now) == "12:52"
+    assert api._clock(at(2026, 11, 2, 0, 5), now) == "00:05 (tomorrow)"
+    assert api._clock(at(2026, 10, 31, 12, 52), now) == "12:52 (yesterday)"
+    assert api._clock(at(2026, 10, 29, 12, 52), now) == "2026-10-29 12:52"
+    assert api._clock(at(2026, 11, 4, 8, 0), now) == "2026-11-04 08:00"
+    ny = dt.datetime(2026, 12, 31, 23, 0).timestamp()
+    assert api._clock(at(2027, 1, 1, 1, 0), ny) == "01:00 (tomorrow)" and api._clock(at(2025, 12, 31, 23, 0), ny) == "2025-12-31 23:00"

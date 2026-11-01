@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.10.30.1
+Version: 2026.11.01.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -408,8 +408,14 @@ def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
     return out
 
 
-def _clock(t: float) -> str:
-    return time.strftime("%H:%M", time.localtime(t)) + (" (tomorrow)" if time.localtime(t).tm_yday != time.localtime().tm_yday else "")
+def _clock(t: float, now: float | None = None) -> str:
+    """A local clock time, with its day when it is not today: 'HH:MM', 'HH:MM (tomorrow)', 'HH:MM (yesterday)', or
+    'YYYY-MM-DD HH:MM'. (Before 2026.11.01.1 every time on another day read '(tomorrow)', past start times too.)"""
+    import datetime as dt
+    when = dt.datetime.fromtimestamp(t)
+    days = (when.date() - dt.datetime.fromtimestamp(time.time() if now is None else now).date()).days
+    hm = when.strftime("%H:%M")
+    return {0: hm, 1: f"{hm} (tomorrow)", -1: f"{hm} (yesterday)"}.get(days, when.strftime("%Y-%m-%d %H:%M"))
 
 
 def _slurm_time(s: str | None) -> float | None:
