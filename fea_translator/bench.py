@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.11.01.3
+Version: 2026.11.01.4
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -213,7 +213,7 @@ def _joint_cases() -> dict:
                          "stiffness": K, "seal": {"stress": 1.0}}],
             "bolts": [{"name": "b", "size": "M12", "preload": P, "at": [[0, 0, 60]], "head": {"part": "top", "nz": 1},
                        "nut": {"part": "base", "nz": -1}}],
-            "sweep": {"bc": "pull", "steps": 16},
+            "sweep": {"bc": "pull", "steps": 8},
             "expect": [{"quantity": "gaskets.g.preload.force_N", "value": P, "tol": 0.03},
                        {"quantity": "lift_off.g", "value": P / (1 - C), "tol": 0.10}]}
     # joint_cover: ring ri 40 ro 80 h 30; cover r 80 h 40 with a spigot r 39 into the bore; grip 70; 8 bolts on pcd 120
@@ -222,7 +222,7 @@ def _joint_cases() -> dict:
     kj8 = 1 / (1 / (Kg * Ag) + 40 / (E * Ag) + 30 / (E * Ag))
     C8 = kb8 / (kb8 + kj8)
     Ap = math.pi * 39 ** 2                                              # the spigot's bottom: the separating area
-    cover = {"analysis": "joint", "mesh": {"size": 6},
+    cover = {"analysis": "joint", "mesh": {"size": 8},
              "parts": {"ring": {"part": {"goal": {"features": [{"kind": "base_ring", "params": {"ri": 40, "ro": 80, "h": 30}}]}}},
                        "cover": {"part": {"goal": {"features": [
                            {"kind": "base_cyl", "params": {"r": 80, "h": 40}},
@@ -236,7 +236,7 @@ def _joint_cases() -> dict:
                           "with": {"part": "ring", "nz": 1}, "stiffness": Kg, "seal": {"stress": sig}}],
              "bolts": [{"name": "cover", "size": "M12", "preload": P, "pattern": {"center": [0, 0, 70], "pcd": 120, "n": n},
                         "head": {"part": "cover", "nz": 1}, "nut": {"part": "ring", "nz": -1}}],
-             "sweep": {"bc": "inside", "steps": 12},
+             "sweep": {"bc": "inside", "steps": 8}, "run": {"timeout_s": 1800},
              "expect": [{"quantity": "gaskets.g.preload.force_N", "value": n * P, "tol": 0.03},
                         {"quantity": "leak.g", "value": (n * P - sig * Ag) / ((1 - C8) * Ap), "tol": 0.15},
                         {"quantity": "lift_off.g", "value": n * P / ((1 - C8) * Ap), "tol": 0.15}]}

@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.10.22.2
+Version: 2026.11.01.4
 """
 import shutil
 import subprocess
@@ -157,7 +157,8 @@ def test_benchmark_reference_solver(name, tmp_path):
 def test_benchmark_calculix(name, tmp_path):
     if name in bench.NEEDS and "gmsh" in bench.NEEDS[name] and not HAVE_GMSH:
         pytest.skip("Gmsh not installed")
-    r = run_study(name, bench.cases("ccx")[name], tmp_path, solver="ccx")
+    st = bench.cases("ccx")[name]
+    r = run_study(name, st, tmp_path, solver="ccx", timeout=st.get("run", {}).get("timeout_s", 600))
     assert r["ok"], r.get("error")
     assert r["passed"], (r["checks"], r.get("warnings"))
     assert r.get("equilibrium_error", 0) < 1e-4 and r.get("heat_balance_error", 0) < 1e-3

@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.01.3
+Version: 2026.11.01.4
 """
 import copy
 import math
@@ -43,6 +43,7 @@ def test_deck_structure(pull):
     assert count("STEP") == 1 + 4 and count("END STEP") == 1 + 4
     assert count("EQUATION") == 6                                   # 3 directions x (head, nut)
     assert up.count("*BOUNDARY, FIXED") == 4 and up.count("*CLOAD, OP=NEW") == 4
+    assert "*EL FILE" not in up and up.count("*NODE PRINT, NSET=N_BOLTENDS") == 5
     assert "PRESSURE-OVERCLOSURE=LINEAR" in up and "*FRICTION" in up and "*CONTACT FILE" in up
     assert [s["factor"] for s in plan["steps"]] == [0.0, 0.25, 0.5, 0.75, 1.0]
     b = plan["bolts"][0]
@@ -136,12 +137,17 @@ def _frd(steps):
     return "\n".join(out) + "\n"
 
 
-def _dat(nodes, forces):
-    """The pretension nodes' reactions per step: forces = [[f per node] per step]."""
+def _dat(plan, forces):
+    """The bolt ends' displacements per step that give these bolt forces: forces = [[f per bolt] per step]."""
     out = []
+    bolts = [(rec, b) for rec in plan["bolts"] for b in rec["bolts"]]
     for k, fs in enumerate(forces, start=1):
-        out += ["", f" forces (fx,fy,fz) for set N_PRETENSION and time  {k:.7E}", ""]
-        out += [f"{n:10d} {-f:13.6E}  0.000000E+00  0.000000E+00" for n, f in zip(nodes, fs)]
+        out += ["", f" displacements (vx,vy,vz) for set N_BOLTENDS and time  {k:.7E}", ""]
+        for (rec, b), f in zip(bolts, fs):
+            a = np.asarray(rec["axis"], float)
+            u2 = 0.01 * np.ones(3) + a * (f - rec["preload_N"]) / b["k_N_mm"]
+            for n, u in zip(b["ends"], (0.01 * np.ones(3), u2)):
+                out.append(f"{n:10d}" + "".join(f" {x:13.6E}" for x in u))
     return "\n".join(out) + "\n"
 
 
@@ -166,7 +172,7 @@ def test_evaluate_lift_off_on_a_full_face_gasket(pull):
     stress = [max(0.0, 20000 / 3600 * (1 - f / 60000)) for f in loads]
     frd = _frd([{n: s for n in nodes} for s in stress])
     bolt = [[20000.0]] + [[20000 + 0.2 * f] for f in loads[1:]]
-    res = joint.evaluate(st, parts, plan, _dat(plan["pret_nodes"], bolt), frd)
+    res = joint.evaluate(st, parts, plan, _dat(plan, bolt), frd)
     assert res["gaskets"]["g"]["preload"]["force_N"] == pytest.approx(20000, rel=1e-6)
     assert res["preload_balance_error"] < 1e-5
     assert res["lift_off"]["g"] == pytest.approx(60000, rel=1e-6)
@@ -184,7 +190,7 @@ def test_evaluate_not_reached(pull):
     tets = np.concatenate([p["mesh"].tets + p["n0"] for p in parts])
     _, area, _ = joint.gasket_graph(X, tets, [tuple(f) for f in g["slave_faces"]])
     frd = _frd([{n: 5.0 - k for n in area} for k in range(5)])
-    res = joint.evaluate(st, parts, plan, _dat(plan["pret_nodes"], [[20000.0]] * 5), frd)
+    res = joint.evaluate(st, parts, plan, _dat(plan, [[20000.0]] * 5), frd)
     assert res["lift_off"]["g"] == {"above": 80000.0}
 
 
