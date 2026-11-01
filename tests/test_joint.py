@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.01.4
+Version: 2026.11.01.5
 """
 import copy
 import math
@@ -39,9 +39,15 @@ def test_deck_structure(pull):
     st, parts, text, plan = pull
     up = text.upper()
     count = lambda k: len(re.findall(rf"^\*{k}\b", up, re.M))    # noqa: E731
-    assert count("CONTACT PAIR") == 1 and count("PRE-TENSION SECTION") == 1 and count("BEAM SECTION") == 1
+    assert count("CONTACT PAIR") == 1 and count("PRE-TENSION SECTION") == 0 and count("SPRING") == 1
+    assert "TYPE=SPRINGA" in up and "B31" not in up
     assert count("STEP") == 1 + 4 and count("END STEP") == 1 + 4
-    assert count("EQUATION") == 6                                   # 3 directions x (head, nut)
+    assert count("EQUATION") == 9                                   # 3 directions x (head, nut, the cut)
+    b0 = plan["bolts"][0]["bolts"][0]
+    nc, n2, npt = b0["ends"][0], b0["ends"][1], b0["pret_node"]
+    cut = [ln for ln in text.splitlines() if ln.startswith(f"{nc}, ") and len(ln.split(",")) >= 6]
+    assert cut == [f"{nc}, 1, 1, {nc - 2}, 1, -1", f"{nc}, 2, 1, {nc - 2}, 2, -1", f"{nc}, 3, 1, {nc - 2}, 3, -1, {npt}, 1, -1"]
+    assert b0["k_N_mm"] == pytest.approx(210000 * 84.266 / 60, rel=1e-4)
     assert up.count("*BOUNDARY, FIXED") == 4 and up.count("*CLOAD, OP=NEW") == 4
     assert "*EL FILE" not in up and up.count("*NODE PRINT, NSET=N_BOLTENDS") == 5
     assert "PRESSURE-OVERCLOSURE=LINEAR" in up and "*FRICTION" in up and "*CONTACT FILE" in up
@@ -138,14 +144,14 @@ def _frd(steps):
 
 
 def _dat(plan, forces):
-    """The bolt ends' displacements per step that give these bolt forces: forces = [[f per bolt] per step]."""
+    """The springs' end displacements per step that give these bolt forces: forces = [[f per bolt] per step]."""
     out = []
     bolts = [(rec, b) for rec in plan["bolts"] for b in rec["bolts"]]
     for k, fs in enumerate(forces, start=1):
         out += ["", f" displacements (vx,vy,vz) for set N_BOLTENDS and time  {k:.7E}", ""]
         for (rec, b), f in zip(bolts, fs):
             a = np.asarray(rec["axis"], float)
-            u2 = 0.01 * np.ones(3) + a * (f - rec["preload_N"]) / b["k_N_mm"]
+            u2 = 0.01 * np.ones(3) + a * f / b["k_N_mm"]
             for n, u in zip(b["ends"], (0.01 * np.ones(3), u2)):
                 out.append(f"{n:10d}" + "".join(f" {x:13.6E}" for x in u))
     return "\n".join(out) + "\n"
@@ -175,6 +181,7 @@ def test_evaluate_lift_off_on_a_full_face_gasket(pull):
     res = joint.evaluate(st, parts, plan, _dat(plan, bolt), frd)
     assert res["gaskets"]["g"]["preload"]["force_N"] == pytest.approx(20000, rel=1e-6)
     assert res["preload_balance_error"] < 1e-5
+    assert res["bolt_preload_error"] < 1e-5
     assert res["lift_off"]["g"] == pytest.approx(60000, rel=1e-6)
     assert res["leak"]["g"] is None                                  # one edge: nothing to leak from
     assert any("one edge only" in w for w in res["warnings"])

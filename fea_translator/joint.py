@@ -1,20 +1,21 @@
 """joint.py — bolted, gasketed assemblies: several parts in contact, bolt pretension, a gasket law, and the internal
 pressure stepped up to find where the joint leaks and where it lifts off (analysis "joint", CalculiX only).
-Version: 2026.11.01.4
+Version: 2026.11.01.5
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
     res = evaluate(study, parts, plan, dat_text, frd_text)   bolt forces, gasket stresses, leak and lift-off pressures
     errors, warnings = validate(study)
 
-Bolts are connectors (no bolt geometry): each bolt is one linear beam (B31, circular section of the thread's tensile
-stress area) from the head's bearing face to the nut's bearing face or to the engaged thread of a tapped hole,
-pretensioned with *PRE-TENSION SECTION (ELEMENT=, its reference node takes the preload as a *CLOAD in the first
-step, and is then held, *BOUNDARY FIXED, so the bolt force follows the joint). The bolt force is the preload plus
-the beam's axial stiffness times its stretch since the preload step (CalculiX reports no reaction at that node). Each beam end is tied to the mean
-displacement of its bearing nodes (an annulus between the hole and the washer around the bolt axis, or the bore
-over the thread depth) by one *EQUATION per direction; the beam's end rotations are held, so the bolt has its
-bending and shear stiffness as well.
+Bolts are connectors (no bolt geometry): each bolt is a spring (SPRINGA) of the thread's tensile stress area over
+its grip, k = E A_s / grip, from the head's bearing face to the nut's bearing face or to the engaged thread of a
+tapped hole. Each end follows the mean displacement of its bearing nodes (an annulus between the hole and the washer
+around the axis, or the bore over the thread depth), one *EQUATION per direction. The preload acts across a cut at
+the head: u_C = u_B1 - u_PT * axis, where the reference node PT takes the preload as a *CLOAD in the first step and
+is then held (*BOUNDARY, FIXED), so the bolt force follows the joint. (CalculiX's *PRE-TENSION SECTION on a beam
+element deletes the beam and leaves a rigid link: the bolt would not stretch.) The bolt force is the spring's
+stiffness times its stretch; at the preload it must equal the preload (bolt_preload_error). Bolts carry no shear
+or bending: friction at the gasket holds the parts sideways.
 
 The gasket is the contact between the two flange faces (face-to-face penalty contact, TYPE=SURFACE TO SURFACE, as
 CalculiX recommends with 10-node tetrahedra): its compression curve (closure mm, stress MPa) becomes the tabular
@@ -359,51 +360,46 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
                                 "area": sum(p["mesh"].area_of(tg) for p, tg in slave)})
         plan["selection"][f"gasket {g['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in slave for t in tg]
         plan["selection"][f"gasket {g['name']} (with)"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in master for t in tg]
-    # bolts: a pretensioned B31 beam per bolt, tied to its bearing nodes
-    beams, eqs, rot, pret, bolt_mat = [], [], [], [], []
+    # bolts: a spring (SPRINGA, k = E A_s / grip) from a cut node C at the head to the nut, with the pretension as
+    # an equation across the cut: u_C = u_B1 - u_PT * axis (CalculiX's own *PRE-TENSION SECTION on a beam deletes the
+    # beam and leaves a rigid link: the bolt would have no stretch). B1 and B2 follow their bearing nodes' mean.
+    springs, eqs, pret = [], [], []
     for gi, b in enumerate(study.get("bolts", [])):
         bn = _name(b["name"])
         sz = bolt_size(b)
         P = preload_N(b)
         mat = to_deck_units(material_of({"material": b.get("material", "steel")}))
-        bolt_mat += [f"*MATERIAL, NAME=MB_{bn}", "*ELASTIC", f"{_g(mat['E'])}, {_g(mat['nu'])}"]
         geo = bolt_geometry(parts, b)
         rec = {"name": b["name"], "size": b["size"], "preload_N": P, "As": sz["As"], "bolts": []}
-        elems = []
         for bg in geo:
-            n1, n2, npt = n_next, n_next + 1, n_next + 2
-            n_next += 3
-            L += ["*NODE"] + [f"{n}, {_g(q[0])}, {_g(q[1])}, {_g(q[2])}" for n, q in ((n1, bg["B1"]), (n2, bg["B2"]))]
-            L += [f"{npt}, {_g(bg['B1'][0])}, {_g(bg['B1'][1])}, {_g(bg['B1'][2])}"]
+            n1, n2, nc, npt = n_next, n_next + 1, n_next + 2, n_next + 3
+            n_next += 4
+            L += ["*NODE"] + [f"{n}, {_g(q[0])}, {_g(q[1])}, {_g(q[2])}" for n, q in
+                              ((n1, bg["B1"]), (n2, bg["B2"]), (nc, bg["B1"]), (npt, bg["B1"]))]
             eid = e_next
             e_next += 1
-            beams.append((eid, n1, n2, bn))
-            elems.append(eid)
+            k = mat["E"] * sz["As"] / bg["grip"]
+            springs.append((eid, nc, n2, bn, k))
             for d in (1, 2, 3):
                 eqs += _equation(int(bg["head"][0]) + 1, [int(q) + 1 for q in bg["head"]], n1, d, held)
                 eqs += _equation(int(bg["nut"][0]) + 1, [int(q) + 1 for q in bg["nut"]], n2, d, held)
-            rot += [f"{n1}, 4, 6", f"{n2}, 4, 6"]
+            for d in (1, 2, 3):   # the cut: u_C - u_B1 + axis_d u_PT = 0
+                terms = [(nc, d, 1.0), (n1, d, -1.0)] + ([(npt, 1, float(bg["axis"][d - 1]))]
+                                                          if abs(bg["axis"][d - 1]) > 1e-12 else [])
+                eqs += ["*EQUATION", str(len(terms)), ", ".join(f"{n}, {dd}, {_g(c)}" for n, dd, c in terms)]
             pret.append((eid, npt, bg["axis"], P))
-            rec["bolts"].append({"k": bg["k"], "element": eid, "pret_node": npt, "ends": [n1, n2],
-                                 "k_N_mm": mat["E"] * sz["As"] / bg["grip"], "B1": np.round(bg["B1"], 4).tolist(),
-                                 "B2": np.round(bg["B2"], 4).tolist(), "grip_mm": round(bg["grip"], 4),
-                                 "head_nodes": len(bg["head"]), "nut_nodes": len(bg["nut"])})
+            rec["bolts"].append({"k": bg["k"], "element": eid, "pret_node": npt, "ends": [nc, n2], "k_N_mm": k,
+                                 "B1": np.round(bg["B1"], 4).tolist(), "B2": np.round(bg["B2"], 4).tolist(),
+                                 "grip_mm": round(bg["grip"], 4), "head_nodes": len(bg["head"]),
+                                 "nut_nodes": len(bg["nut"])})
         rec["elset"], rec["axis"] = f"EB_{bn}", geo[0]["axis"].tolist()
-        rec["k_bolt_N_mm"] = mat["E"] * sz["As"] / float(np.mean([bg["grip"] for bg in geo]))
+        rec["k_bolt_N_mm"] = float(np.mean([q["k_N_mm"] for q in rec["bolts"]]))
         plan["bolts"].append(rec)
-        L.append("*ELEMENT, TYPE=B31, ELSET=" + f"EB_{bn}")
-        L += [f"{e}, {a}, {c}" for e, a, c, nm in beams if nm == bn]
-    L += bolt_mat
-    for rec in plan["bolts"]:
-        bn = _name(rec["name"])
-        r = math.sqrt(rec["As"] / math.pi)
-        n1 = _perp(np.asarray(rec["axis"], float))
-        L += [f"*BEAM SECTION, ELSET=EB_{bn}, MATERIAL=MB_{bn}, SECTION=CIRC", _g(r), ", ".join(_g(c) for c in n1)]
-    for eid, npt, axis, P in pret:
-        L += [f"*PRE-TENSION SECTION, ELEMENT={eid}, NODE={npt}", ", ".join(_g(c) for c in axis)]
+    for eid, nc, n2, bn, k in springs:   # one element set per spring: each has its own stiffness (its grip)
+        L += [f"*ELEMENT, TYPE=SPRINGA, ELSET=ES{eid}", f"{eid}, {nc}, {n2}", f"*SPRING, ELSET=ES{eid}", _g(k)]
     L += eqs
     pnodes = [npt for _, npt, _, _ in pret]
-    ends = [n for _, a, c, _ in beams for n in (a, c)]
+    ends = [n for _, nc, n2, _, _ in springs for n in (nc, n2)]
     L += ["*NSET, NSET=N_PRETENSION"] + _lines(pnodes) + ["*NSET, NSET=N_BOLTENDS"] + _lines(ends)
     plan["pret_nodes"] = pnodes
 
@@ -427,7 +423,7 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
             out += [f"{n + 1}, {k + 1}, {_g(d[n][k] * factor)}" for k in range(3) if d[n][k] != 0]
         return out
     # step 1: the preload (and the loads that do not change)
-    L += ["*STEP, INC=1000", "*STATIC", "0.5, 1., 1e-08, 1.", "*BOUNDARY"] + bnd + rot
+    L += ["*STEP, INC=1000", "*STATIC", "0.5, 1., 1e-08, 1.", "*BOUNDARY"] + bnd
     L += ["*CLOAD"] + [f"{npt}, 1, {_g(P)}" for _, npt, _, P in pret] + cloads(cload_const, 1.0)
     if dload_const:
         L += ["*DLOAD"] + dloads(dload_const, 1.0)
@@ -439,7 +435,7 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         # each step adds 1/n of the load: one increment (CalculiX cuts it back if contact needs it)
         L += ["*STEP, INC=1000", "*STATIC", "1., 1., 1e-08, 1.", "*BOUNDARY, FIXED", "N_PRETENSION, 1, 1"]
         cl = cloads(cload_const, 1.0) + cloads(swept_cload, f)
-        L += ["*CLOAD, OP=NEW"] + (cl or [f"{beams[0][1]}, 1, 0."])
+        L += ["*CLOAD, OP=NEW"] + (cl or [f"{springs[0][2]}, 1, 0."])
         if swept_dload:
             L += ["*DLOAD"] + dloads(swept_dload, f)
         L += outputs() + ["*END STEP"]
@@ -590,8 +586,8 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
     unit = "MPa" if sw.get("kind") == "pressure" else "N"
     res = {"analysis": "joint", "swept": {"bc": sw.get("bc"), "kind": sw.get("kind"), "max": sw.get("max"), "unit": unit},
            "bolts": {}, "gaskets": {}, "steps": [], "leak": {}, "lift_off": {}}
-    # bolt forces: the preload in step 1; then, with the pretension node held, the preload plus the beam's
-    # stiffness times its stretch since step 1 (the change of its ends' distance along the axis)
+    # bolt forces: each spring's stiffness times its stretch (its ends' distance change along the axis); in step 1
+    # it must equal the preload (bolt_preload_error)
     blist = [(rec, b_) for rec in plan["bolts"] for b_ in rec["bolts"]]
     forces = np.full((nsteps, len(blist)), np.nan)
     U = [{int(r[0]): np.asarray(r[1:4], float) for r in blk["rows"] if len(r) >= 4} for blk in ub]
@@ -602,12 +598,16 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
             return None
         return float((U[s][n2] - U[s][n1]) @ np.asarray(rec["axis"], float))
     for i, (rec, b_) in enumerate(blist):
-        forces[0, i] = rec["preload_N"]
-        e0 = stretch(0, rec, b_)
-        for s in range(1, nsteps):
+        for s in range(nsteps):
             e = stretch(s, rec, b_)
-            if e is not None and e0 is not None:
-                forces[s, i] = rec["preload_N"] + b_["k_N_mm"] * (e - e0)
+            if e is not None:
+                forces[s, i] = b_["k_N_mm"] * e
+    pre = [rec["preload_N"] for rec, _ in blist]
+    if blist and np.isfinite(forces[0]).all():
+        err = float(np.max(np.abs(forces[0] - pre) / np.maximum(pre, 1e-9)))
+        res_pre_err = round(err, 6)
+    else:
+        res_pre_err = None
     # gaskets
     graphs = {}
     for g in plan["gaskets"]:
@@ -692,6 +692,10 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
             res.setdefault("warnings", []).append(
                 f"gasket {g['name']}: already below its sealing stress at the preload (ring {pre['ring_MPa']:.4g} MPa "
                 f"< {pre['seal_MPa']:.4g} MPa): more preload, more bolts, or a narrower gasket")
+    res["bolt_preload_error"] = res_pre_err
+    if res_pre_err is not None and res_pre_err > 0.01:
+        res.setdefault("warnings", []).append(
+            f"bolt forces at the preload differ from the preload by {100 * res_pre_err:.3g} %: check the bolt results")
     # checks: the gasket force balances the bolts at the preload (no other load across the joint then)
     tot_b = sum(r["preload_N"] * r["count"] for r in res["bolts"].values())
     tot_g = sum(v.get("preload", {}).get("force_N", 0.0) for v in res["gaskets"].values())
