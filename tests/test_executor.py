@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.11.01.1
+Version: 2026.11.01.2
 """
 import json
 import os
@@ -577,3 +577,15 @@ def test_clock_labels_past_and_future_days():
     assert api._clock(at(2026, 11, 4, 8, 0), now) == "2026-11-04 08:00"
     ny = dt.datetime(2026, 12, 31, 23, 0).timestamp()
     assert api._clock(at(2027, 1, 1, 1, 0), ny) == "01:00 (tomorrow)" and api._clock(at(2025, 12, 31, 23, 0), ny) == "2025-12-31 23:00"
+
+
+
+def test_answers_name_the_version_they_come_from(slurm):
+    """jobs(), cancel and bench_status say which feat version answered (the router reads "translator" from every
+    answer, docs/ROUTER.md), as run_studies and study_status do."""
+    from fea_translator import __version__
+    assert api.jobs()["translator"] == __version__
+    r = api.run({"bar": _bar(queue=False)}, "ref", wait=120)
+    assert r["translator"] == __version__ and api.cancel(r["request"])["translator"] == __version__
+    b = api.bench(["axial_bar"], "ref", wait=120)
+    assert b["translator"] == __version__ and api.bench_status(b["bench"])["translator"] == __version__

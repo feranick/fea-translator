@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.01.1
+Version: 2026.11.01.2
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -613,7 +613,7 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
                 rec.update({k: pr[k] for k in ("stage", "eta_min", "eta_min_max") if k in pr})
             studies[n] = rec
         out.append({"request": str(d), "started": _clock(meta.get("started", d.stat().st_mtime)), "studies": studies})
-    return {"executor": executor.kind(), "requests": out, **executor.queue_summary()}
+    return {"translator": __version__, "executor": executor.kind(), "requests": out, **executor.queue_summary()}
 
 
 def cancel(request: str, names: list[str] | None = None) -> dict:
@@ -643,7 +643,8 @@ def cancel(request: str, names: list[str] | None = None) -> dict:
         except (OSError, json.JSONDecodeError, KeyError):
             pass
     err = executor.scancel(ids)
-    out = {"request": str(folder), "cancelled_jobs": ids, "already_finished": [n for n in want if n not in todo]}
+    out = {"request": str(folder), "translator": __version__, "cancelled_jobs": ids,
+           "already_finished": [n for n in want if n not in todo]}
     if err:
         out["error"] = err
     local = [n for n in todo if n not in slurm]
@@ -756,7 +757,7 @@ def bench_status(bench: str, wait: float = 0.0) -> dict:
     cases = {k: {x: v.get(x) for x in ("ok", "passed", "checks", "error", "why", "state", "seconds", "mesh",
                                      "warnings", "solver_reruns") if x in v}
              for k, v in st.get("studies", {}).items()}
-    out = {"bench": str(folder), "solver": st.get("solver"), "done": st.get("done"),
+    out = {"bench": str(folder), "translator": __version__, "solver": st.get("solver"), "done": st.get("done"),
            "passed": [k for k, v in cases.items() if v.get("passed")],
            "failed": [k for k, v in cases.items() if v.get("passed") is False or v.get("ok") is False],
            "pending": st.get("pending", []), "skipped": meta.get("skipped", {}), "cases": cases}

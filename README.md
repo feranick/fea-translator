@@ -34,7 +34,7 @@ The translator finds `ccx` (or `ccx_2.*`) on the PATH or in `/opt/homebrew/bin`;
 
 ```bash
 feat status                    # versions; ccx and gmsh found?
-pytest -q                      # 104 tests: 82 run anywhere (35 with fake SLURM commands or a fake ccx, 6 of the MCP server, 9 of pictures; two need build123d-translator, one VTK), 21 need ccx (and Gmsh)
+pytest -q                      # 105 tests: 83 run anywhere (36 with fake SLURM commands or a fake ccx, 6 of the MCP server, 9 of pictures; two need build123d-translator, one VTK), 21 need ccx (and Gmsh)
 feat bench                     # every benchmark, pass/fail against closed-form answers
 ```
 
@@ -216,7 +216,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `api.py` | 2026.11.01.1 (times on another day: `jobs()`'s start times and the finish times read `HH:MM (tomorrow)` for every other day, past starts too (`12:52 (tomorrow)` for a run of 31 October); now `HH:MM`, `HH:MM (tomorrow)`, `HH:MM (yesterday)` or `YYYY-MM-DD HH:MM`) |
+| Package, `api.py` | 2026.11.01.2 (`jobs()`, `cancel` and `bench_status` answers carry `"translator": __version__`, as `run_studies` and `study_status` do and as cfdt, lmpt and omct's `jobs()` do: llm-translators' router reads each server's version from its answers) |
+| `api.py` (before) | 2026.11.01.1 (times on another day: `jobs()`'s start times and the finish times read `HH:MM (tomorrow)` for every other day, past starts too (`12:52 (tomorrow)` for a run of 31 October); now `HH:MM`, `HH:MM (tomorrow)`, `HH:MM (yesterday)` or `YYYY-MM-DD HH:MM`) |
 | `runner.py`, `api.py` (before), `executor.py`, `mcp_server.py`, `study.py` | 2026.10.30.1 (cancel stops local studies too: a `cancel` flag in each unfinished study's folder, which the runner checks while CalculiX runs (its own process group: it and its threads end within a second) and before meshing and each solve, in whichever process runs it; studies not started yet end as cancelled when they would start; other studies in the same pool go on. With `FEAT_EXECUTOR=slurm`, studies of 1 minute or more (`FEAT_SLURM_MIN_MINUTES`, before 5) become SLURM jobs, routed by the size-scaled estimate of `validate_studies`) |
 | `runner.py` (before) | 2026.10.28.2 (buckling pictures keep as many mode shapes as the results keep factors: CalculiX printed 4 factors and shapes for `euler_column` where 2 were asked, and the state had 4) |
 | `render.py`, `render_vtk.py` (new), `runner.py`, `study.py`, `api.py`, `cli.py`, `mcp_server.py`, `deck.py`, `refsolver.py` | 2026.10.28.1 (pictures, as cfd-translator 2026.10.28.1: `images` (fields on the deformed part, mode shapes, the setup view, section cuts, the off-BC peak marked), `state.npz` from every run, `render_images` and `get_image` tools, `feat images`; Matplotlib by default, VTK (`render` extra) for `quality: high` in a child process; `render` in `tool_status`; mode shapes in the `.dat` from both solvers; matplotlib a dependency) |
