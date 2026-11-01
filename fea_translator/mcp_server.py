@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.10.30.1
+Version: 2026.11.01.3
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -76,6 +76,9 @@ from a task scheduled after that time). Follow 'next' in the result.
 Check equilibrium_error, warnings and 'selection' (what each
 face selector took), and rerun with converge: true before trusting peak stresses; peaks at supports
 are singular: judge designs on peak_von_mises_off_bc and safety_factor_off_bc.
+Bolted joints: analysis "joint" takes an assembly (parts), gaskets (contact with a closure-stress law and a
+sealing stress), pretensioned bolts, and a pressure or force raised in steps; results give the leak and
+lift-off value per gasket and the bolt forces per step.
 Long studies run as SLURM jobs on the machine (when FEAT_EXECUTOR=slurm): run_studies returns them pending
 with job ids. They do not depend on this conversation. Report the expected finish time and stop; do not poll.
 Later, study_status(request) collects them; jobs() lists recent and active runs (also those started in other

@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.10.18.1
+Version: 2026.11.01.3
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -24,6 +24,12 @@ build123d-translator goals meshed by Gmsh. Cases (E = 210 GPa, nu = 0.3 unless n
   joule_bar       steel bar, 50 mV across, both ends at 20 C: P = V^2 / R, T_max = T0 + q L^2 / 8k (exact)
   thermal_stress_bar  steel bar at a uniform 120 C between two walls: sigma = E alpha dT (exact)
   plate_hole      quarter plate 200x50x2 with a 10 mm hole, net-section Kt = 2 + (1 - d/W)^3 (5 %; Gmsh, CalculiX)
+  joint_pull      two 60x60x30 blocks, a full-face gasket (50 MPa/mm), one M12 through bolt at 20 kN, the top block
+                  pulled off: gasket force at the preload = 20 kN (3 %), lift-off at F = P / (1 - C),
+                  C = k_bolt / (k_bolt + k_joint) (10 %; CalculiX)
+  joint_cover     a 40 mm cover on a flange ring (ri 40, ro 80), annular gasket (500 MPa/mm, seal 5 MPa), 8 x M12 at
+                  20 kN, internal pressure: gasket force = 8 P (3 %), leak and lift-off pressures from the joint diagram
+                  (15 %: the cover bends; Gmsh, CalculiX)
 """
 from __future__ import annotations
 
@@ -176,12 +182,65 @@ def cases(solver: str = "ccx") -> dict:
                                {"kind": "force", "name": "pull", "faces": {"nx": 1}, "fx": 1.0 * W / 2 * t}],
                        "expect": [{"quantity": "max_von_mises_nodal", "value": kt * s_net, "tol": 0.05}]},
     }
+    out.update(_joint_cases())
     # plate_hole: the box is the quarter x in [-100, 100], y in [-25, 25]; the hole is centred on its
     # -X/-Y corner, so the two symmetry planes pass through the hole centre; the peak is at (-100, -20).
     return out
 
 
-NEEDS = {"euler_column": {"ccx"}, "plate_hole": {"ccx", "gmsh"}, "lame_ring": {"gmsh"}, "coax_capacitor": {"gmsh"}}
+NEEDS = {"euler_column": {"ccx"}, "plate_hole": {"ccx", "gmsh"}, "lame_ring": {"gmsh"}, "coax_capacitor": {"gmsh"},
+         "joint_pull": {"ccx"}, "joint_cover": {"ccx", "gmsh"}}
+
+
+def _joint_cases() -> dict:
+    """Bolted, gasketed joints (analysis "joint"; CalculiX only), against the joint diagram: the bolt and the clamped
+    members (gasket and flanges in series) share the external load as C = k_b / (k_b + k_j); the clamp force falls
+    by (1 - C) F, so the joint lifts off at F = n P / (1 - C) and leaks when the gasket stress (clamp force over the
+    gasket area) falls to the sealing stress."""
+    As = math.pi / 4 * (12 - 0.9382 * 1.75) ** 2                      # M12 tensile stress area
+    P = 20000.0
+    # joint_pull: blocks 60 x 60, 30 mm each; bolt grip 60; gasket 50 MPa/mm over 3600 mm2
+    A, K, L = 3600.0, 50.0, 60.0
+    kb = E * As / L
+    kj = 1 / (1 / (K * A) + L / (E * A))
+    C = kb / (kb + kj)
+    pull = {"analysis": "joint",
+            "parts": {"base": {"part": {"box": [60, 60, 30], "origin": [-30, -30, 0], "divisions": [12, 12, 6]}},
+                      "top": {"part": {"box": [60, 60, 30], "origin": [-30, -30, 30], "divisions": [12, 12, 6]}}},
+            "bcs": [{"kind": "fixed", "name": "side", "faces": {"part": "base", "nx": -1}},
+                    {"kind": "force", "name": "pull", "faces": {"part": "top", "nz": 1}, "fz": 80000.0}],
+            "gaskets": [{"name": "g", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
+                         "stiffness": K, "seal": {"stress": 1.0}}],
+            "bolts": [{"name": "b", "size": "M12", "preload": P, "at": [[0, 0, 60]], "head": {"part": "top", "nz": 1},
+                       "nut": {"part": "base", "nz": -1}}],
+            "sweep": {"bc": "pull", "steps": 16},
+            "expect": [{"quantity": "gaskets.g.preload.force_N", "value": P, "tol": 0.03},
+                       {"quantity": "lift_off.g", "value": P / (1 - C), "tol": 0.10}]}
+    # joint_cover: ring ri 40 ro 80 h 30; cover r 80 h 40 with a spigot r 39 into the bore; grip 70; 8 bolts on pcd 120
+    Ag, Kg, Lc, n, sig = math.pi * (80 ** 2 - 40 ** 2), 500.0, 70.0, 8, 5.0
+    kb8 = n * E * As / Lc
+    kj8 = 1 / (1 / (Kg * Ag) + 40 / (E * Ag) + 30 / (E * Ag))
+    C8 = kb8 / (kb8 + kj8)
+    Ap = math.pi * 39 ** 2                                              # the spigot's bottom: the separating area
+    cover = {"analysis": "joint", "mesh": {"size": 6},
+             "parts": {"ring": {"part": {"goal": {"features": [{"kind": "base_ring", "params": {"ri": 40, "ro": 80, "h": 30}}]}}},
+                       "cover": {"part": {"goal": {"features": [
+                           {"kind": "base_cyl", "params": {"r": 80, "h": 40}},
+                           {"kind": "boss_cyl", "params": {"r": 39, "x": 0, "y": 0, "h": 5, "nx": 0, "ny": 0, "nz": -1}}]}},
+                                 "move": [0, 0, 30]}},
+             "bcs": [{"kind": "fixed", "name": "outside", "faces": {"part": "ring", "cyl_r": 80, "side": "outer"}},
+                     {"kind": "pressure", "name": "inside", "p": 60.0,
+                      "faces": [{"part": "cover", "nz": -1, "at": [0, 0, 25]}, {"part": "cover", "cyl_r": 39},
+                                {"part": "ring", "cyl_r": 40, "side": "inner"}]}],
+             "gaskets": [{"name": "g", "faces": {"part": "cover", "nz": -1, "at": [60, 0, 30]},
+                          "with": {"part": "ring", "nz": 1}, "stiffness": Kg, "seal": {"stress": sig}}],
+             "bolts": [{"name": "cover", "size": "M12", "preload": P, "pattern": {"center": [0, 0, 70], "pcd": 120, "n": n},
+                        "head": {"part": "cover", "nz": 1}, "nut": {"part": "ring", "nz": -1}}],
+             "sweep": {"bc": "inside", "steps": 12},
+             "expect": [{"quantity": "gaskets.g.preload.force_N", "value": n * P, "tol": 0.03},
+                        {"quantity": "leak.g", "value": (n * P - sig * Ag) / ((1 - C8) * Ap), "tol": 0.15},
+                        {"quantity": "lift_off.g", "value": n * P / ((1 - C8) * Ap), "tol": 0.15}]}
+    return {"joint_pull": pull, "joint_cover": cover}
 
 
 def run(solver: str = "ccx", names=None, folder: Path | None = None) -> dict:

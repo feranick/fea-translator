@@ -4,7 +4,7 @@ Turns an **FEA study** (one solid part, a material, an analysis, supports and lo
 
 It is the FEA counterpart of [build123d-translator](https://github.com/feranick/build123d-translator): an LLM writes the study (the flexible part), the translator computes everything else (which mesh faces, which nodes, consistent nodal loads, element face numbers, the deck), and a checker confirms the result: closed-form benchmarks, equilibrium and heat balance on every run, expected values, and mesh convergence. Parts are STEP files or build123d-translator goals, so the same face conventions select CAD features and boundary conditions.
 
-Analyses: **linear static** (displacements, von Mises stress, reactions, safety factor), **modal** (natural frequencies), **linear buckling** (load factors), **steady heat transfer** (temperatures, heat flows; with `stress: true`, thermal stresses), **DC electric conduction** (terminal currents, resistance, power, current density), **electrostatics** (charges, capacitance, field, margin to breakdown) and **Joule heating** (electric, then thermal, optionally stresses).
+Analyses: **linear static** (displacements, von Mises stress, reactions, safety factor), **modal** (natural frequencies), **linear buckling** (load factors), **steady heat transfer** (temperatures, heat flows; with `stress: true`, thermal stresses), **DC electric conduction** (terminal currents, resistance, power, current density), **electrostatics** (charges, capacitance, field, margin to breakdown), **Joule heating** (electric, then thermal, optionally stresses) and **bolted joints** (an assembly of parts with gaskets and pretensioned bolts: leak and lift-off pressures).
 
 ## Install
 
@@ -92,6 +92,34 @@ Per study the folder holds `part.step`, `mesh.msh`, `<name>.inp` (the deck; runs
 | thermal or joule with `stress: true` | `stress`: the static results (displacements, von Mises peaks, safety factors, reactions) of the thermal expansion |
 
 Every run also returns `checks` (the `expect` list, pass or fail), `passed`, `warnings` (unbalanced reactions or heat; a result changing by more than 5 % on a finer mesh; a peak at a support or load; a peak that grows on a finer mesh while the displacement has converged, i.e. a singularity; a `cyl_r` that took holes and fillets together), mesh size and counts, times, and the files.
+
+### Joint studies
+
+`"analysis": "joint"` (CalculiX only) models a bolted, gasketed joint: several parts in contact, a gasket law between two flange faces, pretensioned bolts, and one pressure or force raised in steps until the joint leaks and lifts off (a cover's relief pressure).
+
+```json
+{"analysis": "joint", "mesh": {"size": 6},
+ "parts": {"body":  {"part": {"step": "s50_body.step"}, "material": "cast_iron"},
+           "cover": {"part": {"step": "s50_cover.step"}, "material": "steel", "move": [0, 0, 0]}},
+ "bcs": [{"kind": "fixed", "name": "feet", "faces": {"part": "body", "nz": -1}},
+         {"kind": "pressure", "name": "inside", "p": 2.0,
+          "faces": [{"part": "cover", "nz": -1, "at": [0, 0, 5]}, {"part": "body", "cyl_r": 60, "side": "inner"}]}],
+ "gaskets": [{"name": "cover_gasket", "faces": {"part": "cover", "nz": -1, "at": [75, 0, 10]},
+              "with": {"part": "body", "nz": 1, "at": [75, 0, 10]},
+              "curve": [[0.05, 2], [0.1, 8], [0.2, 30], [0.3, 60]], "seal": {"stress": 10, "m": 2}, "friction": 0.2}],
+ "bolts": [{"name": "cover", "size": "M10", "torque": 40, "pattern": {"center": [0, 0, 22], "pcd": 170, "n": 8},
+            "head": {"part": "cover", "nz": 1}, "thread": {"part": "body", "depth": 15}}],
+ "sweep": {"bc": "inside", "steps": 12}}
+```
+
+- **Parts**: `parts` replaces `part`; each has its own material and an optional `move` [dx, dy, dz]; every face selector names its `part`. Parts are meshed separately (same element order) and meet only through gaskets and bolts.
+- **Gaskets**: `faces` is the gasket side (the contact slave), `with` the mating flange face. `curve` [[closure mm, stress MPa], ...] (from the gasket data sheet's loading curve) becomes CalculiX's tabular pressure-overclosure law; or `stiffness` (MPa/mm) for a linear one. Face-to-face penalty contact with friction (0.2). The gasket is modelled as the contact law: its thickness is not meshed, so the flange faces should touch (or be `move`d to touch) in the CAD.
+- **Bolts**: `size` M3-M36 (ISO 898-1 stress area, ISO 273 medium clearance hole, ISO 7089 washer; `hole_d`, `washer_d` override), `preload` N or `torque` N m (P = T / (k d), k 0.2), positions `at` (points on the axes) or `pattern` {center, pcd, n, start_deg}; `head` the bearing face under the head, `nut` the bearing face under the nut, or `thread` {part, depth} for a tapped hole (the bore over the engaged depth). Each bolt is a beam (B31) of the stress area from head to nut, tied to the mean displacement of its bearing annulus, pretensioned in step 1 and then locked, so its force follows the joint.
+- **Steps**: step 1 the preload (with the constant loads), then `sweep.steps` steps raising the swept bc to its value (the last step's).
+- **Leak and lift-off**: at every step the contact pressure at the gasket nodes gives the ring stress (the strongest closed ring of gasket nodes around the pressurized edge: the minimax path from the inner edge, the one nearest `inner_at` or the pressure, to the outer edge). Leak: ring stress below the sealing stress (`seal.stress`, or `m` x p, whichever is larger); lift-off: ring stress 0 (an open path across: a cover acting as a relief valve). Both interpolated between steps; `{"above": max}` when not reached.
+- **Results**: `leak.<gasket>`, `lift_off.<gasket>` (MPa for a pressure sweep, N for a force), `gaskets.<name>` (area, edges, `preload` stresses and force), `bolts.<name>` (preload, stiffness, positions, max force), `steps[]` (load, bolt forces, gasket ring/min/max/mean stress, contact fraction, force, leak, open), `preload_balance_error` (gasket force against the bolt preloads), `selection`.
+- **Not modelled**: the pressure reaching into an opening gasket (leaks slightly earlier), bolt bending stresses, thread stripping, gasket creep relaxation; no `converge`, no pictures yet.
+- **Benchmarks** (joint diagram, C = k_b / (k_b + k_j)): `joint_pull` (two blocks, an M12 bolt, a pull: preload force 3 %, lift-off F = P / (1 - C) 10 %) and `joint_cover` (a cover with a spigot on a ring, 8 M12 bolts, internal pressure: leak and lift-off pressures 15 %).
 
 ## The checker
 
@@ -206,6 +234,7 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 | `fea_translator/runner.py` | One study end to end, checks |
 | `fea_translator/refsolver.py` | Reference solver (static, modal, thermal) |
 | `fea_translator/bench.py` | Benchmark studies with closed-form answers |
+| `fea_translator/joint.py` | Bolted, gasketed assemblies: meshing parts, bolt connectors, gasket contact, the multi-step deck, leak and lift-off |
 | `fea_translator/render.py` | Pictures: fields from the nodal solution, the saved state, validation, defaults, Matplotlib |
 | `fea_translator/render_vtk.py` | Pictures with VTK (PyVista) in a child process; the offscreen probe |
 | `fea_translator/api.py`, `cli.py`, `mcp_server.py` | JSON API, `feat`, `feat-mcp` |
@@ -216,7 +245,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
-| Package, `api.py` | 2026.11.01.2 (`jobs()`, `cancel` and `bench_status` answers carry `"translator": __version__`, as `run_studies` and `study_status` do and as cfdt, lmpt and omct's `jobs()` do: llm-translators' router reads each server's version from its answers) |
+| Package, `joint.py` (new), `runner.py`, `study.py`, `bench.py`, `mcp_server.py` | 2026.11.01.3 (bolted joints: `analysis: joint` with parts in contact, gaskets as a contact law with a sealing stress, pretensioned bolt connectors (nut or tapped thread), a pressure or force raised in steps; leak and lift-off per gasket from the ring stress; benchmarks `joint_pull`, `joint_cover`; CalculiX only) |
+| `api.py` | 2026.11.01.2 (`jobs()`, `cancel` and `bench_status` answers carry `"translator": __version__`, as `run_studies` and `study_status` do and as cfdt, lmpt and omct's `jobs()` do: llm-translators' router reads each server's version from its answers) |
 | `api.py` (before) | 2026.11.01.1 (times on another day: `jobs()`'s start times and the finish times read `HH:MM (tomorrow)` for every other day, past starts too (`12:52 (tomorrow)` for a run of 31 October); now `HH:MM`, `HH:MM (tomorrow)`, `HH:MM (yesterday)` or `YYYY-MM-DD HH:MM`) |
 | `runner.py`, `api.py` (before), `executor.py`, `mcp_server.py`, `study.py` | 2026.10.30.1 (cancel stops local studies too: a `cancel` flag in each unfinished study's folder, which the runner checks while CalculiX runs (its own process group: it and its threads end within a second) and before meshing and each solve, in whichever process runs it; studies not started yet end as cancelled when they would start; other studies in the same pool go on. With `FEAT_EXECUTOR=slurm`, studies of 1 minute or more (`FEAT_SLURM_MIN_MINUTES`, before 5) become SLURM jobs, routed by the size-scaled estimate of `validate_studies`) |
 | `runner.py` (before) | 2026.10.28.2 (buckling pictures keep as many mode shapes as the results keep factors: CalculiX printed 4 factors and shapes for `euler_column` where 2 were asked, and the state had 4) |

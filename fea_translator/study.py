@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.10.28.1
+Version: 2026.11.01.3
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -17,7 +17,7 @@ The deck uses mm, N, s, t (tonne), mW: conversions are in `to_deck_units`.
 """
 from __future__ import annotations
 
-ANALYSES = ("static", "modal", "buckling", "thermal", "electric", "electrostatic", "joule")
+ANALYSES = ("static", "modal", "buckling", "thermal", "electric", "electrostatic", "joule", "joint")
 MECH = ("static", "modal", "buckling", "thermal", "joule")      # analyses that take mechanical bcs (thermal, joule: with stress)
 EPS0 = 8.8541878128e-15  # vacuum permittivity, F/mm
 
@@ -138,6 +138,11 @@ EXAMPLE = {"bracket_static": {
     "probes": [{"name": "tip", "faces": {"nx": 1}}]}}
 
 
+JOINT_DOC = ("analysis joint: parts {name: {part, material, move}} for part; selectors take part. gaskets [{name, "
+             "faces, with, curve [[closure mm, MPa]] | stiffness MPa/mm, seal {stress, m}, friction}]. bolts [{name, "
+             "size M3-M36, preload N | torque N m, at [[x,y,z]] | pattern {center, pcd, n, start_deg}, head, nut | "
+             "thread {part, depth}}]. sweep {bc, steps}: that pressure or force rises in steps. Results: leak, "
+             "lift_off per gasket ({above} if not reached), steps[]. README: Joint studies.")
 FIELD_NAMES = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal", "safety_factor", "temperature",
                "heat_flux", "potential", "current_density", "e_field")
 
@@ -168,7 +173,7 @@ def study_format() -> dict:
                            "stress_band": "mm: *_off_bc peaks leave out material this close to supports and loads (default: 2 element sizes, "
                                           "the same on the converge mesh); widen it if peak_von_mises_off_bc does not converge"},
             "material_keys": MATERIAL_KEYS, "materials": MATERIALS, "bc_kinds": bcs, "selectors": SELECTOR_DOC,
-            "example": EXAMPLE}
+            "example": EXAMPLE, "joint": JOINT_DOC}
 
 
 # ---- units -------------------------------------------------------------------------------
@@ -302,6 +307,13 @@ def validate_study(st: dict) -> dict:
     errors, warnings = [], []
     if not isinstance(st, dict):
         return {"ok": False, "errors": ["a study must be an object"], "warnings": []}
+    if st.get("analysis") == "joint":   # an assembly of parts with contact and bolts (joint.py)
+        from .joint import validate as validate_joint
+        errors, warnings = validate_joint(st)
+        errors += _run_errors(st)
+        if "images" in st:
+            errors.append("images: not available for joint studies yet")
+        return {"ok": not errors, "errors": errors, "warnings": warnings}
     part = st.get("part")
     if isinstance(part, dict) and "box" in part:
         if not (isinstance(part["box"], list) and len(part["box"]) == 3 and all(_num(v) and v > 0 for v in part["box"])):

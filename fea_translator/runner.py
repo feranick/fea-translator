@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.10.30.1
+Version: 2026.11.01.3
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -686,6 +686,9 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     fine = size_factor != 1.0
     PEAK.update(rss_mb=0.0, threads=0)
     CRASHES.clear()
+    if study.get("analysis") == "joint":   # an assembly: parts, contact, bolts (joint.py)
+        from .joint import solve as solve_joint
+        return solve_joint(name, study, folder, solver, timeout, progress)
     check_cancel()
     if progress:
         progress.stage("mesh_fine" if fine else "mesh")
@@ -871,7 +874,7 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
                     pass
             res["convergence"] = conv
         res["checks"] = check_expectations(study, res)
-        warn = []
+        warn = list(res.pop("warnings", []))
         if res.get("equilibrium_error", 0) > 1e-3:
             warn.append(f"reactions do not balance the loads (error {res['equilibrium_error']:.2g})")
         if res.get("heat_balance_error", 0) > 1e-2:
