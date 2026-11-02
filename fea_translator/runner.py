@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.01.3
+Version: 2026.11.02.1
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -109,11 +109,19 @@ def _kill_group(p: subprocess.Popen) -> None:
         pass
 
 
-def _wait_rss(p: subprocess.Popen, timeout: float) -> int:
-    """Waits for the child (killing it after `timeout` s, or when the study's cancel flag appears) and records
-    its peak resident memory; returns its exit code. os.wait4 reports the child's own peak, even in a process
-    that runs many studies."""
+class Stopped(SolverError):
+    """A run stopped by its monitor (it could not converge): the reason."""
+
+
+MONITOR_EVERY = 5.0       # s between two looks of a run's monitor at its .sta/.cvg files
+
+
+def _wait_rss(p: subprocess.Popen, timeout: float, monitor=None) -> int:
+    """Waits for the child (killing it after `timeout` s, or when the study's cancel flag appears, or when the
+    monitor gives a reason to stop) and records its peak resident memory; returns its exit code. os.wait4 reports
+    the child's own peak, even in a process that runs many studies."""
     t_end = time.time() + timeout
+    t_mon = time.time() + MONITOR_EVERY
     while True:
         try:
             pid, status, ru = os.wait4(p.pid, os.WNOHANG)
@@ -131,10 +139,16 @@ def _wait_rss(p: subprocess.Popen, timeout: float) -> int:
         if time.time() > t_end:
             _kill_group(p)
             raise subprocess.TimeoutExpired(p.args, timeout)
+        if monitor is not None and time.time() > t_mon:
+            t_mon = time.time() + MONITOR_EVERY
+            why = monitor()
+            if why:
+                _kill_group(p)
+                raise Stopped(why)
         time.sleep(0.2)
 
 
-def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
+def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None) -> str:
     """Runs ccx on the deck. serial: one thread (modal, buckling: the eigenvalues then do not depend on the
     machine's load; with several threads, 1 in 4 concurrent runs of euler_column returned a wrong factor)."""
     exe = find_ccx()
@@ -162,7 +176,7 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
     with open(log_path, "w") as fh:
         p = subprocess.Popen([exe, "-i", inp.stem], cwd=inp.parent, stdout=fh, stderr=subprocess.STDOUT, env=env,
                              start_new_session=True)   # its own process group: a cancel or timeout ends all of it
-        code = _wait_rss(p, timeout)    # waits with wait4, which also gives the child's peak memory
+        code = _wait_rss(p, timeout, monitor)    # waits with wait4, which also gives the child's peak memory
     log = log_path.read_text(errors="replace")
     PEAK["threads"] = max(PEAK["threads"], int(env.get("OMP_NUM_THREADS", "1")))
     errs = [ln.strip() for ln in log.splitlines() if "*ERROR" in ln.upper()]
@@ -172,7 +186,7 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False) -> str:
         # 4-thread setup machine): once more single-threaded, as for solves that do not balance
         CRASHES.append({"solve": inp.stem, "crash": _exit_text(code), "threads": threads, "after_rerun": "ok"})
         try:
-            return run_ccx(inp, timeout, serial=True)
+            return run_ccx(inp, timeout, serial=True, monitor=monitor)
         except SolverError as exc:
             CRASHES[-1]["after_rerun"] = str(exc)[:300]
             raise
@@ -908,6 +922,9 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
                 warn.append(f"{where}CalculiX's stresses disagreed with its own displacements in "
                             f"{sc['elements_disagreeing']} elements (up to {sc['max_difference_MPa']:.4g} MPa): "
                             "the peaks and safety factors use the stresses recomputed from the displacements")
+        warn += list(res.get("mesh", {}).get("mesh_notes", []))
+        for pn, pi in (res.get("mesh", {}).get("parts") or {}).items():   # joint studies: per part
+            warn += [f"part {pn}: {n}" for n in pi.get("mesh_notes", [])]
         ns = res.get("mesh", {}).get("straightened_elements", 0)
         if ns:
             warn.append(f"{ns} curved second-order elements were inverted after meshing and were straightened "

@@ -1,6 +1,6 @@
 """joint.py — bolted, gasketed assemblies: several parts in contact, bolt pretension, a gasket law, and the internal
 pressure stepped up to find where the joint leaks and where it lifts off (analysis "joint", CalculiX only).
-Version: 2026.11.01.6
+Version: 2026.11.02.1
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -258,21 +258,88 @@ def _equation(dep: int, others: list[int], ref: int, d: int, avoid: set) -> list
     return out
 
 
-def gasket_law(g: dict) -> list[str]:
+MIN_SLOPE = 0.02          # no gasket-curve segment softer than 2 % of the curve's secant slope (stress / closure at its end)
+PRELOAD_STICK = 0.01      # the friction's stick slope in the preload step, relative to the later steps'
+STAB_FRACTION = 1e-6      # stabilisation springs: each 1e-6 of the softest bolt's stiffness
+STAB_NODES = 6            # per part that no support holds: 6 well-spread nodes, 3 springs each
+STAB_WARN = 0.01          # warn when the springs carry more than 1 % of the preload
+GAP_TOL = 0.01            # mm: gasket faces further apart than this (median) do not touch at the start
+
+
+def face_gap(X: np.ndarray, slave_nodes: np.ndarray, master_nodes: np.ndarray, normal) -> dict:
+    """How far the gasket's faces are apart before the preload: for each slave node, the distance along the gasket's
+    normal to the nearest master node (median and largest, mm)."""
+    from scipy.spatial import cKDTree
+    if not len(slave_nodes) or not len(master_nodes):
+        return {"median_mm": None, "max_mm": None}
+    _, j = cKDTree(X[master_nodes]).query(X[slave_nodes])
+    d = np.abs((X[master_nodes][j] - X[slave_nodes]) @ np.asarray(normal, float))
+    return {"median_mm": round(float(np.median(d)), 6), "max_mm": round(float(d.max()), 6)}
+
+
+def gasket_curve(g: dict) -> tuple[list[tuple[float, float]], bool]:
+    """The compression curve from (0, 0), every segment at least MIN_SLOPE of the secant slope (a segment of zero
+    stiffness, e.g. a data sheet's seating range, leaves the first contact without stiffness: the preload then does
+    not converge); and whether it was raised."""
+    pts = sorted((float(c), float(s)) for c, s in g["curve"])
+    if pts[0] != (0.0, 0.0):
+        pts = [(0.0, 0.0)] + pts
+    smin = MIN_SLOPE * pts[-1][1] / max(pts[-1][0], 1e-12)
+    out, raised = [pts[0]], False
+    for c, s in pts[1:]:
+        s2 = max(s, out[-1][1] + smin * (c - out[-1][0]))
+        raised |= s2 > s + 1e-12 * max(1.0, abs(s))
+        out.append((c, s2))
+    return out, raised
+
+
+def gasket_slope(g: dict) -> float:
+    """The gasket's reference normal stiffness (MPa/mm): its stiffness, or the curve's steepest segment."""
+    if "curve" not in g:
+        return float(g["stiffness"])
+    pts, _ = gasket_curve(g)
+    return max((s2 - s1) / max(c2 - c1, 1e-12) for (c1, s1), (c2, s2) in zip(pts, pts[1:]))
+
+
+def gap_warning(g: dict) -> str | None:
+    gp = g.get("gap") or {}
+    if gp.get("median_mm") is None or gp["median_mm"] <= GAP_TOL:
+        return None
+    return (f"gasket {g['name']}: its faces are {gp['median_mm']:.3g} mm apart (median; up to {gp['max_mm']:.3g} mm) "
+            "before the preload: they should touch (parts.move); the gasket's thickness is not meshed")
+
+
+def friction_lines(g: dict, stick: float = 1.0) -> list[str]:
+    """*FRICTION: mu and the stick slope (100 times below the normal stiffness, x stick)."""
+    return ["*FRICTION", f"{_g(float(g.get('friction', 0.2)))}, {_g(gasket_slope(g) / 100.0 * stick)}"]
+
+
+def gasket_law(g: dict, stick: float = 1.0) -> list[str]:
     """*SURFACE BEHAVIOR (and *FRICTION) of a gasket: the compression curve as (pressure, overclosure) pairs, or a
     linear stiffness (MPa/mm = N/mm3)."""
     if "curve" in g:
-        pts = sorted((float(c), float(s)) for c, s in g["curve"])
-        if pts[0] != (0.0, 0.0):
-            pts = [(0.0, 0.0)] + pts
+        pts, _ = gasket_curve(g)
         L = ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR"] + [f"{_g(s)}, {_g(c)}" for c, s in pts]
-        k = max((s2 - s1) / max(c2 - c1, 1e-12) for (c1, s1), (c2, s2) in zip(pts, pts[1:]))
     else:
-        k = float(g["stiffness"])
-        L = ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR", _g(k)]
-    mu = float(g.get("friction", 0.2))
-    L += ["*FRICTION", f"{_g(mu)}, {_g(k / 100.0)}"]      # stick slope about 100 times below the normal stiffness
-    return L
+        L = ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR", _g(float(g["stiffness"]))]
+    return L + friction_lines(g, stick)
+
+
+def spread_nodes(X: np.ndarray, cand: np.ndarray, n: int) -> list[int]:
+    """n well-spread nodes of cand (indices into X): the farthest from the centre, then each the farthest from
+    those chosen."""
+    if not len(cand):
+        return []
+    P = X[cand]
+    pick = [int(np.argmax(np.linalg.norm(P - P.mean(axis=0), axis=1)))]
+    d = np.linalg.norm(P - P[pick[0]], axis=1)
+    while len(pick) < min(n, len(cand)):
+        k = int(np.argmax(d))
+        if d[k] <= 0:
+            break
+        pick.append(k)
+        d = np.minimum(d, np.linalg.norm(P - P[k], axis=1))
+    return [int(cand[k]) for k in pick]
 
 
 def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
@@ -310,6 +377,7 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
             L.append(f"*NSET, NSET={sname}")
             L += _lines((nodes + 1).tolist())
             held.update((nodes + 1).tolist())
+            plan.setdefault("held_parts", set()).update(p["name"] for p, _ in sel)
             if k == "fixed":
                 bnd.append(f"{sname}, 1, 3")
             elif k == "slider":
@@ -362,13 +430,16 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         sf, mf = _gfaces(slave), _gfaces(master)
         L += [f"*SURFACE, NAME=GS_{gn}"] + [f"{e + 1}, S{s}" for e, s in sf]
         L += [f"*SURFACE, NAME=GM_{gn}"] + [f"{e + 1}, S{s}" for e, s in mf]
-        L += [f"*SURFACE INTERACTION, NAME=GI_{gn}"] + gasket_law(g)
+        L += [f"*SURFACE INTERACTION, NAME=GI_{gn}"] + gasket_law(g, PRELOAD_STICK)
         L += [f"*CONTACT PAIR, INTERACTION=GI_{gn}, TYPE=SURFACE TO SURFACE", f"GS_{gn}, GM_{gn}"]
         nrm = sum((p["mesh"].groups[tg_].normal * p["mesh"].groups[tg_].area[:, None]).sum(axis=0)
                   for p, tgs in slave for tg_ in tgs)
+        gap = face_gap(X, _gnodes(slave), _gnodes(master), _unit(nrm))
         plan["gaskets"].append({"name": g["name"], "slave_faces": sf, "seal": g.get("seal", {}),
                                 "inner_at": g.get("inner_at"), "tags": gtags(parts, slave),
                                 "with_tags": gtags(parts, master), "normal": _unit(nrm).tolist(),
+                                "curve_raised": bool("curve" in g and gasket_curve(g)[1]), "friction": friction_lines(g),
+                                "interaction": f"GI_{gn}", "gap": gap,
                                 "area": sum(p["mesh"].area_of(tg) for p, tg in slave)})
         plan["selection"][f"gasket {g['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in slave for t in tg]
         plan["selection"][f"gasket {g['name']} (with)"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in master for t in tg]
@@ -392,6 +463,9 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
             e_next += 1
             k = mat["E"] * sz["As"] / bg["grip"]
             springs.append((eid, nc, n2, bn, k))
+            in_eq = plan.setdefault("eq_nodes", set())
+            in_eq.update(int(q) for q in bg["head"])
+            in_eq.update(int(q) for q in bg["nut"])
             for d in (1, 2, 3):
                 eqs += _equation(int(bg["head"][0]) + 1, [int(q) + 1 for q in bg["head"]], n1, d, held)
                 eqs += _equation(int(bg["nut"][0]) + 1, [int(q) + 1 for q in bg["nut"]], n2, d, held)
@@ -410,6 +484,33 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
     for eid, nc, n2, bn, k in springs:   # one element set per spring: each has its own stiffness (its grip)
         L += [f"*ELEMENT, TYPE=SPRINGA, ELSET=ES{eid}", f"{eid}, {nc}, {n2}", f"*SPRING, ELSET=ES{eid}", _g(k)]
     L += eqs
+    # stabilisation: weak springs to ground on every part no support holds (before the gasket is pressed it has no
+    # stiffness and friction none: the part could slide and rock about the bolt line, and the preload chatters)
+    k_stab = STAB_FRACTION * min((q["k_N_mm"] for rec in plan["bolts"] for q in rec["bolts"]), default=1.0)
+    stab, ground, stab_el = {}, [], []
+    held_parts = plan.pop("held_parts", set())
+    eq_nodes = plan.pop("eq_nodes", set())
+    for p in parts:
+        if p["name"] in held_parts:
+            continue
+        surf = np.unique(np.concatenate([np.asarray(tri).ravel() for tri in p["mesh"].surfaces.values()])) + p["n0"]
+        cand = np.array([q for q in surf if int(q) not in eq_nodes and int(q) + 1 not in held], int)
+        stab[p["name"]] = [q + 1 for q in spread_nodes(X, cand, STAB_NODES)]
+        for q in stab[p["name"]]:
+            for d in range(3):   # a SPRINGA of unit length along x, y, z to a fixed ground node
+                gpos = X[q - 1] + np.eye(3)[d]
+                L += ["*NODE", f"{n_next}, {_g(gpos[0])}, {_g(gpos[1])}, {_g(gpos[2])}"]
+                ground.append(n_next)
+                stab_el.append((e_next, q, n_next))
+                n_next += 1
+                e_next += 1
+    if stab_el:
+        L += ["*ELEMENT, TYPE=SPRINGA, ELSET=E_STAB"] + [f"{e}, {a}, {b}" for e, a, b in stab_el]
+        L += ["*SPRING, ELSET=E_STAB", _g(k_stab)]
+        L += ["*NSET, NSET=N_STAB"] + _lines(sorted({q for v in stab.values() for q in v}))
+        L += ["*NSET, NSET=N_STABGROUND"] + _lines(ground)
+        bnd.append("N_STABGROUND, 1, 3")
+    plan["stabilisation"] = {"k_N_mm": k_stab, "parts": stab, "springs": len(stab_el)}
     pnodes = [npt for _, npt, _, _ in pret]
     ends = [n for _, nc, n2, _, _ in springs for n in (nc, n2)]
     L += ["*NSET, NSET=N_PRETENSION"] + _lines(pnodes) + ["*NSET, NSET=N_BOLTENDS"] + _lines(ends)
@@ -417,7 +518,9 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
 
     def outputs():   # bolt forces from the beam ends' displacements (CalculiX reports no reaction at a pretension
         # node held with *BOUNDARY, FIXED); gasket stresses from the contact output; no element stresses (large)
-        return [f"*NODE PRINT, NSET=N_BOLTENDS, FREQUENCY={FREQ}", "U", "*NODE FILE", "U", "*CONTACT FILE", "CDIS, CSTR"]
+        stab_out = [f"*NODE PRINT, NSET=N_STAB, FREQUENCY={FREQ}", "U"] if stab_el else []
+        return ([f"*NODE PRINT, NSET=N_BOLTENDS, FREQUENCY={FREQ}", "U"] + stab_out
+                + ["*NODE FILE", "U", "*CONTACT FILE", "CDIS, CSTR"])
 
     def dloads(items, factor):
         out = []
@@ -435,7 +538,8 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
             out += [f"{n + 1}, {k + 1}, {_g(d[n][k] * factor)}" for k in range(3) if d[n][k] != 0]
         return out
     # step 1: the preload (and the loads that do not change)
-    L += ["*STEP, INC=1000", "*STATIC", "0.5, 1., 1e-08, 1.", "*BOUNDARY"] + bnd
+    # a small first increment: the contact is found at a twentieth of the preload
+    L += ["*STEP, INC=1000", "*STATIC", "0.05, 1., 1e-05, 0.25", "*BOUNDARY"] + bnd
     L += ["*CLOAD"] + [f"{npt}, 1, {_g(P)}" for _, npt, _, P in pret] + cloads(cload_const, 1.0)
     if dload_const:
         L += ["*DLOAD"] + dloads(dload_const, 1.0)
@@ -448,6 +552,9 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         L += ["*STEP, INC=1000", "*STATIC", "1., 1., 1e-08, 1.", "*BOUNDARY, FIXED", "N_PRETENSION, 1, 1"]
         cl = cloads(cload_const, 1.0) + cloads(swept_cload, f)
         L += ["*CLOAD, OP=NEW"] + (cl or [f"{springs[0][2]}, 1, 0."])
+        if k == 1:   # the gasket's friction at its full stick slope once it is pressed
+            for g in plan["gaskets"]:
+                L += [f"*CHANGE FRICTION, INTERACTION={g['interaction']}"] + g["friction"]
         if swept_dload:
             L += ["*DLOAD"] + dloads(swept_dload, f)
         L += outputs() + ["*END STEP"]
@@ -705,6 +812,33 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
                 f"gasket {g['name']}: already below its sealing stress at the preload (ring {pre['ring_MPa']:.4g} MPa "
                 f"< {pre['seal_MPa']:.4g} MPa): more preload, more bolts, or a narrower gasket")
     res["bolt_preload_error"] = res_pre_err
+    # stabilisation springs: what they carry (k u at each spring node) against the preload
+    stp = plan.get("stabilisation") or {}
+    if stp.get("springs"):
+        us = [b for b in dat["blocks"] if b["set"] == "N_STAB" and b["what"].startswith("displacements")]
+        tot_pre = sum(rec["preload_N"] * len(rec["bolts"]) for rec in plan["bolts"])
+        by_step = []
+        for blk in us[:nsteps]:
+            f = [stp["k_N_mm"] * float(np.linalg.norm(r[1:4])) for r in blk["rows"] if len(r) >= 4]
+            by_step.append(round(float(np.sum(f)), 6))
+        mx = max(by_step) if by_step else None
+        res["stabilisation"] = {"springs": stp["springs"], "k_N_mm": stp["k_N_mm"],
+                                "parts": {k: len(v) for k, v in stp["parts"].items()},
+                                "force_N_by_step": by_step, "max_force_N": mx,
+                                "fraction_of_preload": round(mx / tot_pre, 8) if mx is not None and tot_pre else None}
+        fr = res["stabilisation"]["fraction_of_preload"]
+        if fr is not None and fr > STAB_WARN:
+            res.setdefault("warnings", []).append(
+                f"the stabilisation springs carry {100 * fr:.3g} % of the preload ({mx:.4g} N): a part is not held "
+                f"by its bolts and gaskets alone ({', '.join(stp['parts'])}); check the gasket faces touch and the bolts' faces")
+    for g in plan["gaskets"]:
+        res["gaskets"][g["name"]]["gap_mm"] = (g.get("gap") or {}).get("median_mm")
+        if gap_warning(g):
+            res.setdefault("warnings", []).append(gap_warning(g))
+        if g.get("curve_raised"):
+            res.setdefault("warnings", []).append(
+                f"gasket {g['name']}: segments of its curve softer than {100 * MIN_SLOPE:g} % of its secant slope were "
+                "raised to it (no zero-stiffness contact at first touch)")
     if res_pre_err is not None and res_pre_err > 0.01:
         res.setdefault("warnings", []).append(
             f"bolt forces at the preload differ from the preload by {100 * res_pre_err:.3g} %: check the bolt results")
@@ -952,12 +1086,108 @@ def validate(st: dict) -> tuple[list[str], list[str]]:
     return errs, warns
 
 
+# ---- watching CalculiX: stop a run that cannot converge -----------------------------------------------
+MAX_FAILED_ATTEMPTS = 3   # unconverged attempts of one increment before the run is stopped
+CHATTER_ITERS = 16        # iterations of one attempt looked at for contact chatter
+CHATTER_FLIPS = 6         # direction changes of the contact count among them
+CHATTER_SPREAD = 0.05     # the contact count's swing, relative to its largest value
+
+
+def read_sta(text: str) -> list[tuple[int, int, int, bool]]:
+    """(step, increment, attempt, converged) of each line of a .sta file (an attempt like '2U' did not converge)."""
+    out = []
+    for line in text.splitlines():
+        tk = line.split()
+        if len(tk) >= 6 and tk[0].isdigit() and tk[1].isdigit() and re.fullmatch(r"\d+U?", tk[2]):
+            out.append((int(tk[0]), int(tk[1]), int(tk[2].rstrip("U")), not tk[2].endswith("U")))
+    return out
+
+
+def read_cvg(text: str) -> list[tuple[int, int, int, int, int, float]]:
+    """(step, increment, attempt, iteration, contact elements, residual force %) of each line of a .cvg file."""
+    out = []
+    for line in text.splitlines():
+        tk = line.split()
+        if len(tk) >= 6 and all(x.isdigit() for x in tk[:5]):
+            try:
+                out.append((int(tk[0]), int(tk[1]), int(tk[2]), int(tk[3]), int(tk[4]), float(tk[5])))
+            except ValueError:
+                continue
+    return out
+
+
+def _what(step: int, plan: dict | None) -> str:
+    if step == 1:
+        return "preload"
+    st = (plan or {}).get("steps") or []
+    f = st[step - 1]["factor"] if step - 1 < len(st) else None
+    sw = (plan or {}).get("sweep") or {}
+    return f"step {step}" + (f" ({sw.get('bc')} at {100 * f:.0f} %)" if f is not None else "")
+
+
+def stall_reason(sta: str, cvg: str, plan: dict | None = None) -> tuple[str, int] | None:
+    """Why the run should stop now (and the step it is in), or None: an increment that failed MAX_FAILED_ATTEMPTS
+    times, or contact chatter: the number of contact elements swinging up and down in the current attempt."""
+    rows = read_cvg(cvg)
+    if rows:
+        s, i, a = rows[-1][:3]
+        cur = [r for r in rows if r[:3] == (s, i, a)]
+        if len(cur) >= CHATTER_ITERS:
+            c = np.array([r[4] for r in cur[-CHATTER_ITERS:]], float)
+            d = np.sign(np.diff(c))
+            d = d[d != 0]
+            flips = int((d[1:] != d[:-1]).sum()) if len(d) > 1 else 0
+            lo, hi = int(c.min()), int(c.max())
+            if flips >= CHATTER_FLIPS and hi > 0 and (hi - lo) / hi >= CHATTER_SPREAD:
+                return (f"{_what(s, plan)} did not converge: contact chatter ({hi - lo} contact elements switching, "
+                        f"{lo} to {hi}; step {s}, increment {i}, attempt {a}, iteration {cur[-1][3]})"), s
+    failed: dict = {}
+    for s, i, a, ok in read_sta(sta):
+        if not ok:
+            failed[(s, i)] = failed.get((s, i), 0) + 1
+    for (s, i), n in failed.items():
+        if n >= MAX_FAILED_ATTEMPTS:
+            return f"{_what(s, plan)} did not converge: increment {i} of step {s} failed {n} attempts", s
+    return None
+
+
+class Watch:
+    """A monitor for runner.run_ccx: reads the .sta and .cvg files while CalculiX runs."""
+
+    def __init__(self, inp: Path, plan: dict):
+        self.inp, self.plan, self.step = Path(inp), plan, None
+
+    def __call__(self) -> str | None:
+        rd = lambda sfx: self.inp.with_suffix(sfx).read_text(errors="replace") if self.inp.with_suffix(sfx).is_file() else ""  # noqa: E731
+        r = stall_reason(rd(".sta"), rd(".cvg"), self.plan)
+        if r is None:
+            return None
+        self.step = r[1]
+        return r[0]
+
+
+def completed_steps(sta: str) -> int:
+    """The last step whose final increment converged (step time 1)."""
+    done = 0
+    for line in sta.splitlines():
+        tk = line.split()
+        if len(tk) >= 7 and tk[0].isdigit() and tk[1].isdigit() and re.fullmatch(r"\d+", tk[2]):
+            try:
+                if abs(float(tk[5]) - 1.0) < 1e-6:
+                    done = max(done, int(tk[0]))
+            except ValueError:
+                continue
+    return done
+
+
 # ---- one joint study end to end (runner.solve_once calls this) -----------------------------------
 def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, progress=None) -> dict:
     """Meshes the parts, writes and runs the deck (CalculiX: contact and pretension), evaluates the joint."""
     import time
 
-    from .runner import SolverError, _record_timing, check_cancel, run_ccx
+    import subprocess
+
+    from .runner import SolverError, Stopped, _record_timing, check_cancel, run_ccx
     if solver != "ccx":
         raise SolverError("a joint study needs CalculiX (contact, bolt pretension): the reference solver cannot run it")
     check_cancel()
@@ -973,12 +1203,33 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
     inp = Path(folder) / f"{name}.inp"
     inp.write_text(text)
     check_cancel()
-    run_ccx(inp, timeout)
+    watch = Watch(inp, plan)
+    stopped = None
+    try:
+        run_ccx(inp, timeout, monitor=watch)
+    except (Stopped, subprocess.TimeoutExpired) as exc:
+        sta = inp.with_suffix(".sta")
+        done = completed_steps(sta.read_text(errors="replace")) if sta.is_file() else 0
+        why = str(exc) if isinstance(exc, Stopped) else f"CalculiX ran past the time limit ({timeout:g} s) in {_what(done + 1, plan)}"
+        if done < 1 or not inp.with_suffix(".dat").is_file():   # not even the preload: nothing to report
+            gaps = [w for w in (gap_warning(g) for g in plan["gaskets"]) if w]
+            raise SolverError(why + ". " + (" ".join(gaps) + ". " if gaps else "")
+                              + "Check that each gasket's faces touch (parts.move), that every part is held by "
+                              "supports or bolts, and the start of the gasket curve; the stabilisation springs were on."
+                              ) from exc
+        stopped = (why, done)
+        plan = dict(plan, steps=plan["steps"][:done])
     t2 = time.perf_counter()
     res = evaluate(study, parts, plan, inp.with_suffix(".dat").read_text(errors="replace"),
                    inp.with_suffix(".frd").read_text(errors="replace") if inp.with_suffix(".frd").is_file() else "")
+    if stopped:
+        res["stopped"] = {"why": stopped[0], "completed_steps": stopped[1]}
+        res.setdefault("warnings", []).append(
+            f"{stopped[0]}: the results stop at step {stopped[1]} ({res['steps'][-1]['load']:.4g} {res['swept']['unit']}); "
+            "leak and lift-off beyond it are not known")
     minfo = {"nodes": n_nodes, "elements": sum(len(p["mesh"].tets) for p in parts), "order": parts[0]["mesh"].order,
-             "parts": {p["name"]: {k: v for k, v in p["info"].items() if k in ("nodes", "elements", "size")} for p in parts}}
+             "parts": {p["name"]: {k: v for k, v in p["info"].items() if k in ("nodes", "elements", "size", "mesh_notes",
+                                                                              "straightened_elements")} for p in parts}}
     _record_timing({"analysis": "joint"}, solver, minfo, t1 - t0, t2 - t1)
     res["selection"] = plan["selection"]
     res["mesh"] = minfo

@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.11.01.4
+Version: 2026.11.02.1
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -189,7 +189,7 @@ def cases(solver: str = "ccx") -> dict:
 
 
 NEEDS = {"euler_column": {"ccx"}, "plate_hole": {"ccx", "gmsh"}, "lame_ring": {"gmsh"}, "coax_capacitor": {"gmsh"},
-         "joint_pull": {"ccx"}, "joint_cover": {"ccx", "gmsh"}}
+         "joint_pull": {"ccx"}, "joint_cover": {"ccx", "gmsh"}, "joint_two_bolt": {"ccx"}}
 
 
 def _joint_cases() -> dict:
@@ -240,7 +240,23 @@ def _joint_cases() -> dict:
              "expect": [{"quantity": "gaskets.g.preload.force_N", "value": n * P, "tol": 0.03},
                         {"quantity": "leak.g", "value": (n * P - sig * Ag) / ((1 - C8) * Ap), "tol": 0.15},
                         {"quantity": "lift_off.g", "value": n * P / ((1 - C8) * Ap), "tol": 0.15}]}
-    return {"joint_pull": pull, "joint_cover": cover}
+    # joint_two_bolt: a stand-in for the S50 inspection cover (carbonio, 2026.11.01: the preload chattered for 4 h):
+    # a plate held by two M10 at 25 N m on a gasket whose curve starts soft (no stiffness up to 0.02 mm); it can
+    # slide, and rock about the bolt line, until the gasket is pressed
+    P10 = 25e3 / (0.2 * 10)
+    two = {"analysis": "joint",
+           "parts": {"body": {"part": {"box": [120, 60, 20], "origin": [-60, -30, 0], "divisions": [16, 8, 3]}},
+                     "cover": {"part": {"box": [120, 60, 10], "origin": [-60, -30, 20], "divisions": [16, 8, 2]}}},
+           "bcs": [{"kind": "fixed", "name": "feet", "faces": {"part": "body", "nz": -1}},
+                   {"kind": "force", "name": "lift", "faces": {"part": "cover", "nz": 1}, "fz": 40000.0}],
+           "gaskets": [{"name": "g", "faces": {"part": "cover", "nz": -1}, "with": {"part": "body", "nz": 1},
+                        "curve": [[0.02, 0.0], [0.05, 1.0], [0.1, 4.0], [0.2, 15.0], [0.3, 35.0]], "seal": {"stress": 1.0}}],
+           "bolts": [{"name": "b", "size": "M10", "torque": 25, "at": [[-37.5, 0, 30], [37.5, 0, 30]],
+                      "head": {"part": "cover", "nz": 1}, "nut": {"part": "body", "nz": -1}}],
+           "sweep": {"bc": "lift", "steps": 4},
+           "expect": [{"quantity": "gaskets.g.preload.force_N", "value": 2 * P10, "tol": 0.03},
+                      {"quantity": "bolts.b.preload_N", "value": P10, "tol": 1e-9}]}
+    return {"joint_pull": pull, "joint_cover": cover, "joint_two_bolt": two}
 
 
 def run(solver: str = "ccx", names=None, folder: Path | None = None) -> dict:

@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.01.6
+Version: 2026.11.02.1
 """
 import copy
 import math
@@ -35,11 +35,11 @@ def test_bolt_sizes_and_preload():
     assert len(pts) == 4 and all(np.linalg.norm(p[:2]) == pytest.approx(50) and p[2] == 5 for p in pts)
 
 
-def test_deck_structure(pull):
+def test_deck_structure(pull, tmp_path):
     st, parts, text, plan = pull
     up = text.upper()
     count = lambda k: len(re.findall(rf"^\*{k}\b", up, re.M))    # noqa: E731
-    assert count("CONTACT PAIR") == 1 and count("PRE-TENSION SECTION") == 0 and count("SPRING") == 1
+    assert count("CONTACT PAIR") == 1 and count("PRE-TENSION SECTION") == 0 and count("SPRING") == 2   # bolt, stabilisation
     assert "TYPE=SPRINGA" in up and "B31" not in up
     assert count("STEP") == 1 + 4 and count("END STEP") == 1 + 4
     assert count("EQUATION") == 9                                   # 3 directions x (head, nut, the cut)
@@ -49,13 +49,33 @@ def test_deck_structure(pull):
     assert cut == [f"{nc}, 1, 1, {nc - 2}, 1, -1", f"{nc}, 2, 1, {nc - 2}, 2, -1", f"{nc}, 3, 1, {nc - 2}, 3, -1, {npt}, 1, -1"]
     assert b0["k_N_mm"] == pytest.approx(210000 * 84.266 / 60, rel=1e-4)
     assert up.count("*BOUNDARY, FIXED") == 4 and up.count("*CLOAD, OP=NEW") == 4
-    assert "*EL FILE" not in up and up.count("*NODE PRINT, NSET=N_BOLTENDS") == 5
+    assert "*EL FILE" not in up and up.count("*NODE PRINT, NSET=N_BOLTENDS") == 5 and up.count("*NODE PRINT, NSET=N_STAB") == 5
+    # the preload starts small; the friction's stick slope is low there and back to full from step 2
+    steps = up.split("*STEP")
+    assert "0.05, 1., 1E-05, 0.25" in steps[1] and "CHANGE FRICTION" not in steps[1]
+    assert "*CHANGE FRICTION, INTERACTION=GI_G\n*FRICTION\n0.2, 0.5\n" in steps[2] and "CHANGE FRICTION" not in steps[3]
+    model = steps[0]
+    assert "*FRICTION\n0.2, 0.005\n" in model                       # 50 MPa/mm / 100 x 0.01
+    # stabilisation: the top block (no support) gets 6 well-spread nodes x 3 springs to fixed ground nodes
+    stp = plan["stabilisation"]
+    assert list(stp["parts"]) == ["top"] and len(stp["parts"]["top"]) == 6 and stp["springs"] == 18
+    assert stp["k_N_mm"] == pytest.approx(1e-6 * plan["bolts"][0]["bolts"][0]["k_N_mm"])
+    assert "N_STABGROUND, 1, 3" in steps[1]
+    X = joint.all_nodes(parts)
+    P = X[np.array(stp["parts"]["top"]) - 1]
+    assert P[:, 2].min() >= 30 - 1e-9 and np.ptp(P[:, 0]) == pytest.approx(60) and np.ptp(P[:, 1]) == pytest.approx(60)
     assert "PRESSURE-OVERCLOSURE=LINEAR" in up and "*FRICTION" in up and "*CONTACT FILE" in up
     assert [s["factor"] for s in plan["steps"]] == [0.0, 0.25, 0.5, 0.75, 1.0]
     b = plan["bolts"][0]
     assert b["preload_N"] == 20000 and len(b["bolts"]) == 1
     assert b["bolts"][0]["grip_mm"] == pytest.approx(60, abs=1e-6)     # top face to bottom face
     assert plan["gaskets"][0]["area"] == pytest.approx(3600, rel=1e-6)
+    assert plan["gaskets"][0]["gap"] == {"median_mm": 0.0, "max_mm": 0.0}       # the blocks touch
+    moved = copy.deepcopy(st)
+    moved["parts"]["top"]["move"] = [0, 0, 0.2]
+    pm = joint.mesh_parts(moved, tmp_path)
+    g2 = joint.write("m", moved, pm)[1]["gaskets"][0]
+    assert g2["gap"]["median_mm"] == pytest.approx(0.2) and "0.2 mm apart" in joint.gap_warning(g2)
     # the beam's end nodes and the pretension node come after the mesh nodes, the beam after the tets
     n_mesh = sum(len(p["mesh"].nodes) for p in parts)
     assert min(plan["pret_nodes"]) > n_mesh
@@ -343,3 +363,154 @@ def test_joint_image_validation():
     assert "for modal and buckling" in errs([{"mode": 1}])
     assert "step: for joint studies" in " | ".join(
         validate_study(dict(cases()["cantilever"], images=[{"field": "von_mises", "step": 1}]))["errors"])
+
+
+def test_gasket_curve_gets_a_minimum_slope():
+    pts, raised = joint.gasket_curve({"curve": [[0.02, 0.0], [0.05, 1.0], [0.1, 4.0], [0.3, 35.0]]})
+    smin = 0.02 * 35.0 / 0.3
+    assert raised and pts[0] == (0.0, 0.0) and pts[1] == (0.02, pytest.approx(0.02 * smin))
+    assert all((s2 - s1) / (c2 - c1) >= smin - 1e-9 for (c1, s1), (c2, s2) in zip(pts, pts[1:]))
+    assert pts[-1] == (0.3, 35.0)
+    assert joint.gasket_curve({"curve": [[0.1, 5.0], [0.2, 20.0]]}) == ([(0.0, 0.0), (0.1, 5.0), (0.2, 20.0)], False)
+
+
+def _cvg(conts, step=1, inc=1, att=1):
+    head = [" SUMMARY OF C0NVERGENCE INFORMATION", "  STEP   INC   ATT  ITER     CONT.   RESID.        CORR.",
+            "                             EL.     FORCE         DISP", ""]
+    return "\n".join(head + [f"{step:6d}{inc:6d}{att:6d}{i + 1:6d}{c:10d}  0.1000E+08  0.1000E+03  0.0000E+00  0.0000E+00"
+                              for i, c in enumerate(conts)]) + "\n"
+
+
+def test_stall_reason_contact_chatter_and_failed_attempts():
+    chatter = [96964 if i % 2 else 66000 + 10 * i for i in range(20)]
+    why, step = joint.stall_reason("", _cvg(chatter))
+    assert step == 1 and why.startswith("preload did not converge: contact chatter (")
+    assert "contact elements switching" in why and "96964" in why and "iteration 20" in why
+    settling = [96964 - 2000 * min(i, 10) for i in range(30)]            # contact found, then steady: no chatter
+    assert joint.stall_reason("", _cvg(settling)) is None
+    assert joint.stall_reason("", _cvg(chatter[:10])) is None            # too few iterations to judge
+    sta = ("SUMMARY OF JOB INFORMATION\n  STEP      INC     ATT  ITRS     TOT TIME     STEP TIME      INC TIME\n"
+           "     1          1     1U   60  0.000000E+00  0.000000E+00  0.500000E-01\n"
+           "     1          1     2U   60  0.000000E+00  0.000000E+00  0.125000E-01\n")
+    assert joint.stall_reason(sta, "") is None
+    sta3 = sta + "     1          1     3U   60  0.000000E+00  0.000000E+00  0.312500E-02\n"
+    why, _ = joint.stall_reason(sta3, "")
+    assert why == "preload did not converge: increment 1 of step 1 failed 3 attempts"
+    plan = {"steps": [{"factor": 0.0}, {"factor": 0.5}, {"factor": 1.0}], "sweep": {"bc": "inside"}}
+    why, step = joint.stall_reason("", _cvg(chatter, step=3), plan)
+    assert step == 3 and why.startswith("step 3 (inside at 100 %) did not converge")
+    done = ("     1          1     1    2  0.500000E-01  0.500000E-01  0.500000E-01\n"
+            "     1          9     1    3  0.100000E+01  0.100000E+01  0.250000E+00\n"
+            "     2          1     1U   60  0.100000E+01  0.000000E+00  0.100000E+01\n")
+    assert joint.completed_steps(done) == 1 and joint.completed_steps(sta3) == 0
+
+
+def test_stabilisation_forces_in_the_results(pull):
+    st, parts, text, plan = pull
+    g = plan["gaskets"][0]
+    X = joint.all_nodes(parts)
+    tets = np.concatenate([p["mesh"].tets + p["n0"] for p in parts])
+    _, area, _ = joint.gasket_graph(X, tets, [tuple(f) for f in g["slave_faces"]])
+    frd = _frd([{n: 20000 / 3600 for n in area}] * 5)
+    nodes = plan["stabilisation"]["parts"]["top"]
+    k = plan["stabilisation"]["k_N_mm"]
+
+    def dat(u):
+        out = _dat(plan, [[20000.0]] * 5)
+        for s in range(1, 6):
+            out += f"\n displacements (vx,vy,vz) for set N_STAB and time  {s:.7E}\n\n"
+            out += "\n".join(f"{n:10d}  0.000000E+00  0.000000E+00 {u:13.6E}" for n in nodes) + "\n"
+        return out
+    res = joint.evaluate(st, parts, plan, dat(0.1), frd)
+    stb = res["stabilisation"]
+    assert stb["springs"] == 18 and stb["parts"] == {"top": 6}
+    assert stb["max_force_N"] == pytest.approx(6 * k * 0.1, rel=1e-4) and stb["fraction_of_preload"] < 1e-4
+    assert not any("stabilisation springs carry" in w for w in res.get("warnings", []))
+    big = joint.evaluate(st, parts, plan, dat(0.1 * 0.02 * 20000 / (6 * k * 0.1)), frd)   # 2 % of the preload
+    assert big["stabilisation"]["fraction_of_preload"] == pytest.approx(0.02, rel=1e-4)
+    assert any("stabilisation springs carry 2 % of the preload" in w for w in big["warnings"])
+
+
+def _fake_ccx(tmp_path, monkeypatch, body: str):
+    exe = tmp_path / "fake_ccx"
+    exe.write_text("#!/bin/sh\n# fake ccx: -i <stem>\nstem=$2\n" + body + "\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("FEAT_CCX", str(exe))
+    from fea_translator import runner
+    monkeypatch.setattr(runner, "MONITOR_EVERY", 0.2)
+
+
+def test_a_chattering_preload_stops_early_with_its_reason(tmp_path, monkeypatch):
+    import time
+    from fea_translator.runner import SolverError
+    chatter = _cvg([96964 if i % 2 else 66000 for i in range(20)])
+    (tmp_path / "cvg.txt").write_text(chatter)
+    _fake_ccx(tmp_path, monkeypatch, f"cp {tmp_path}/cvg.txt $stem.cvg\necho '1 1 1 0' > $stem.sta\nsleep 60")
+    st = copy.deepcopy(cases()["joint_pull"])
+    st["sweep"]["steps"] = 2
+    t0 = time.time()
+    with pytest.raises(SolverError, match=r"preload did not converge: contact chatter .*stabilisation springs were on"):
+        joint.solve("pull", st, tmp_path / "run", "ccx", 120)
+    assert time.time() - t0 < 30
+
+
+def test_a_stall_after_the_preload_keeps_the_steps_done(tmp_path, monkeypatch):
+    """CalculiX stopped in step 3 (chatter): the results of steps 1 and 2, with the reason."""
+    st = copy.deepcopy(cases()["joint_pull"])
+    st["sweep"]["steps"] = 4
+    parts = joint.mesh_parts(st, tmp_path / "pre")
+    _, plan = joint.write("pull", st, parts)
+    g = plan["gaskets"][0]
+    X = joint.all_nodes(parts)
+    tets = np.concatenate([p["mesh"].tets + p["n0"] for p in parts])
+    _, area, _ = joint.gasket_graph(X, tets, [tuple(f) for f in g["slave_faces"]])
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "dat").write_text(_dat(plan, [[20000.0], [24000.0]]))
+    (src / "frd").write_text(_frd([{n: 5.0 for n in area}, {n: 3.0 for n in area}]))
+    (src / "sta").write_text("     1          5     1    2  0.100000E+01  0.100000E+01  0.250000E+00\n"
+                             "     2          1     1    3  0.200000E+01  0.100000E+01  0.100000E+01\n")
+    (src / "cvg").write_text(_cvg([96964 if i % 2 else 66000 for i in range(20)], step=3))
+    _fake_ccx(tmp_path, monkeypatch, f"for x in dat frd sta cvg; do cp {src}/$x $stem.$x; done\nsleep 60")
+    res = joint.solve("pull", st, tmp_path / "run", "ccx", 120)
+    assert res["stopped"]["completed_steps"] == 2 and "step 3" in res["stopped"]["why"]
+    assert [s["step"] for s in res["steps"]] == [1, 2] and res["steps"][1]["bolts"]["b"]["max_N"] == pytest.approx(24000)
+    assert any("the results stop at step 2" in w for w in res["warnings"])
+
+
+def test_a_surface_gmsh_cannot_mesh_is_tried_with_other_algorithms():
+    """A casing-to-head joint at size 8 (carbonio, 2026.11.01): "Invalid boundary mesh (overlapping facets) on surface 80"."""
+    from fea_translator.mesher import SURFACE_ALGORITHMS, generate
+
+    class FakeGmsh:
+        def __init__(self, fails):
+            self.fails, self.algs, self.calls = fails, [], 0
+            self.model = self
+            self.mesh = self
+
+        def generate(self, dim):
+            self.calls += 1
+            if self.fails:
+                self.fails -= 1
+                raise Exception("Invalid boundary mesh (overlapping facets) on surface 80 surface 80")
+
+        def clear(self):
+            pass
+
+        def setAlgorithm(self, dim, tag, val):
+            self.algs.append((dim, tag, val))
+
+        def getBoundingBox(self, dim, tag):
+            return [0, 0, 0, 2, 4, 6]
+    g, notes = FakeGmsh(2), []
+    generate(g, 3, notes)
+    assert g.calls == 3 and g.algs == [(2, 80, 1), (2, 80, 5)]
+    assert "surface 80 (near [1.0, 2.0, 3.0] mm)" in notes[0] and "MeshAdapt" in notes[0] and "Delaunay" in notes[1]
+    with pytest.raises(MeshError, match=r"could not mesh surface 80 \(near \[1.0, 2.0, 3.0\] mm\) with any 2D algorithm"):
+        generate(FakeGmsh(len(SURFACE_ALGORITHMS) + 1), 3, [])
+
+    class Other(FakeGmsh):
+        def generate(self, dim):
+            raise Exception("some other failure")
+    with pytest.raises(Exception, match="some other failure"):
+        generate(Other(0), 3, [])

@@ -1,5 +1,5 @@
 """mesher.py — the part as a tetrahedral mesh: Gmsh from a STEP file (or a build123d-translator goal).
-Version: 2026.10.16.6
+Version: 2026.11.02.1
 
     mesh_part(study, workdir) -> (Mesh, info)
 
@@ -10,6 +10,7 @@ mesh without Gmsh (tests and benchmarks).
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,47 @@ def part_step(study: dict, workdir: Path) -> Path:
     solid, _ = T.build(part["goal"])
     base = Path(workdir) / "part"
     return Path(T.export(solid, base, ("step",))["step"])
+
+
+_FAILED_SURFACE = re.compile(r"(?:mesh periodic surface|surface)\s+(\d+)", re.I)
+SURFACE_ALGORITHMS = (1, 5, 6)               # MeshAdapt, Delaunay, Frontal-Delaunay: tried in turn on a failing surface
+ALGORITHM_NAMES = ("MeshAdapt", "Delaunay", "Frontal-Delaunay")
+
+
+def generate(gmsh, dim: int, notes: list | None = None) -> None:
+    """gmsh.model.mesh.generate(dim), again with another 2D algorithm on a surface Gmsh could not mesh ('Invalid
+    boundary mesh (overlapping facets) on surface 80': a casing-to-head joint, carbonio, 2026.11.01; as
+    cfd-translator 2026.11.01.2). Each failing surface gets MeshAdapt, then Delaunay, then Frontal-Delaunay."""
+    tried: dict[int, int] = {}
+    while True:
+        try:
+            gmsh.model.mesh.generate(dim)
+            return
+        except Exception as exc:  # noqa: BLE001 (Gmsh raises plain Exception)
+            m = _FAILED_SURFACE.search(str(exc))
+            if not m:
+                raise
+            sf = int(m.group(1))
+            k = tried.get(sf, 0)
+            at = _where(gmsh, sf)
+            if k >= len(SURFACE_ALGORITHMS):
+                raise MeshError(f"Gmsh could not mesh surface {sf} (near {at} mm) with any 2D algorithm ({exc}); it is "
+                                "often a thin sliver face or a seam meeting a tiny edge: change mesh.size a little, "
+                                "refine there (mesh.refine), or simplify that face in the CAD") from exc
+            tried[sf] = k + 1
+            gmsh.model.mesh.clear()
+            gmsh.model.mesh.setAlgorithm(2, sf, SURFACE_ALGORITHMS[k])
+            if notes is not None:
+                notes.append(f"Gmsh could not mesh surface {sf} (near {at} mm) with its default algorithm ({str(exc)[:120]}): "
+                             f"meshed it again with {ALGORITHM_NAMES[k]}")
+
+
+def _where(gmsh, sf: int) -> list:
+    try:
+        bb = gmsh.model.getBoundingBox(2, sf)
+        return [round(0.5 * (bb[i] + bb[i + 3]), 1) for i in range(3)]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _gmsh_init(gmsh):
@@ -79,7 +121,8 @@ def mesh_step(step: Path, size: float | None = None, order: int = 2, refine=(), 
             fmin = gmsh.model.mesh.field.add("Min")
             gmsh.model.mesh.field.setNumbers(fmin, "FieldsList", fields)
             gmsh.model.mesh.field.setAsBackgroundMesh(fmin)
-        gmsh.model.mesh.generate(3)
+        notes: list = []
+        generate(gmsh, 3, notes)
         if order == 2:
             gmsh.model.mesh.setOrder(2)
         tags, coords, _ = gmsh.model.mesh.getNodes()
@@ -122,8 +165,11 @@ def mesh_step(step: Path, size: float | None = None, order: int = 2, refine=(), 
     tets = order_known(nodes, tets)
     nodes, straightened = straighten_inverted(nodes, tets)
     mesh = Mesh(nodes, tets, surfaces, info).build()
-    return mesh, {"size": h, "diag": diag, "nodes": len(nodes), "elements": len(tets), "order": order,
-                  "straightened_elements": straightened}
+    info = {"size": h, "diag": diag, "nodes": len(nodes), "elements": len(tets), "order": order,
+            "straightened_elements": straightened}
+    if notes:
+        info["mesh_notes"] = notes
+    return mesh, info
 
 
 def mesh_part(study: dict, workdir: Path, size_factor: float = 1.0) -> tuple[Mesh, dict]:
