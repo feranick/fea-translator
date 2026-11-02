@@ -1,6 +1,6 @@
 """joint.py — bolted, gasketed assemblies: several parts in contact, bolt pretension, a gasket law, and the internal
 pressure stepped up to find where the joint leaks and where it lifts off (analysis "joint", CalculiX only).
-Version: 2026.11.01.5
+Version: 2026.11.01.6
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -128,6 +128,14 @@ def _gnodes(sel_parts) -> np.ndarray:
 def _gfaces(sel_parts) -> list[tuple[int, int]]:
     """(global element index, face number) of selected faces."""
     return [(e + p["e0"], s) for p, t in sel_parts for e, s in p["mesh"].faces_of(t)]
+
+
+TAG_STRIDE = 100000         # face tags in the merged state: (part index + 1) * TAG_STRIDE + the part's own tag
+
+
+def gtags(parts: list[dict], sel_parts) -> list[int]:
+    """Globally unique face tags of a selection (for the pictures' state)."""
+    return [(parts.index(p) + 1) * TAG_STRIDE + int(t) for p, tg in sel_parts for t in tg]
 
 
 def all_nodes(parts: list[dict]) -> np.ndarray:
@@ -296,6 +304,7 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
             plan["selection"][bname] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in sel for t in tg]
         nodes = _gnodes(sel)
         sname = "N_" + _name(bname)
+        plan.setdefault("bc_tags", {})[bname] = gtags(parts, sel)
         if k in SUPPORTS:
             plan["sets"][bname] = {"nset": sname, "nodes": (nodes + 1).tolist()}
             L.append(f"*NSET, NSET={sname}")
@@ -355,8 +364,11 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         L += [f"*SURFACE, NAME=GM_{gn}"] + [f"{e + 1}, S{s}" for e, s in mf]
         L += [f"*SURFACE INTERACTION, NAME=GI_{gn}"] + gasket_law(g)
         L += [f"*CONTACT PAIR, INTERACTION=GI_{gn}, TYPE=SURFACE TO SURFACE", f"GS_{gn}, GM_{gn}"]
+        nrm = sum((p["mesh"].groups[tg_].normal * p["mesh"].groups[tg_].area[:, None]).sum(axis=0)
+                  for p, tgs in slave for tg_ in tgs)
         plan["gaskets"].append({"name": g["name"], "slave_faces": sf, "seal": g.get("seal", {}),
-                                "inner_at": g.get("inner_at"),
+                                "inner_at": g.get("inner_at"), "tags": gtags(parts, slave),
+                                "with_tags": gtags(parts, master), "normal": _unit(nrm).tolist(),
                                 "area": sum(p["mesh"].area_of(tg) for p, tg in slave)})
         plan["selection"][f"gasket {g['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in slave for t in tg]
         plan["selection"][f"gasket {g['name']} (with)"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in master for t in tg]
@@ -704,6 +716,62 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
     return res
 
 
+# ---- the state for pictures (render.py) ------------------------------------------------------------
+def save_state(folder: Path, study: dict, parts: list[dict], plan: dict, res: dict, frd_text: str) -> None:
+    """state.npz / state.json as render.py reads them, for the whole assembly: the merged nodes, elements and
+    boundary triangles (face tags made unique per part), and per step (1 = the preload) the displacements U_steps,
+    the nodal stress tensors S_steps (from the displacements, each part with its material) and the gasket stress
+    cp_steps (contact pressure at the gasket nodes, 0 elsewhere); the bcs, gaskets and bolts for the setup view."""
+    from types import SimpleNamespace
+
+    from .render import nodal_stress
+    from .render import save_state as save
+    X = all_nodes(parts)
+    N = len(X)
+    tets = np.concatenate([p["mesh"].tets + p["n0"] for p in parts])
+    surfaces = {}
+    for i, p in enumerate(parts):
+        for tg, tri in p["mesh"].surfaces.items():
+            surfaces[(i + 1) * TAG_STRIDE + int(tg)] = np.asarray(tri, np.int64).reshape(-1, 3) + p["n0"]
+    merged = SimpleNamespace(nodes=X, tets=tets, surfaces=surfaces,
+                             size=float(np.linalg.norm(X.max(axis=0) - X.min(axis=0))))
+    blocks = frd_steps(frd_text)
+    nsteps = len(plan["steps"])
+    U = np.zeros((nsteps, N, 3))
+    for b in blocks:
+        if b["name"].startswith("DISP") and b["step"] and 1 <= b["step"] <= nsteps:
+            for n, v in b["data"].items():
+                if 1 <= n <= N:
+                    U[b["step"] - 1, n - 1] = v[:3]
+    cp = np.zeros((nsteps, N))
+    for s, pm in contact_pressure_by_step(blocks).items():
+        if s and 1 <= s <= nsteps:
+            for n, v in pm.items():
+                if 1 <= n <= N:
+                    cp[s - 1, n - 1] = max(0.0, v)
+    S = np.zeros((nsteps, N, 6))
+    for s in range(nsteps):
+        for p in parts:
+            sl = slice(p["n0"], p["n0"] + len(p["mesh"].nodes))
+            S[s, sl] = nodal_stress(p["mesh"], U[s, sl], {"material": p["material"]}, {})
+    fields = {"U_steps": U.astype(np.float32), "S_steps": S.astype(np.float32), "cp_steps": cp.astype(np.float32)}
+    bcs = [{"name": n, "kind": plan["kinds"][n], "tags": plan.get("bc_tags", {}).get(n, [])} for n in plan["kinds"]]
+    bcs += [{"name": g["name"], "kind": "gasket", "tags": g["tags"]} for g in plan["gaskets"]]
+    sw = res.get("swept", {})
+    meta = {"bcs": bcs, "joint": True,
+            "steps": [{"step": s["step"], "load": r["load"]} for s, r in zip(plan["steps"], res["steps"])],
+            "unit": sw.get("unit"), "swept": sw.get("bc"),
+            "gaskets": {g["name"]: {"normal": g["normal"], "with_tags": g["with_tags"],
+                                    "seal_MPa_steps": [max(float(g["seal"].get("stress", 0.0)), float(g["seal"].get("m", 0.0))
+                                                           * (r["load"] if sw.get("unit") == "MPa" else 0.0))
+                                                       for r in res["steps"]]}
+                        for g in plan["gaskets"]},
+            "bolts": [[b_["B1"], b_["B2"]] for rec in plan["bolts"] for b_ in rec["bolts"]],
+            "parts": [{"name": p["name"], "tag_min": (i + 1) * TAG_STRIDE, "tag_max": (i + 2) * TAG_STRIDE - 1}
+                      for i, p in enumerate(parts)]}
+    save(folder, merged, fields, study, meta)
+
+
 # ---- validation ----------------------------------------------------------------------------------
 def _psel(sel, parts: set, where: str) -> list[str]:
     errs = []
@@ -919,4 +987,10 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
                     if inp.with_suffix(s).is_file()}
     res["deck"] = {"steps": len(plan["steps"]), "bolts": sum(len(b["bolts"]) for b in plan["bolts"]),
                    "gaskets": len(plan["gaskets"])}
+    try:   # the state for pictures (images, render_images): the results stand without it
+        frd = inp.with_suffix(".frd")
+        save_state(Path(folder), study, parts, plan, res, frd.read_text(errors="replace") if frd.is_file() else "")
+        res["files"]["state"] = str(Path(folder) / "state.npz")
+    except Exception as exc:  # noqa: BLE001
+        res.setdefault("warnings", []).append(f"could not save the state for pictures: {type(exc).__name__}: {exc}"[:300])
     return res

@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.01.5
+Version: 2026.11.01.6
 """
 import copy
 import math
@@ -126,10 +126,19 @@ def test_crossing():
     assert joint._crossing([0, 10, 20, 30], [50, 30, 10, 0], floor=0.0) == pytest.approx(25)
 
 
-def _frd(steps):
-    """An ASCII .frd with one CONTACT block per step: steps = [{node: cpress}]."""
+def _frd(steps, disp=None):
+    """An ASCII .frd with one CONTACT block per step: steps = [{node: cpress}]; disp = [{node: (ux, uy, uz)}]
+    adds a DISP block per step."""
     out = ["    1C", "    1UUSER"]
     for k, pm in enumerate(steps, start=1):
+        if disp:
+            out += [f"    1PSTEP              {k}           1           {k}",
+                    f"  100CL  101 1.000000000           {len(disp[k - 1])}                     0    {k}           1",
+                    " -4  DISP        4    1", " -5  D1          1    2    1    0", " -5  D2          1    2    2    0",
+                    " -5  D3          1    2    3    0", " -5  ALL         1    2    0    0    1ALL"]
+            for n, u in sorted(disp[k - 1].items()):
+                out.append(f" -1{n:10d}" + "".join(f"{x:12.5E}" for x in u))
+            out.append(" -3")
         out += [f"    1PSTEP              {k}           1           {k}",
                 f"  100CL  101 1.000000000           {len(pm)}                     0    {k}           1",
                 " -4  CONTACT     6    1",
@@ -237,7 +246,7 @@ def test_validation_errors():
     assert "needs supports" in errs(lambda s: s["bcs"].pop(0) and s["sweep"].update(bc="pull"))
     assert "kind is one of" in errs(lambda s: s["bcs"].append({"kind": "temperature", "faces": {"part": "top", "nz": 1}}))
     assert "converge" in errs(lambda s: s.update(converge=True))
-    assert "images" in errs(lambda s: s.update(images=True))
+    assert "images[0]" in errs(lambda s: s.update(images=[{"field": "temperature"}]))
 
 
 def test_thread_engagement_needs_a_bore(tmp_path):
@@ -277,3 +286,60 @@ def test_thread_engagement_in_a_tapped_hole(tmp_path):
     assert np.all(z_nut <= top_of_base + 1e-6) and np.all(z_nut >= top_of_base - 12 - 1e-6)
     assert np.allclose(np.linalg.norm(X[geo["nut"], :2], axis=1), 5.125, atol=0.05)
     assert 30 < geo["grip"] < 42
+
+
+def test_joint_pictures(pull, tmp_path, monkeypatch):
+    """The state of a joint study (every step's displacements, stresses and gasket stress) and its default
+    pictures: the setup with the bolts, the gasket at the preload and at the last step, the deformed assembly."""
+    from fea_translator import render
+    monkeypatch.setenv("FEAT_RENDER", "matplotlib")
+    st, parts, text, plan = pull
+    X = joint.all_nodes(parts)
+    g = plan["gaskets"][0]
+    tets = np.concatenate([p["mesh"].tets + p["n0"] for p in parts])
+    _, area, _ = joint.gasket_graph(X, tets, [tuple(f) for f in g["slave_faces"]])
+    nodes = sorted(area)
+    n_top0 = parts[1]["n0"]
+    # the gasket stress falls from the bolt outwards as the pull rises; the top block rises
+    cps = [{n: max(0.0, 8.0 - k - 0.1 * float(np.linalg.norm(X[n - 1, :2]))) for n in nodes} for k in range(5)]
+    disp = [{n: (0.0, 0.0, 0.002 * k * (n > n_top0)) for n in range(1, len(X) + 1)} for k in range(5)]
+    frd = _frd(cps, disp)
+    res = joint.evaluate(st, parts, plan, _dat(plan, [[20000.0]] * 5), frd)
+    joint.save_state(tmp_path, st, parts, plan, res, frd)
+    state = render.load_state(tmp_path)
+    assert state["fields"]["U_steps"].shape == (5, len(X), 3) and state["fields"]["cp_steps"].shape == (5, len(X))
+    assert state["fields"]["U_steps"][4, -1, 2] == pytest.approx(0.008, rel=1e-5)
+    assert {b["name"]: b["kind"] for b in state["meta"]["bcs"]} == {"side": "fixed", "pull": "force", "g": "gasket"}
+    assert len(state["meta"]["bolts"]) == 1 and state["meta"]["gaskets"]["g"]["normal"] == pytest.approx([0, 0, -1])
+    specs = render.default_images(st)
+    assert [sp["name"] for sp in specs] == ["setup", "g_preload", "g_last", "displacement"]
+    assert validate_study(dict(st, images=True))["ok"] and validate_study(dict(st, images=specs))["ok"]
+    out, warns = render.render(tmp_path, True, "pull")
+    assert not [w for w in warns if "VTK" not in w and "Matplotlib" not in w], warns
+    assert set(out) == {"setup", "g_preload", "g_last", "displacement"}
+    assert out["setup"]["bolts"] == 1 and out["setup"]["bcs"]["g"]["triangles"] > 0
+    assert out["g_preload"]["max"] == pytest.approx(max(cps[0].values()), rel=1e-5)
+    assert out["g_preload"]["clim"] == pytest.approx([0, max(cps[0].values())], rel=1e-5)   # from 0 (open)
+    assert out["g_last"]["max"] == pytest.approx(max(cps[4].values()), rel=1e-5)
+    assert out["g_preload"]["seal_MPa"] == 1.0                     # the pull gasket's seal.stress, on the colour bar
+    assert "step 1 (preload)" in out["g_preload"]["what"] and "pull = 8e+04 N" in out["g_last"]["what"]
+    import matplotlib.image as mpimg
+    for k in out:
+        assert mpimg.imread(out[k]["path"]).std() > 0.02
+    # a gasket picture is viewed face on: from below for this downward-facing gasket face
+    _, sp = render.at_step(state, {"field": "gasket_stress"})
+    assert sp["surface"] == "g" and sp["step"] == 5 and sp["view"] == [-90.0, -90.0]
+
+
+def test_joint_image_validation():
+    st = cases()["joint_pull"]
+
+    def errs(images):
+        return " | ".join(validate_study(dict(st, images=images))["errors"])
+    assert errs([{"field": "gasket_stress", "step": 3}]) == ""
+    assert "step: 1 (the preload) to 9" in errs([{"field": "displacement", "step": 10}])
+    assert "drawn on a gasket" in errs([{"field": "gasket_stress", "surface": "side"}])
+    assert "not a field of this joint study" in errs([{"field": "temperature"}])
+    assert "for modal and buckling" in errs([{"mode": 1}])
+    assert "step: for joint studies" in " | ".join(
+        validate_study(dict(cases()["cantilever"], images=[{"field": "von_mises", "step": 1}]))["errors"])

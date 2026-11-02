@@ -1,7 +1,7 @@
 """render_vtk.py — 3D pictures with VTK (through PyVista), offscreen: lit, smooth surfaces for an image's
 "quality": "high" (fields, mode shapes, section cuts, the setup view). Matplotlib (render.py) stays the default
 and the fallback when VTK cannot draw.
-Version: 2026.10.28.1
+Version: 2026.11.01.6
 
     render(state_dir, specs, out_dir, name) -> ({name: {path, what, ...}}, warnings)    (in the caller's process)
     probe() -> {ok, window, prefix, why}: can this machine draw offscreen (cached per process)
@@ -191,12 +191,19 @@ def draw_setup(state, spec, title, path) -> dict:
     p = _plotter(title)
     p.add_mesh(m, scalars="rgb", rgb=True, smooth_shading=True, split_sharp_edges=True, specular=0.15, ambient=0.45,
                diffuse=0.6)                                   # bright enough to tell the bc colours apart
+    bolts = state["meta"].get("bolts") or []
+    if bolts:   # joint studies: each bolt from head to nut
+        import pyvista as pv
+        pts = np.array([q for b in bolts for q in b], float)
+        lines = np.array([[2, 2 * i, 2 * i + 1] for i in range(len(bolts))]).ravel()
+        p.add_mesh(pv.PolyData(pts, lines=lines), color="black", line_width=4)
+        legend.append([f"bolts ({len(bolts)})", "black"])
     for i, (label, color) in enumerate(legend):   # one line per bc in its colour, under the title
         p.add_text(label, position=(18, SIZE[1] - 64 - 26 * i), font_size=12, color=color)
     _camera(p, spec.get("view", [25, -60]), m.bounds)
     p.screenshot(str(path))
     p.close()
-    return {"bcs": info, "renderer": "vtk"}
+    return dict({"bcs": info, "renderer": "vtk"}, **({"bolts": len(bolts)} if bolts else {}))
 
 
 def draw_field(state, spec, title, path) -> dict:
@@ -255,7 +262,7 @@ def draw_field(state, spec, title, path) -> dict:
 
 
 def _child(state_dir: str, spec_file: str, out_dir: str, name: str) -> dict:
-    from .render import load_state, title_of
+    from .render import at_step, load_state, title_of
     state = load_state(Path(state_dir))
     specs = json.loads(Path(spec_file).read_text())
     images, warns = {}, []
@@ -263,8 +270,9 @@ def _child(state_dir: str, spec_file: str, out_dir: str, name: str) -> dict:
         nm = sp["name"]
         path = Path(out_dir) / f"{nm}.png"
         try:
-            what = title_of(state, sp, name)
-            info = draw_setup(state, sp, what, path) if sp.get("setup") else draw_field(state, sp, what, path)
+            st_k, sp = at_step(state, sp)
+            what = title_of(st_k, sp, name)
+            info = draw_setup(st_k, sp, what, path) if sp.get("setup") else draw_field(st_k, sp, what, path)
             images[nm] = {"path": str(path), "what": what, **info}
         except Exception as exc:  # noqa: BLE001 (a picture must not fail the study)
             warns.append(f"image {nm!r}: VTK: {type(exc).__name__}: {exc}")

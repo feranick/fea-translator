@@ -1,6 +1,6 @@
 """render.py — pictures of a solved study: a field on the part's surface (deformed or not), mode shapes, the
 "setup" view (which faces each support and load took), and section cuts; plus the saved state they are drawn from.
-Version: 2026.10.28.1
+Version: 2026.11.01.6
 
     render(folder, specs, name) -> ({name: {path, what, ...}}, warnings)    from <folder>/state.npz into <folder>/images
     default_images(state | study) -> specs (for "images": true)
@@ -32,24 +32,28 @@ FIELDS = {"von_mises": "von Mises stress (MPa)", "displacement": "displacement m
           "ux": "displacement x (mm)", "uy": "displacement y (mm)", "uz": "displacement z (mm)",
           "max_principal": "max principal stress (MPa)", "safety_factor": "safety factor (yield / von Mises)",
           "temperature": "temperature (°C)", "heat_flux": "heat flux magnitude (W/m²)", "potential": "potential (V)",
-          "current_density": "current density magnitude (A/mm²)", "e_field": "electric field magnitude (kV/mm)"}
+          "current_density": "current density magnitude (A/mm²)", "e_field": "electric field magnitude (kV/mm)",
+          "gasket_stress": "gasket stress (contact pressure, MPa)"}
 MODE_LABEL = "mode shape: displacement magnitude (relative)"
 CMAPS = {"von_mises": "jet", "max_principal": "coolwarm", "safety_factor": "RdYlGn", "temperature": "inferno",
          "heat_flux": "inferno", "potential": "viridis", "current_density": "plasma", "e_field": "plasma",
-         "ux": "coolwarm", "uy": "coolwarm", "uz": "coolwarm", "displacement": "viridis"}
+         "ux": "coolwarm", "uy": "coolwarm", "uz": "coolwarm", "displacement": "viridis", "gasket_stress": "turbo"}
 MECH = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal", "safety_factor")
 PALETTE = ("#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22",
            "#7f7f7f", "#393b79", "#ad494a")
 PART_GREY = "#c8c8c8"
 DEFORM_FRACTION = 0.05      # deformed: true scales the largest displacement to 5 % of the part's size
 SIZE_IN, DPI = (9, 7), 130
-SPEC_KEYS = ("name", "surface", "field", "deformed", "view", "clim", "quality", "mode", "setup", "slice")
+SPEC_KEYS = ("name", "surface", "field", "deformed", "view", "clim", "quality", "mode", "setup", "slice", "step")
+JOINT_FIELDS = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal", "gasket_stress")
 
 
 # ---- which fields an analysis has ----------------------------------------------------------------
 def fields_of(study: dict) -> tuple:
     """The fields a study's pictures can show (safety_factor needs the material's yield)."""
     an = study.get("analysis")
+    if an == "joint":
+        return JOINT_FIELDS
     mech = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal")
     from .study import material_of
     try:
@@ -71,6 +75,13 @@ def default_images(study: dict, modes: int | None = None) -> list[dict]:
     electrostatic: potential and electric field; joule: temperature, potential and current density."""
     an = study.get("analysis")
     vm = {"name": "von_mises", "field": "von_mises", "deformed": True}
+    if an == "joint":   # the setup, each gasket's stress at the preload and at the last step, the deformed assembly
+        last = joint_steps(study)
+        out = [{"name": "setup", "setup": True}]
+        for g in study.get("gaskets", []):
+            out += [{"name": f"{g['name']}_preload", "field": "gasket_stress", "surface": g["name"], "step": 1},
+                    {"name": f"{g['name']}_last", "field": "gasket_stress", "surface": g["name"], "step": last}]
+        return out + [{"name": "displacement", "field": "displacement", "deformed": True, "step": last}]
     if an == "static":
         return [vm, {"name": "setup", "setup": True}]
     if an == "modal":
@@ -92,6 +103,13 @@ def _num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def joint_steps(study: dict) -> int:
+    """A joint study's steps: the preload, then the swept load's steps."""
+    sw = study.get("sweep") if isinstance(study.get("sweep"), dict) else {}
+    n = sw.get("steps", 10)
+    return 1 + (int(n) if _num(n) else 10)
+
+
 def image_errors(images, study: dict) -> list[str]:
     """Errors of a study's "images": true, or a list of views (validated against its analysis and bc names)."""
     if images is True or images is False:
@@ -102,6 +120,8 @@ def image_errors(images, study: dict) -> list[str]:
     from .study import bc_name
     an = study.get("analysis")
     bcs = [bc_name(i, b) for i, b in enumerate(study.get("bcs", []) or []) if isinstance(b, dict)]
+    gaskets = [g.get("name") for g in study.get("gaskets", []) or [] if isinstance(g, dict)] if an == "joint" else []
+    bcs += gaskets
     have = fields_of(study)
     modes = int(study.get("modes", 6 if an == "modal" else 3)) if _num(study.get("modes", 0)) else 6
     errs, names = [], []
@@ -137,7 +157,14 @@ def image_errors(images, study: dict) -> list[str]:
         if not what and not have:
             errs.append(f"{w}: a {an} study's pictures are mode shapes: give mode: n")
         if "surface" in sp and sp["surface"] != "part" and sp["surface"] not in bcs:
-            errs.append(f"{w}.surface: part or a bc name ({', '.join(bcs) or 'none'})")
+            errs.append(f"{w}.surface: part or a bc{' or gasket' if an == 'joint' else ''} name ({', '.join(bcs) or 'none'})")
+        if sp.get("field") == "gasket_stress" and sp.get("surface", gaskets[0] if gaskets else None) not in gaskets:
+            errs.append(f"{w}: gasket_stress is drawn on a gasket: surface: {' | '.join(map(str, gaskets)) or 'a gasket'}")
+        if "step" in sp:
+            if an != "joint":
+                errs.append(f"{w}.step: for joint studies")
+            elif not _num(sp["step"]) or int(sp["step"]) != sp["step"] or not 1 <= sp["step"] <= joint_steps(study):
+                errs.append(f"{w}.step: 1 (the preload) to {joint_steps(study)} (the full swept load)")
         if "setup" in sp and any(k in sp for k in ("deformed", "clim")):
             errs.append(f"{w}: the setup view takes no deformed or clim")
         if "deformed" in sp:
@@ -229,7 +256,8 @@ def field_values(state: dict, field: str | None, mode: int | None = None) -> np.
         m = np.linalg.norm(modes[mode - 1], axis=1)
         return m / max(float(m.max()), 1e-300)
     need = {"von_mises": "S", "max_principal": "S", "safety_factor": "S", "displacement": "U", "ux": "U", "uy": "U",
-            "uz": "U", "temperature": "T", "heat_flux": "q", "potential": "phi", "current_density": "J", "e_field": "E"}
+            "uz": "U", "temperature": "T", "heat_flux": "q", "potential": "phi", "current_density": "J", "e_field": "E",
+            "gasket_stress": "cp"}
     key = need.get(field)
     if key is None:
         raise ValueError(f"unknown field {field!r}")
@@ -296,6 +324,55 @@ def _limits(vals: np.ndarray, spec: dict, default: str) -> tuple[float, float, s
     ext = {(True, True): "both", (True, False): "min", (False, True): "max"}.get(
         (bool(len(v) and v.min() < lo), bool(len(v) and v.max() > hi)), "neither")
     return lo, hi, ext
+
+
+# ---- joint studies: one step of the saved steps ------------------------------------------------------
+def view_from(normal) -> list[float]:
+    """[elevation, azimuth] of a camera on the side a face's outward normal points to (looking at the face)."""
+    n = np.asarray(normal, float)
+    n = n / max(float(np.linalg.norm(n)), 1e-300)
+    if abs(n[2]) > 0.999:          # along z: x to the right
+        return [90.0 if n[2] > 0 else -90.0, -90.0]
+    return [float(np.degrees(np.arcsin(np.clip(n[2], -1, 1)))), float(np.degrees(np.arctan2(n[1], n[0])))]
+
+
+def gasket_seal(state: dict, spec: dict) -> float | None:
+    """The sealing stress of a gasket picture's gasket at its step (the larger of seal.stress and m x p)."""
+    if spec.get("field") != "gasket_stress":
+        return None
+    g = (state["meta"].get("gaskets") or {}).get(spec.get("surface")) or {}
+    seal = g.get("seal_MPa_steps")
+    k = int(spec.get("step", len(seal or [])))
+    return float(seal[k - 1]) if seal and 1 <= k <= len(seal) and seal[k - 1] else None
+
+
+def at_step(state: dict, spec: dict) -> tuple[dict, dict]:
+    """A joint study's state at the picture's step (U, S and the gasket stress cp of that step; default the last),
+    and the spec with a gasket picture's defaults (its gasket, viewed face on). Other studies: unchanged."""
+    f = state["fields"]
+    if f.get("U_steps") is None:
+        return state, spec
+    n = len(f["U_steps"])
+    k = int(spec.get("step", n))
+    if not 1 <= k <= n:
+        raise ValueError(f"step {k}: this joint study saved steps 1 to {n}")
+    fields = dict(f, U=np.asarray(f["U_steps"][k - 1], float), S=np.asarray(f["S_steps"][k - 1], float),
+                  cp=np.asarray(f["cp_steps"][k - 1], float))
+    spec = dict(spec, step=k)
+    if spec.get("field") == "gasket_stress":
+        gs = state["meta"].get("gaskets") or {}
+        g = spec.get("surface") or next(iter(gs), None)
+        spec["surface"] = g
+        if "view" not in spec and g in gs:
+            spec["view"] = view_from(gs[g]["normal"])
+        st_k = dict(state, fields=fields)
+        if "clim" not in spec:   # from 0 (open) to the peak, the sealing stress always in range
+            seal = gasket_seal(st_k, spec) or 0.0
+            on = np.unique(st_k["tri"][surface_triangles(st_k, spec)])
+            top = float(np.max(fields["cp"][on])) if len(on) else 0.0
+            spec["clim"] = [0.0, max(top, 1.1 * seal, 1e-6)]
+        return st_k, spec
+    return dict(state, fields=fields), spec
 
 
 # ---- the saved state -----------------------------------------------------------------------------
@@ -420,6 +497,12 @@ def _axes3d(fig, pts, view):
     ax.set_xlabel("x (mm)")
     ax.set_ylabel("y (mm)")
     ax.set_zlabel("z (mm)")
+    e, a = float(view[0]), float(view[1]) % 180
+    along = "z" if abs(e) > 89 else ("x" if abs(e) < 1 and min(a, 180 - a) < 1 else
+                                     ("y" if abs(e) < 1 and abs(a - 90) < 1 else None))
+    if along:                      # looking along an axis: its ticks would pile up in one spot
+        getattr(ax, f"set_{along}ticks")([])
+        getattr(ax, f"set_{along}label")("")
     return ax
 
 
@@ -451,13 +534,19 @@ def draw_matplotlib(state: dict, spec: dict, title: str, path: Path) -> dict:
             info[b["name"]] = {"color": b["color"], "triangles": int(m.sum())}
         ax = _axes3d(fig, X, view)
         ax.add_collection3d(Poly3DCollection(T, facecolors=colors, edgecolors="none"))
+        bolts = state["meta"].get("bolts") or []
+        for b1, b2 in bolts:   # joint studies: each bolt from head to nut, drawn over the parts
+            ax.plot([b1[0], b2[0]], [b1[1], b2[1]], [b1[2], b2[2]], color="black", lw=2.5, zorder=10)
+        if bolts:
+            from matplotlib.lines import Line2D
+            handles.append(Line2D([0], [0], color="black", lw=2.5, label=f"bolts ({len(bolts)})"))
         if handles:
             ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.0, 1.0), fontsize=9, framealpha=0.9)
         ax.set_title(title)
         fig.tight_layout()
         fig.savefig(path, facecolor="white")
         plt.close(fig)
-        return {"bcs": info, "renderer": "matplotlib"}
+        return dict({"bcs": info, "renderer": "matplotlib"}, **({"bolts": len(bolts)} if bolts else {}))
     mode = spec.get("mode")
     vals = field_values(state, spec.get("field"), mode)
     U = displacement_of(state, spec)
@@ -504,6 +593,13 @@ def draw_matplotlib(state: dict, spec: dict, title: str, path: Path) -> dict:
     cb = fig.colorbar(sm, ax=ax, label=MODE_LABEL if mode is not None else FIELDS[spec["field"]], shrink=0.7, extend=ext,
                       format="%.4g")
     cb.ax.yaxis.get_major_formatter().set_useOffset(False) if hasattr(cb.ax.yaxis.get_major_formatter(), "set_useOffset") else None
+    seal = gasket_seal(state, spec)
+    if seal is not None:
+        info["seal_MPa"] = seal
+    if seal is not None and lo < seal < hi:   # the sealing stress on the colour bar: below it the gasket leaks
+        cb.ax.axhline(seal, color="white", lw=2.5)
+        cb.ax.axhline(seal, color="black", lw=1, ls="--")
+        cb.ax.text(1.6, seal, f"seal {seal:.3g}", transform=cb.ax.get_yaxis_transform(), va="center", fontsize=8)
     ax.set_title(title)
     fig.tight_layout()
     fig.savefig(path, facecolor="white")
@@ -527,6 +623,14 @@ def title_of(state: dict, spec: dict, name: str) -> str:
     s = f"{name}: {FIELDS[spec['field']]}"
     if spec.get("surface", "part") != "part":
         s += f" on {spec['surface']}"
+    steps = state["meta"].get("steps")
+    if steps and spec.get("step"):
+        k = int(spec["step"])
+        st = steps[k - 1] if k <= len(steps) else None
+        if k == 1:
+            s += ", step 1 (preload)"
+        elif st:
+            s += f", step {k} ({state['meta'].get('swept')} = {st['load']:.4g} {state['meta'].get('unit') or ''})".rstrip()
     if spec.get("slice"):
         s += f", cut at {spec['slice']['axis']} = {float(spec['slice']['at']):g} mm"
     return s
@@ -565,8 +669,9 @@ def render(folder: Path, specs: list, name: str = "study") -> tuple[dict, list]:
         nm = sp["name"]
         path = out_dir / f"{nm}.png"
         try:
-            what = title_of(state, sp, name)
-            info = draw_matplotlib(state, sp, what, path)
+            st_k, sp = at_step(state, sp)
+            what = title_of(st_k, sp, name)
+            info = draw_matplotlib(st_k, sp, what, path)
             out[nm] = {"path": str(path), "what": what, **{k: round(v, 6) if isinstance(v, float) else v for k, v in info.items()}}
         except Exception as exc:  # noqa: BLE001 (a picture must not fail the study)
             warns.append(f"image {nm!r}: {type(exc).__name__}: {exc}")
