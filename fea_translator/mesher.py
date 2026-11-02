@@ -1,5 +1,5 @@
 """mesher.py — the part as a tetrahedral mesh: Gmsh from a STEP file (or a build123d-translator goal).
-Version: 2026.11.02.7
+Version: 2026.11.02.8
 
     mesh_part(study, workdir) -> (Mesh, info)
 
@@ -123,9 +123,15 @@ def _gmsh_init(gmsh):
     gmsh.option.setNumber("General.Terminal", 0)
 
 
+CURVATURE = 12            # Gmsh's default here: elements per full circle on curved faces (0: sizes ignore curvature)
+
+
 def mesh_step(step: Path, size: float | None = None, order: int = 2, refine=(), save: Path | None = None,
-              factor: float = 1.0) -> tuple[Mesh, dict]:
-    """Mesh of a one-solid STEP: element size `size` (default 1/20 of the bounding-box diagonal) x factor."""
+              factor: float = 1.0, min_size: float | None = None, curvature: int = CURVATURE) -> tuple[Mesh, dict]:
+    """Mesh of a one-solid STEP: element size `size` (default 1/20 of the bounding-box diagonal) x factor.
+    min_size: no element smaller (mm, x factor; default size/10, or a quarter of the finest refine); curvature:
+    elements per full circle on curved faces (0 turns it off: small fillets and holes no longer shrink the elements
+    around them). Edges shorter than min_size in the CAD still get one element each."""
     import gmsh
 
     _gmsh_init(gmsh)
@@ -140,9 +146,11 @@ def mesh_step(step: Path, size: float | None = None, order: int = 2, refine=(), 
         diag = float(np.linalg.norm([xmax - xmin, ymax - ymin, zmax - zmin]))
         h = (float(size) if size else diag / 20) * factor
         refine = [dict(r, size=float(r['size']) * factor) for r in refine]
+        hmin = (float(min_size) * factor if min_size else
+                (min(h, *(r["size"] for r in refine)) / 4 if refine else h / 10))
         gmsh.option.setNumber("Mesh.MeshSizeMax", h)
-        gmsh.option.setNumber("Mesh.MeshSizeMin", min(h, *(r["size"] for r in refine)) / 4 if refine else h / 10)
-        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12)   # elements per full circle on curved faces
+        gmsh.option.setNumber("Mesh.MeshSizeMin", min(hmin, h))
+        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", int(curvature))   # elements per full circle (0: off)
         gmsh.option.setNumber("Mesh.ElementOrder", order)
         gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)        # mid-edge nodes on the geometry
         if refine:
@@ -203,8 +211,8 @@ def mesh_step(step: Path, size: float | None = None, order: int = 2, refine=(), 
     tets = order_known(nodes, tets)
     nodes, straightened = straighten_inverted(nodes, tets)
     mesh = Mesh(nodes, tets, surfaces, info).build()
-    info = {"size": h, "diag": diag, "nodes": len(nodes), "elements": len(tets), "order": order,
-            "straightened_elements": straightened}
+    info = {"size": h, "min_size": round(min(hmin, h), 6), "curvature": int(curvature), "diag": diag,
+            "nodes": len(nodes), "elements": len(tets), "order": order, "straightened_elements": straightened}
     if notes:
         info["mesh_notes"] = notes
     return mesh, info
@@ -224,6 +232,7 @@ def mesh_part(study: dict, workdir: Path, size_factor: float = 1.0) -> tuple[Mes
         mesh = box_mesh(lx, ly, lz, *div, order=order, origin=org)
         return mesh, {"size": h, "nodes": len(mesh.nodes), "elements": len(mesh.tets), "order": order, "divisions": div}
     step = part_step(study, workdir)
-    mesh, info = mesh_step(step, m.get("size"), order, m.get("refine", []), Path(workdir) / "mesh.msh", size_factor)
+    mesh, info = mesh_step(step, m.get("size"), order, m.get("refine", []), Path(workdir) / "mesh.msh", size_factor,
+                           m.get("min_size"), int(m.get("curvature", CURVATURE)))
     info["step"] = str(step)
     return mesh, info

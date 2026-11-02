@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.02.7
+Version: 2026.11.02.8
 """
 import copy
 import math
@@ -590,3 +590,30 @@ def test_an_unexpected_error_says_where(tmp_path, monkeypatch):
     r = runner.run_study("x", cases()["joint_pull"], tmp_path)
     assert r["why"] == "ValueError" and "zero-size array" in r["error"]
     assert r["stage"] and any("test_joint.py" in w and "boom" in w for w in r["where"])
+
+
+def test_mesh_min_size_and_curvature():
+    """A detailed part meshed coarsely: min_size and curvature (0: off) for any study, per part in a joint."""
+    from fea_translator.study import mesh_errors
+    assert mesh_errors({"size": 10, "min_size": 4, "curvature": 0}) == ([], [])
+    e, _ = mesh_errors({"size": 10, "min_size": 12, "curvature": 2.5, "fine": 1}, "parts.head.mesh")
+    assert any("unknown keys ['fine']" in m for m in e) and any("above 'size'" in m for m in e)
+    assert any("'curvature' is elements per full circle" in m for m in e) and all(m.startswith("parts.head.mesh") for m in e)
+    st = copy.deepcopy(cases()["joint_cover"])
+    st["parts"]["cover"]["mesh"] = {"min_size": 3}
+    assert validate_study(st)["ok"]
+    st["parts"]["cover"]["mesh"] = {"min_size": -1}
+    assert "parts.cover.mesh: 'min_size' must be positive" in " | ".join(validate_study(st)["errors"])
+
+
+def test_curvature_off_and_min_size_coarsen_a_filleted_part(tmp_path):
+    pytest.importorskip("gmsh")
+    pytest.importorskip("build123d_translator")
+    from fea_translator.mesher import mesh_part
+    goal = {"features": [{"kind": "base_box", "params": {"w": 80, "d": 60, "h": 20}},
+                         {"kind": "hole", "params": {"r": 1.5, "x": 20, "y": 10}},
+                         {"kind": "fillet_vertical", "params": {"r": 2}}]}
+    fine, i1 = mesh_part({"part": {"goal": goal}, "mesh": {"size": 10}}, tmp_path / "a")
+    coarse, i2 = mesh_part({"part": {"goal": goal}, "mesh": {"size": 10, "min_size": 5, "curvature": 0}}, tmp_path / "b")
+    assert i2["curvature"] == 0 and i2["min_size"] == 5 and i1["curvature"] == 12
+    assert len(coarse.nodes) < 0.7 * len(fine.nodes), (len(coarse.nodes), len(fine.nodes))

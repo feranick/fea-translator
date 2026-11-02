@@ -1,6 +1,6 @@
 """joint.py — bolted, gasketed assemblies: several parts in contact, bolt pretension, a gasket law, and the internal
 pressure stepped up to find where the joint leaks and where it lifts off (analysis "joint", CalculiX only).
-Version: 2026.11.02.4
+Version: 2026.11.02.8
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -43,7 +43,7 @@ import numpy as np
 
 from . import __version__, results
 from .meshdata import EDGE_MID, EDGES, FACES, Mesh, MeshError
-from .study import G_SCALE, MATERIALS, _num, _point, _selector, bc_name, material_of, to_deck_units
+from .study import G_SCALE, MATERIALS, _num, _point, _selector, bc_name, material_of, mesh_errors, to_deck_units
 
 # ISO 261 coarse threads: nominal diameter d, pitch P (mm); ISO 273 medium clearance; ISO 7089 washer outer diameter
 BOLTS = {"M3": (3, 0.5, 3.4, 7), "M4": (4, 0.7, 4.5, 9), "M5": (5, 0.8, 5.5, 10), "M6": (6, 1.0, 6.6, 12),
@@ -83,7 +83,7 @@ def mesh_parts(study: dict, folder: Path, size_factor: float = 1.0) -> list[dict
     from .mesher import mesh_part
     out, n0, e0 = [], 0, 0
     for pname, spec in study["parts"].items():
-        sub = {"part": spec["part"], "mesh": spec.get("mesh", study.get("mesh", {}))}
+        sub = {"part": spec["part"], "mesh": {**study.get("mesh", {}), **spec.get("mesh", {})}}   # the part's own over the study's
         d = Path(folder) / f"part_{pname}"
         d.mkdir(parents=True, exist_ok=True)
         mesh, info = mesh_part(sub, d, size_factor)
@@ -988,9 +988,17 @@ def validate(st: dict) -> tuple[list[str], list[str]]:
                 errs.append(f"{w}.material: a name or {{E, nu, ...}}")
         if "move" in p and not _point(p["move"]):
             errs.append(f"{w}.move: [dx, dy, dz]")
+        if "mesh" in p:
+            e, w2 = mesh_errors(p["mesh"], f"{w}.mesh", "joint")
+            errs += e
+            warns += w2
         extra = set(p) - {"part", "material", "mesh", "move"}
         if extra:
             errs.append(f"{w}: unknown keys {sorted(extra)}")
+    if "mesh" in st:
+        e, w2 = mesh_errors(st["mesh"], "mesh", "joint")
+        errs += e
+        warns += w2
     names = set(parts)
     bcs = st.get("bcs", [])
     bnames, nsup = [], 0

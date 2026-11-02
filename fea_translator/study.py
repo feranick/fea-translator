@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.11.02.7
+Version: 2026.11.02.8
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -120,7 +120,8 @@ CONVENTIONS = [
     "flows, heat balance.",
     "mesh.size is the element size in mm (default: 1/20 of the part's bounding-box diagonal); order 2 "
     "(10-node tetrahedra, default) is accurate for bending and curved faces; refine adds finer spheres "
-    "{at, r, size} at stress concentrations. Rerun with a smaller size to check convergence (converge: true does it).",
+    "{at, r, size} at stress concentrations; min_size (mm) and curvature (elements per circle, default 12; 0 "
+    "off) coarsen detailed parts. Rerun with a smaller size to check convergence (converge: true does it).",
     "expect: [{quantity, value, tol}] turns the run into a check: quantity is a dotted path into the results "
     "(max_displacement, max_von_mises, frequencies.0, buckling_factors.0, reactions.<bc name>.fz, "
     "probes.<name>.mean_u.uz, T_max, heat_flow.<bc name>); tol is relative (default 0.02).",
@@ -305,6 +306,37 @@ def _run_errors(st: dict) -> list[str]:
     return errs
 
 
+MESH_KEYS = {"size", "order", "refine", "min_size", "curvature"}
+
+
+def mesh_errors(mesh, where: str = "mesh", an: str | None = None) -> tuple[list[str], list[str]]:
+    """Errors and warnings of a mesh {size, order, refine, min_size, curvature} (a study's, or a joint part's)."""
+    errors, warnings = [], []
+    if not isinstance(mesh, dict):
+        return [f"{where}: an object {{size, order, refine, min_size, curvature}}"], []
+    if set(mesh) - MESH_KEYS:
+        errors.append(f"{where}: unknown keys {sorted(set(mesh) - MESH_KEYS)} (allowed: {', '.join(sorted(MESH_KEYS))})")
+    if "size" in mesh and (not _num(mesh["size"]) or mesh["size"] <= 0):
+        errors.append(f"{where}: 'size' must be positive (mm)")
+    if "min_size" in mesh:
+        if not _num(mesh["min_size"]) or mesh["min_size"] <= 0:
+            errors.append(f"{where}: 'min_size' must be positive (mm): no element smaller")
+        elif _num(mesh.get("size")) and mesh["min_size"] > mesh["size"]:
+            errors.append(f"{where}: 'min_size' ({mesh['min_size']:g}) above 'size' ({mesh['size']:g})")
+    if "curvature" in mesh and (not _num(mesh["curvature"]) or int(mesh["curvature"]) != mesh["curvature"]
+                                or not 0 <= mesh["curvature"] <= 100):
+        errors.append(f"{where}: 'curvature' is elements per full circle on curved faces, 0 (off) to 100 (default 12)")
+    if mesh.get("order", 2) not in (1, 2):
+        errors.append(f"{where}: 'order' is 1 or 2")
+    if mesh.get("order", 2) == 1 and an in ("static", "modal", "buckling", "joint"):
+        warnings.append(f"{where}: 4-node tetrahedra are much too stiff in bending; use order 2")
+    for j, rf in enumerate(mesh.get("refine", []) if isinstance(mesh.get("refine", []), list) else [None]):
+        if not isinstance(rf, dict) or not _point(rf.get("at")) or not _num(rf.get("r")) or not _num(rf.get("size")) \
+                or rf["r"] <= 0 or rf["size"] <= 0:
+            errors.append(f"{where}: refine {j + 1} must be {{at: [x, y, z], r: radius > 0, size > 0}}")
+    return errors, warnings
+
+
 def validate_study(st: dict) -> dict:
     errors, warnings = [], []
     if not isinstance(st, dict):
@@ -442,20 +474,9 @@ def validate_study(st: dict) -> dict:
             warnings.append("sliders alone need three faces normal to X, Y and Z (and may still allow rotation)")
     if "modes" in st and (not _num(st["modes"]) or int(st["modes"]) != st["modes"] or not 1 <= st["modes"] <= 100):
         errors.append("modes: a whole number from 1 to 100")
-    mesh = st.get("mesh", {})
-    if not isinstance(mesh, dict):
-        errors.append("mesh: an object {size, order, refine}")
-    else:
-        if "size" in mesh and (not _num(mesh["size"]) or mesh["size"] <= 0):
-            errors.append("mesh: 'size' must be positive (mm)")
-        if mesh.get("order", 2) not in (1, 2):
-            errors.append("mesh: 'order' is 1 or 2")
-        if mesh.get("order", 2) == 1 and an in ("static", "modal", "buckling"):
-            warnings.append("mesh: 4-node tetrahedra are much too stiff in bending; use order 2")
-        for j, rf in enumerate(mesh.get("refine", []) if isinstance(mesh.get("refine", []), list) else [None]):
-            if not isinstance(rf, dict) or not _point(rf.get("at")) or not _num(rf.get("r")) or not _num(rf.get("size")) \
-                    or rf["r"] <= 0 or rf["size"] <= 0:
-                errors.append(f"mesh: refine {j + 1} must be {{at: [x, y, z], r: radius > 0, size > 0}}")
+    e, w = mesh_errors(st.get("mesh", {}), "mesh", an)
+    errors += e
+    warnings += w
     for j, pr in enumerate(st.get("probes", [])):
         if not isinstance(pr, dict) or not isinstance(pr.get("name"), str) or "faces" not in pr:
             errors.append(f"probe {j + 1}: needs 'name' and 'faces'")
