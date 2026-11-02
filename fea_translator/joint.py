@@ -1,6 +1,6 @@
 """joint.py — bolted, gasketed assemblies: several parts in contact, bolt pretension, a gasket law, and the internal
 pressure stepped up to find where the joint leaks and where it lifts off (analysis "joint", CalculiX only).
-Version: 2026.11.02.1
+Version: 2026.11.02.2
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -246,12 +246,11 @@ def _name(s: str) -> str:
 
 
 def _equation(dep: int, others: list[int], ref: int, d: int, avoid: set) -> list[str]:
-    """sum(u_j) - n u_ref = 0 in direction d (1-based nodes): the reference node follows the mean of the nodes.
-    The first (dependent) term is a node not held by a support."""
+    """n u_ref - sum(u_j) = 0 in direction d (1-based nodes): the reference node follows the mean of the nodes.
+    The reference node (a bolt end, in no other equation as dependent, never held) is the dependent term: a bearing
+    node can be held by a support (a nut on a fixed face), and CalculiX refuses a held DOF on the dependent side."""
     nodes = [dep] + [o for o in others if o != dep]
-    pick = next((q for q in nodes if q not in avoid), nodes[0])
-    nodes = [pick] + [q for q in nodes if q != pick]
-    terms = [(q, d, 1.0) for q in nodes] + [(ref, d, -float(len(nodes)))]
+    terms = [(ref, d, float(len(nodes)))] + [(q, d, -1.0) for q in nodes]
     out = ["*EQUATION", str(len(terms))]
     for k in range(0, len(terms), 4):
         out.append(", ".join(f"{q}, {dd}, {_g(c)}" for q, dd, c in terms[k:k + 4]))

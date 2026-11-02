@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.02.1
+Version: 2026.11.02.2
 """
 import copy
 import math
@@ -79,14 +79,16 @@ def test_deck_structure(pull, tmp_path):
     # the beam's end nodes and the pretension node come after the mesh nodes, the beam after the tets
     n_mesh = sum(len(p["mesh"].nodes) for p in parts)
     assert min(plan["pret_nodes"]) > n_mesh
-    # every equation line: terms of (node, dof, coefficient), the first one's node not held by a support
-    held = set(plan["sets"]["side"]["nodes"])
+    # every equation's dependent (first) term is one of the bolt's own nodes: never held, never a mesh node
     eq = [ln for ln in text.splitlines()]
+    deps = []
     for i, ln in enumerate(eq):
         if ln.upper().startswith("*EQUATION"):
             nterms = int(eq[i + 1])
             first = eq[i + 2].split(",")
-            assert int(first[0]) not in held and nterms >= 2
+            deps.append((int(first[0]), int(first[1])))
+            assert int(first[0]) > n_mesh and nterms >= 2
+    assert len(deps) == len(set(deps)) == 9                          # each DOF dependent in one equation only
 
 
 def test_gasket_law_tabular_and_linear():
@@ -514,3 +516,19 @@ def test_a_surface_gmsh_cannot_mesh_is_tried_with_other_algorithms():
             raise Exception("some other failure")
     with pytest.raises(Exception, match="some other failure"):
         generate(Other(0), 3, [])
+
+
+def test_a_nut_on_a_fixed_face(tmp_path):
+    """joint_two_bolt's nuts bear on the body's fixed bottom face: every nut node is held; the equations still take
+    the bolt's own end node as the dependent DOF (CalculiX: '*ERROR in cascade: the DOF corresponding to ...')."""
+    st = cases()["joint_two_bolt"]
+    parts = joint.mesh_parts(st, tmp_path)
+    text, plan = joint.write("tb", st, parts)
+    held = set(plan["sets"]["feet"]["nodes"])
+    eq = text.splitlines()
+    deps = [tuple(int(v) for v in eq[i + 2].split(",")[:2]) for i, ln in enumerate(eq) if ln.startswith("*EQUATION")]
+    assert len(deps) == 18 and len(set(deps)) == 18 and not {n for n, _ in deps} & held
+    nut = [i for i, ln in enumerate(eq) if ln.startswith("*EQUATION")][3]   # bolt 1, direction 1, the nut's equation
+    terms = " ".join(eq[nut + 2:nut + 2 + 4]).replace(" ", "").split(",")
+    assert any(int(n) in held for n in terms[3::3] if n.isdigit())
+    assert plan["gaskets"][0]["curve_raised"] and list(plan["stabilisation"]["parts"]) == ["cover"]

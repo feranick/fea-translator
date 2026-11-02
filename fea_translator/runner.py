@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.02.1
+Version: 2026.11.02.2
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -179,7 +179,16 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None) -> st
         code = _wait_rss(p, timeout, monitor)    # waits with wait4, which also gives the child's peak memory
     log = log_path.read_text(errors="replace")
     PEAK["threads"] = max(PEAK["threads"], int(env.get("OMP_NUM_THREADS", "1")))
-    errs = [ln.strip() for ln in log.splitlines() if "*ERROR" in ln.upper()]
+    lines = log.splitlines()
+    errs = []
+    for i, ln in enumerate(lines):   # an error with the lines that finish its sentence ("... the DOF corresponding to / node 12")
+        if "*ERROR" in ln.upper():
+            more = []
+            for nx in lines[i + 1:i + 4]:
+                if not nx.strip() or "*ERROR" in nx.upper() or "*WARNING" in nx.upper():
+                    break
+                more.append(nx.strip())
+            errs.append(" ".join([ln.strip()] + more))
     threads = int(env.get("OMP_NUM_THREADS", "1"))
     if not errs and (code != 0 or not inp.with_suffix(".dat").is_file()) and threads > 1:
         # it died with no error of its own (a crash in the threaded solver: the eigenvalue step on a
