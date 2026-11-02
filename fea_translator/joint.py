@@ -1,6 +1,6 @@
 """joint.py — bolted, gasketed assemblies: several parts in contact, bolt pretension, a gasket law, and the internal
 pressure stepped up to find where the joint leaks and where it lifts off (analysis "joint", CalculiX only).
-Version: 2026.11.02.3
+Version: 2026.11.02.4
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -18,8 +18,9 @@ stiffness times its stretch; at the preload it must equal the preload (bolt_prel
 or bending: friction at the gasket holds the parts sideways.
 
 The gasket is the contact between the two flange faces (face-to-face penalty contact, TYPE=SURFACE TO SURFACE, as
-CalculiX recommends with 10-node tetrahedra): its compression curve (closure mm, stress MPa) becomes the tabular
-pressure-overclosure law (or a linear stiffness, MPa/mm), with friction. The contact pressure at the gasket's slave
+CalculiX recommends with 10-node tetrahedra) with a linear pressure-overclosure law and friction: its stiffness
+(MPa/mm), or its compression curve's secant at the mean gasket stress under the preload (CalculiX ignores a tabular
+law in face-to-face contact: the parts pass through each other). The contact pressure at the gasket's slave
 nodes is the gasket stress.
 
 Leak and lift-off: after the preload step, the swept load (the internal-pressure bc, at its full value in the last
@@ -292,14 +293,6 @@ def gasket_curve(g: dict) -> tuple[list[tuple[float, float]], bool]:
     return out, raised
 
 
-def gasket_slope(g: dict) -> float:
-    """The gasket's reference normal stiffness (MPa/mm): its stiffness, or the curve's steepest segment."""
-    if "curve" not in g:
-        return float(g["stiffness"])
-    pts, _ = gasket_curve(g)
-    return max((s2 - s1) / max(c2 - c1, 1e-12) for (c1, s1), (c2, s2) in zip(pts, pts[1:]))
-
-
 def gap_warning(g: dict) -> str | None:
     gp = g.get("gap") or {}
     if gp.get("median_mm") is None or gp["median_mm"] <= GAP_TOL:
@@ -308,20 +301,45 @@ def gap_warning(g: dict) -> str | None:
             "before the preload: they should touch (parts.move); the gasket's thickness is not meshed")
 
 
-def friction_lines(g: dict, stick: float = 1.0) -> list[str]:
-    """*FRICTION: mu and the stick slope (100 times below the normal stiffness, x stick)."""
-    return ["*FRICTION", f"{_g(float(g.get('friction', 0.2)))}, {_g(gasket_slope(g) / 100.0 * stick)}"]
+def closure_at(g: dict, stress: float) -> float:
+    """The closure (mm) of a gasket curve at a stress (MPa): linear between its points, the last segment beyond."""
+    pts, _ = gasket_curve(g)
+    for (c1, s1), (c2, s2) in zip(pts, pts[1:]):
+        if stress <= s2:
+            return c1 + (c2 - c1) * (stress - s1) / max(s2 - s1, 1e-300)
+    (c1, s1), (c2, s2) = pts[-2], pts[-1]
+    return c2 + (c2 - c1) * (stress - s2) / max(s2 - s1, 1e-300)
 
 
-def gasket_law(g: dict, stick: float = 1.0) -> list[str]:
-    """*SURFACE BEHAVIOR (and *FRICTION) of a gasket: the compression curve as (pressure, overclosure) pairs, or a
-    linear stiffness (MPa/mm = N/mm3)."""
-    if "curve" in g:
-        pts, _ = gasket_curve(g)
-        L = ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR"] + [f"{_g(s)}, {_g(c)}" for c, s in pts]
-    else:
-        L = ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR", _g(float(g["stiffness"]))]
-    return L + friction_lines(g, stick)
+def gasket_linear(g: dict, preload_MPa: float) -> dict:
+    """The gasket's linear law for CalculiX: its stiffness, or its curve's secant at the mean preload stress (the
+    curve's own secant at its last point when there is no preload)."""
+    if "curve" not in g:
+        return {"kind": "stiffness", "stiffness_MPa_mm": float(g["stiffness"])}
+    pts, raised = gasket_curve(g)
+    at = preload_MPa if preload_MPa > 0 else pts[-1][1]
+    c = closure_at(g, at)
+    return {"kind": "secant", "stiffness_MPa_mm": at / c, "at_MPa": round(at, 6), "closure_mm": round(c, 6),
+            "beyond_curve": bool(at > pts[-1][1]), "curve_raised": raised}
+
+
+def friction_lines(k: float, g: dict, stick: float = 1.0) -> list[str]:
+    """*FRICTION: mu and the stick slope (100 times below the normal stiffness k, x stick)."""
+    return ["*FRICTION", f"{_g(float(g.get('friction', 0.2)))}, {_g(k / 100.0 * stick)}"]
+
+
+def _nearest_gasket(X: np.ndarray, b: dict, axis, gasket_nodes: dict) -> str | None:
+    """The gasket a bolt clamps: the one with a node nearest to the bolt's axis."""
+    best, name = math.inf, None
+    a = np.asarray(axis, float)
+    for gname, nodes in gasket_nodes.items():
+        if not len(nodes):
+            continue
+        rel = X[nodes] - np.asarray(b["B1"], float)
+        d = np.linalg.norm(rel - np.outer(rel @ a, a), axis=1).min()
+        if d < best:
+            best, name = d, gname
+    return name
 
 
 def spread_nodes(X: np.ndarray, cand: np.ndarray, n: int) -> list[int]:
@@ -422,30 +440,11 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         if "density" in m:
             L += ["*DENSITY", _g(m["density"])]
         L.append(f"*SOLID SECTION, ELSET=E_{_name(p['name'])}, MATERIAL=M_{_name(p['name'])}")
-    # gaskets: face-to-face contact with the gasket law
-    for g in study.get("gaskets", []):
-        gn = _name(g["name"])
-        slave, master = select(parts, g["faces"]), select(parts, g["with"])
-        sf, mf = _gfaces(slave), _gfaces(master)
-        L += [f"*SURFACE, NAME=GS_{gn}"] + [f"{e + 1}, S{s}" for e, s in sf]
-        L += [f"*SURFACE, NAME=GM_{gn}"] + [f"{e + 1}, S{s}" for e, s in mf]
-        L += [f"*SURFACE INTERACTION, NAME=GI_{gn}"] + gasket_law(g, PRELOAD_STICK)
-        L += [f"*CONTACT PAIR, INTERACTION=GI_{gn}, TYPE=SURFACE TO SURFACE", f"GS_{gn}, GM_{gn}"]
-        nrm = sum((p["mesh"].groups[tg_].normal * p["mesh"].groups[tg_].area[:, None]).sum(axis=0)
-                  for p, tgs in slave for tg_ in tgs)
-        gap = face_gap(X, _gnodes(slave), _gnodes(master), _unit(nrm))
-        plan["gaskets"].append({"name": g["name"], "slave_faces": sf, "seal": g.get("seal", {}),
-                                "inner_at": g.get("inner_at"), "tags": gtags(parts, slave),
-                                "with_tags": gtags(parts, master), "normal": _unit(nrm).tolist(),
-                                "curve_raised": bool("curve" in g and gasket_curve(g)[1]), "friction": friction_lines(g),
-                                "interaction": f"GI_{gn}", "gap": gap,
-                                "area": sum(p["mesh"].area_of(tg) for p, tg in slave)})
-        plan["selection"][f"gasket {g['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in slave for t in tg]
-        plan["selection"][f"gasket {g['name']} (with)"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in master for t in tg]
     # bolts: a spring (SPRINGA, k = E A_s / grip) from a cut node C at the head to the nut, with the pretension as
     # an equation across the cut: u_C = mean(u_head) - u_PT * axis (CalculiX's own *PRE-TENSION SECTION on a beam deletes the
     # beam and leaves a rigid link: the bolt would have no stretch). B1 and B2 follow their bearing nodes' mean.
     springs, eqs, pret = [], [], []
+    gasket_nodes = {g["name"]: _gnodes(select(parts, g["faces"])) for g in study.get("gaskets", [])}
     for gi, b in enumerate(study.get("bolts", [])):
         bn = _name(b["name"])
         sz = bolt_size(b)
@@ -488,6 +487,36 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
     for eid, nc, n2, bn, k in springs:   # one element set per spring: each has its own stiffness (its grip)
         L += [f"*ELEMENT, TYPE=SPRINGA, ELSET=ES{eid}", f"{eid}, {nc}, {n2}", f"*SPRING, ELSET=ES{eid}", _g(k)]
     L += eqs
+    # gaskets: face-to-face contact. CalculiX ignores a TABULAR pressure-overclosure law in face-to-face contact (the
+    # parts pass through each other: joint_two_bolt and an S50 cover, 2026.11.02): a curve becomes the LINEAR law of
+    # its secant at the gasket's mean stress under the preload (the bolts nearest to it, over its area)
+    for g in study.get("gaskets", []):
+        gn = _name(g["name"])
+        slave, master = select(parts, g["faces"]), select(parts, g["with"])
+        sf, mf = _gfaces(slave), _gfaces(master)
+        sn = _gnodes(slave)
+        area = sum(p["mesh"].area_of(tg) for p, tg in slave)
+        clamp = 0.0
+        for rec in plan["bolts"]:
+            for b_ in rec["bolts"]:
+                if _nearest_gasket(X, b_, rec["axis"], gasket_nodes) == g["name"]:
+                    clamp += rec["preload_N"]
+        law = gasket_linear(g, clamp / area if area else 0.0)
+        L += [f"*SURFACE, NAME=GS_{gn}"] + [f"{e + 1}, S{s}" for e, s in sf]
+        L += [f"*SURFACE, NAME=GM_{gn}"] + [f"{e + 1}, S{s}" for e, s in mf]
+        L += [f"*SURFACE INTERACTION, NAME=GI_{gn}", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR",
+              _g(law["stiffness_MPa_mm"])] + friction_lines(law["stiffness_MPa_mm"], g, PRELOAD_STICK)
+        L += [f"*CONTACT PAIR, INTERACTION=GI_{gn}, TYPE=SURFACE TO SURFACE", f"GS_{gn}, GM_{gn}"]
+        nrm = sum((p["mesh"].groups[tg_].normal * p["mesh"].groups[tg_].area[:, None]).sum(axis=0)
+                  for p, tgs in slave for tg_ in tgs)
+        gap = face_gap(X, sn, _gnodes(master), _unit(nrm))
+        plan["gaskets"].append({"name": g["name"], "slave_faces": sf, "seal": g.get("seal", {}),
+                                "inner_at": g.get("inner_at"), "tags": gtags(parts, slave),
+                                "with_tags": gtags(parts, master), "normal": _unit(nrm).tolist(),
+                                "law": law, "friction": friction_lines(law["stiffness_MPa_mm"], g),
+                                "interaction": f"GI_{gn}", "gap": gap, "area": area})
+        plan["selection"][f"gasket {g['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in slave for t in tg]
+        plan["selection"][f"gasket {g['name']} (with)"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in master for t in tg]
     # stabilisation: weak springs to ground on every part no support holds (before the gasket is pressed it has no
     # stiffness and friction none: the part could slide and rock about the bolt line, and the preload chatters)
     k_stab = STAB_FRACTION * min((q["k_N_mm"] for rec in plan["bolts"] for q in rec["bolts"]), default=1.0)
@@ -839,10 +868,18 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
         res["gaskets"][g["name"]]["gap_mm"] = (g.get("gap") or {}).get("median_mm")
         if gap_warning(g):
             res.setdefault("warnings", []).append(gap_warning(g))
-        if g.get("curve_raised"):
+        law = g.get("law") or {}
+        res["gaskets"][g["name"]]["law"] = law
+        if law.get("beyond_curve"):
             res.setdefault("warnings", []).append(
-                f"gasket {g['name']}: segments of its curve softer than {100 * MIN_SLOPE:g} % of its secant slope were "
-                "raised to it (no zero-stiffness contact at first touch)")
+                f"gasket {g['name']}: the mean preload stress ({law['at_MPa']:.4g} MPa) is beyond its curve's last point: "
+                "the secant uses the curve's last segment extended; give the curve up to that stress")
+        # the secant reproduces the preload's mean stress; check what the gasket took against it
+        pre_mean = res["gaskets"][g["name"]].get("preload", {}).get("mean_MPa")
+        if law.get("kind") == "secant" and pre_mean and abs(pre_mean - law["at_MPa"]) > 0.2 * law["at_MPa"]:
+            res.setdefault("warnings", []).append(
+                f"gasket {g['name']}: its mean stress at the preload ({pre_mean:.4g} MPa) differs from the stress its "
+                f"secant was taken at ({law['at_MPa']:.4g} MPa): other bolts or loads press it; give 'stiffness' instead")
     if res_pre_err is not None and res_pre_err > 0.01:
         res.setdefault("warnings", []).append(
             f"bolt forces at the preload differ from the preload by {100 * res_pre_err:.3g} %: check the bolt results")

@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.02.3
+Version: 2026.11.02.4
 """
 import copy
 import math
@@ -106,15 +106,17 @@ def test_deck_structure(pull, tmp_path):
     assert not set(deps) & terms
 
 
-def test_gasket_law_tabular_and_linear():
-    lines = joint.gasket_law({"curve": [[0.2, 30], [0.05, 2]], "friction": 0.3})
-    up = "\n".join(lines).upper()
-    assert "PRESSURE-OVERCLOSURE=TABULAR" in up
-    rows = [ln for ln in lines if re.fullmatch(r"\s*[\d.eE+-]+\s*,\s*[\d.eE+-]+\s*", ln)]
-    vals = [tuple(float(v) for v in r.split(",")) for r in rows]
-    assert vals[:3] == [(0.0, 0.0), (2.0, 0.05), (30.0, 0.2)]           # (pressure, overclosure), sorted, from 0
-    assert any(ln.strip().startswith("0.3") for ln in lines)
-    assert "PRESSURE-OVERCLOSURE=LINEAR" in "\n".join(joint.gasket_law({"stiffness": 50})).upper()
+def test_gasket_curve_becomes_its_secant_at_the_preload():
+    """CalculiX ignores a TABULAR law in face-to-face contact: a curve is the LINEAR law of its secant at the mean
+    preload stress."""
+    g = {"curve": [[0.2, 30], [0.05, 2], [0.1, 8]], "friction": 0.3}
+    assert joint.closure_at(g, 5.0) == pytest.approx(0.075) and joint.closure_at(g, 8.0) == pytest.approx(0.1)
+    law = joint.gasket_linear(g, 5.0)
+    assert law["kind"] == "secant" and law["stiffness_MPa_mm"] == pytest.approx(5 / 0.075) and law["closure_mm"] == 0.075
+    assert not law["beyond_curve"] and joint.gasket_linear(g, 45.0)["closure_mm"] == pytest.approx(0.2 + 15 / 220, abs=1e-6)
+    assert joint.gasket_linear(g, 45.0)["beyond_curve"]
+    assert joint.gasket_linear({"stiffness": 50}, 5.0) == {"kind": "stiffness", "stiffness_MPa_mm": 50.0}
+    assert joint.friction_lines(50.0, g, 0.01) == ["*FRICTION", "0.3, 0.005"]
 
 
 def _annulus(nr=4, nt=24, ri=10.0, ro=20.0):
@@ -546,4 +548,9 @@ def test_a_nut_on_a_fixed_face(tmp_path):
     nut = [i for i, ln in enumerate(eq) if ln.startswith("*EQUATION")][0]   # bolt 1, direction 1, the nut's equation
     terms = " ".join(eq[nut + 2:nut + 2 + 4]).replace(" ", "").split(",")
     assert any(int(n) in held for n in terms[3::3] if n.isdigit())
-    assert plan["gaskets"][0]["curve_raised"] and list(plan["stabilisation"]["parts"]) == ["cover"]
+    assert list(plan["stabilisation"]["parts"]) == ["cover"]
+    # the soft-start curve as its secant at the preload: 2 x 12.5 kN over 7200 mm2
+    law = plan["gaskets"][0]["law"]
+    assert law["kind"] == "secant" and law["at_MPa"] == pytest.approx(25000 / 7200) and law["curve_raised"]
+    assert law["stiffness_MPa_mm"] == pytest.approx(law["at_MPa"] / joint.closure_at(st["gaskets"][0], law["at_MPa"]))
+    assert "TABULAR" not in text and f"LINEAR\n{joint._g(law['stiffness_MPa_mm'])}\n" in text

@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.11.01.6
+Version: 2026.11.02.4
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -139,7 +139,8 @@ EXAMPLE = {"bracket_static": {
 
 
 JOINT_DOC = ("analysis joint: parts {name: {part, material, move}} for part; selectors take part. gaskets [{name, "
-             "faces, with, curve [[closure mm, MPa]] | stiffness MPa/mm, seal {stress, m}, friction}]. bolts [{name, "
+             "faces, with, curve [[closure mm, MPa]] (its secant at the preload) | stiffness MPa/mm, seal {stress, m}, "
+             "friction}]. bolts [{name, "
              "size M3-M36, preload N | torque N m, at [[x,y,z]] | pattern {center, pcd, n, start_deg}, head, nut | "
              "thread {part, depth}}]. sweep {bc, steps}: that pressure or force rises in steps. Results: leak, "
              "lift_off per gasket ({above} if not reached), steps[]. images: also field gasket_stress (on a gasket), "

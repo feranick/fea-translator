@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.11.02.1
+Version: 2026.11.02.4
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -213,7 +213,7 @@ def _joint_cases() -> dict:
                          "stiffness": K, "seal": {"stress": 1.0}}],
             "bolts": [{"name": "b", "size": "M12", "preload": P, "at": [[0, 0, 60]], "head": {"part": "top", "nz": 1},
                        "nut": {"part": "base", "nz": -1}}],
-            "sweep": {"bc": "pull", "steps": 8},
+            "sweep": {"bc": "pull", "steps": 8}, "run": {"timeout_s": 1800},
             "expect": [{"quantity": "gaskets.g.preload.force_N", "value": P, "tol": 0.03},
                        {"quantity": "lift_off.g", "value": P / (1 - C), "tol": 0.10}]}
     # joint_cover: ring ri 40 ro 80 h 30; cover r 80 h 40 with a spigot r 39 into the bore; grip 70; 8 bolts on pcd 120
@@ -253,7 +253,7 @@ def _joint_cases() -> dict:
                         "curve": [[0.02, 0.0], [0.05, 1.0], [0.1, 4.0], [0.2, 15.0], [0.3, 35.0]], "seal": {"stress": 1.0}}],
            "bolts": [{"name": "b", "size": "M10", "torque": 25, "at": [[-37.5, 0, 30], [37.5, 0, 30]],
                       "head": {"part": "cover", "nz": 1}, "nut": {"part": "body", "nz": -1}}],
-           "sweep": {"bc": "lift", "steps": 4},
+           "sweep": {"bc": "lift", "steps": 4}, "run": {"timeout_s": 1800},
            "expect": [{"quantity": "gaskets.g.preload.force_N", "value": 2 * P10, "tol": 0.03},
                       {"quantity": "bolts.b.preload_N", "value": P10, "tol": 1e-9}]}
     return {"joint_pull": pull, "joint_cover": cover, "joint_two_bolt": two}
