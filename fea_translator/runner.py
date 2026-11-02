@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.02.2
+Version: 2026.11.02.7
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -970,8 +970,12 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
         res = {"ok": False, "state": "cancelled", "why": str(exc)}
     except (MeshError, SolverError, subprocess.TimeoutExpired) as exc:
         res = {"ok": False, "why": type(exc).__name__, "error": str(exc)[:2000]}
-    except Exception as exc:  # noqa: BLE001
-        res = {"ok": False, "why": type(exc).__name__, "error": str(exc)[:2000]}
+    except Exception as exc:  # noqa: BLE001 (an error of the translator: where it happened, to fix it)
+        import traceback
+        tb = traceback.extract_tb(exc.__traceback__)
+        res = {"ok": False, "why": type(exc).__name__, "error": str(exc)[:2000],
+               "where": [f"{Path(f.filename).name}:{f.lineno} {f.name}: {(f.line or '').strip()[:120]}" for f in tb[-4:]],
+               "stage": prog.info.get("stage") if hasattr(prog, "info") else None}
     finally:
         CANCEL["file"] = None
     res["translator"] = __version__

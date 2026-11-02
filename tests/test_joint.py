@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.02.4
+Version: 2026.11.02.7
 """
 import copy
 import math
@@ -498,41 +498,64 @@ def test_a_stall_after_the_preload_keeps_the_steps_done(tmp_path, monkeypatch):
 
 
 def test_a_surface_gmsh_cannot_mesh_is_tried_with_other_algorithms():
-    """A casing-to-head joint at size 8 (carbonio, 2026.11.01): "Invalid boundary mesh (overlapping facets) on surface 80"."""
-    from fea_translator.mesher import SURFACE_ALGORITHMS, generate
+    """A casing-to-head joint (carbonio, 2026.11.01): "Invalid boundary mesh (overlapping facets) on surface 80";
+    with 2026.11.02.6 the retry returned an empty mesh (ValueError at the nodes): every result is checked, and the
+    volume gets the other 3D algorithms when the surface's 2D algorithms do not help."""
+    from fea_translator.mesher import SURFACE_ALGORITHMS, VOLUME_ALGORITHMS, generate
 
     class FakeGmsh:
-        def __init__(self, fails):
-            self.fails, self.algs, self.calls = fails, [], 0
-            self.model = self
-            self.mesh = self
+        """generate fails `fails` times with msg, then succeeds; empty: the success leaves no mesh."""
+        def __init__(self, fails, msg="Invalid boundary mesh (overlapping facets) on surface 80", empty=False):
+            self.fails, self.msg, self.empty = fails, msg, empty
+            self.algs, self.opts, self.calls, self.meshed = [], [], 0, False
+            self.model = self.mesh = self.option = self
 
         def generate(self, dim):
             self.calls += 1
             if self.fails:
                 self.fails -= 1
-                raise Exception("Invalid boundary mesh (overlapping facets) on surface 80 surface 80")
+                raise Exception(self.msg)
+            self.meshed = not self.empty
+
+        def getElements(self, dim):
+            return ([4], [[1]], [[1, 2, 3, 4]]) if self.meshed else ([], [], [])
 
         def clear(self):
-            pass
+            self.meshed = False
 
         def setAlgorithm(self, dim, tag, val):
             self.algs.append((dim, tag, val))
+
+        def getNumber(self, name):
+            return 1
+
+        def setNumber(self, name, val):
+            self.opts.append((name, val))
 
         def getBoundingBox(self, dim, tag):
             return [0, 0, 0, 2, 4, 6]
     g, notes = FakeGmsh(2), []
     generate(g, 3, notes)
-    assert g.calls == 3 and g.algs == [(2, 80, 1), (2, 80, 5)]
+    assert g.calls == 3 and g.algs == [(2, 80, 1), (2, 80, 5)] and g.opts == []
     assert "surface 80 (near [1.0, 2.0, 3.0] mm)" in notes[0] and "MeshAdapt" in notes[0] and "Delaunay" in notes[1]
-    with pytest.raises(MeshError, match=r"could not mesh surface 80 \(near \[1.0, 2.0, 3.0\] mm\) with any 2D algorithm"):
-        generate(FakeGmsh(len(SURFACE_ALGORITHMS) + 1), 3, [])
+    # the surface's three 2D algorithms fail too: the volume with HXT (then Frontal)
+    g, notes = FakeGmsh(len(SURFACE_ALGORITHMS) + 1), []
+    generate(g, 3, notes)
+    assert g.opts == [("Mesh.Algorithm3D", 10)] and "HXT 3D algorithm" in notes[-1]
+    # Gmsh returns without a mesh and no error: the next 3D algorithm, not an empty mesh
+    g, notes = FakeGmsh(0, empty=True), []
+    with pytest.raises(MeshError, match=r"Gmsh could not mesh the part \(Gmsh returned without tetrahedra\); tried 3D algorithms"):
+        generate(g, 3, notes)
+    assert [o[1] for o in g.opts] == [a for a, _ in VOLUME_ALGORITHMS if a != 1]
+    with pytest.raises(MeshError, match=r"could not mesh surface 80 \(near \[1.0, 2.0, 3.0\] mm\) .*tried 2D algorithms"):
+        generate(FakeGmsh(99), 3, [])
 
     class Other(FakeGmsh):
         def generate(self, dim):
             raise Exception("some other failure")
-    with pytest.raises(Exception, match="some other failure"):
+    with pytest.raises(MeshError, match="some other failure"):
         generate(Other(0), 3, [])
+
 
 
 def test_a_nut_on_a_fixed_face(tmp_path):
@@ -554,3 +577,16 @@ def test_a_nut_on_a_fixed_face(tmp_path):
     assert law["kind"] == "secant" and law["at_MPa"] == pytest.approx(25000 / 7200) and law["curve_raised"]
     assert law["stiffness_MPa_mm"] == pytest.approx(law["at_MPa"] / joint.closure_at(st["gaskets"][0], law["at_MPa"]))
     assert "TABULAR" not in text and f"LINEAR\n{joint._g(law['stiffness_MPa_mm'])}\n" in text
+
+
+def test_an_unexpected_error_says_where(tmp_path, monkeypatch):
+    """A bare ValueError (the S50 casing-to-head joint, 2026.11.02.6) comes back with where it happened and the stage."""
+    from fea_translator import runner
+
+    def boom(*a, **k):
+        import numpy as np_
+        return np_.zeros(0).max()
+    monkeypatch.setattr(runner, "solve_once", boom)
+    r = runner.run_study("x", cases()["joint_pull"], tmp_path)
+    assert r["why"] == "ValueError" and "zero-size array" in r["error"]
+    assert r["stage"] and any("test_joint.py" in w and "boom" in w for w in r["where"])

@@ -1,5 +1,5 @@
 """mesher.py — the part as a tetrahedral mesh: Gmsh from a STEP file (or a build123d-translator goal).
-Version: 2026.11.02.1
+Version: 2026.11.02.7
 
     mesh_part(study, workdir) -> (Mesh, info)
 
@@ -41,34 +41,70 @@ def part_step(study: dict, workdir: Path) -> Path:
 _FAILED_SURFACE = re.compile(r"(?:mesh periodic surface|surface)\s+(\d+)", re.I)
 SURFACE_ALGORITHMS = (1, 5, 6)               # MeshAdapt, Delaunay, Frontal-Delaunay: tried in turn on a failing surface
 ALGORITHM_NAMES = ("MeshAdapt", "Delaunay", "Frontal-Delaunay")
+VOLUME_ALGORITHMS = ((10, "HXT"), (4, "Frontal"), (1, "Delaunay"))   # then the whole volume with another 3D algorithm
+
+
+def _has_mesh(gmsh, dim: int) -> bool:
+    """Whether generate(dim) left elements of that dimension (Gmsh can return without an error and no mesh)."""
+    try:
+        types, _, _ = gmsh.model.mesh.getElements(dim)
+        return len(types) > 0
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def generate(gmsh, dim: int, notes: list | None = None) -> None:
-    """gmsh.model.mesh.generate(dim), again with another 2D algorithm on a surface Gmsh could not mesh ('Invalid
-    boundary mesh (overlapping facets) on surface 80': a casing-to-head joint, carbonio, 2026.11.01; as
-    cfd-translator 2026.11.01.2). Each failing surface gets MeshAdapt, then Delaunay, then Frontal-Delaunay."""
+    """gmsh.model.mesh.generate(dim), with fallbacks, each noted: a surface Gmsh names ('Invalid boundary mesh
+    (overlapping facets) on surface 80', 'Impossible to mesh periodic surface 126') is meshed again with MeshAdapt,
+    then Delaunay, then Frontal-Delaunay (as cfd-translator 2026.11.01.2); when that does not help, or Gmsh names no
+    surface, or it returns without a mesh, the volume is meshed with another 3D algorithm (HXT, Frontal, Delaunay).
+    A MeshError says what was tried when nothing works."""
     tried: dict[int, int] = {}
+    vol_k = 0
+    last = None
+    first_3d = None
     while True:
         try:
             gmsh.model.mesh.generate(dim)
-            return
+            if _has_mesh(gmsh, dim):
+                return
+            raise RuntimeError(f"Gmsh returned without {('', 'lines', 'triangles', 'tetrahedra')[dim]}")
         except Exception as exc:  # noqa: BLE001 (Gmsh raises plain Exception)
+            last = exc
             m = _FAILED_SURFACE.search(str(exc))
-            if not m:
-                raise
-            sf = int(m.group(1))
-            k = tried.get(sf, 0)
-            at = _where(gmsh, sf)
-            if k >= len(SURFACE_ALGORITHMS):
-                raise MeshError(f"Gmsh could not mesh surface {sf} (near {at} mm) with any 2D algorithm ({exc}); it is "
-                                "often a thin sliver face or a seam meeting a tiny edge: change mesh.size a little, "
-                                "refine there (mesh.refine), or simplify that face in the CAD") from exc
-            tried[sf] = k + 1
-            gmsh.model.mesh.clear()
-            gmsh.model.mesh.setAlgorithm(2, sf, SURFACE_ALGORITHMS[k])
-            if notes is not None:
-                notes.append(f"Gmsh could not mesh surface {sf} (near {at} mm) with its default algorithm ({str(exc)[:120]}): "
-                             f"meshed it again with {ALGORITHM_NAMES[k]}")
+            sf = int(m.group(1)) if m else None
+            if sf is not None and tried.get(sf, 0) < len(SURFACE_ALGORITHMS):
+                k = tried.get(sf, 0)
+                tried[sf] = k + 1
+                gmsh.model.mesh.clear()
+                gmsh.model.mesh.setAlgorithm(2, sf, SURFACE_ALGORITHMS[k])
+                if notes is not None:
+                    notes.append(f"Gmsh could not mesh surface {sf} (near {_where(gmsh, sf)} mm) ({str(exc)[:120]}): "
+                                 f"meshed it again with {ALGORITHM_NAMES[k]}")
+                continue
+            if dim == 3 and vol_k < len(VOLUME_ALGORITHMS):
+                if first_3d is None:
+                    try:
+                        first_3d = int(gmsh.option.getNumber("Mesh.Algorithm3D"))
+                    except Exception:  # noqa: BLE001
+                        first_3d = 1
+                alg, aname = VOLUME_ALGORITHMS[vol_k]
+                vol_k += 1
+                if alg == first_3d:
+                    continue                      # the one that just failed
+                gmsh.model.mesh.clear()
+                gmsh.option.setNumber("Mesh.Algorithm3D", alg)
+                if notes is not None:
+                    notes.append(f"Gmsh could not mesh the volume ({str(exc)[:120]}): meshed it again with the "
+                                 f"{aname} 3D algorithm")
+                continue
+            where = (f" surface {sf} (near {_where(gmsh, sf)} mm)" if sf is not None else "")
+            done = ([f"2D algorithms {', '.join(ALGORITHM_NAMES)} on surface{'s' if len(tried) > 1 else ''} "
+                     f"{', '.join(map(str, tried))}"] if tried else []) + (
+                [f"3D algorithms {', '.join(n for _, n in VOLUME_ALGORITHMS)}"] if dim == 3 else [])
+            raise MeshError(f"Gmsh could not mesh{where or ' the part'} ({last}); tried {' and '.join(done) or 'nothing else'}. "
+                            "It is often a thin sliver face or a seam meeting a tiny edge: change mesh.size a little, "
+                            "refine there (mesh.refine), or simplify that face in the CAD") from exc
 
 
 def _where(gmsh, sf: int) -> list:
@@ -128,6 +164,8 @@ def mesh_step(step: Path, size: float | None = None, order: int = 2, refine=(), 
         tags, coords, _ = gmsh.model.mesh.getNodes()
         nodes_all = np.asarray(coords, float).reshape(-1, 3)
         tags = np.asarray(tags, np.int64)
+        if not len(tags):
+            raise MeshError("Gmsh produced no nodes (an empty mesh)")
         lut = -np.ones(int(tags.max()) + 1, np.int64)
         lut[tags] = np.arange(len(tags))
         etypes, _, enodes = gmsh.model.mesh.getElements(3)
