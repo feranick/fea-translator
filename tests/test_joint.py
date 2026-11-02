@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.02.2
+Version: 2026.11.02.3
 """
 import copy
 import math
@@ -42,11 +42,18 @@ def test_deck_structure(pull, tmp_path):
     assert count("CONTACT PAIR") == 1 and count("PRE-TENSION SECTION") == 0 and count("SPRING") == 2   # bolt, stabilisation
     assert "TYPE=SPRINGA" in up and "B31" not in up
     assert count("STEP") == 1 + 4 and count("END STEP") == 1 + 4
-    assert count("EQUATION") == 9                                   # 3 directions x (head, nut, the cut)
+    assert count("EQUATION") == 6                                   # 3 directions x (nut end, the cut at the head)
     b0 = plan["bolts"][0]["bolts"][0]
     nc, n2, npt = b0["ends"][0], b0["ends"][1], b0["pret_node"]
-    cut = [ln for ln in text.splitlines() if ln.startswith(f"{nc}, ") and len(ln.split(",")) >= 6]
-    assert cut == [f"{nc}, 1, 1, {nc - 2}, 1, -1", f"{nc}, 2, 1, {nc - 2}, 2, -1", f"{nc}, 3, 1, {nc - 2}, 3, -1, {npt}, 1, -1"]
+    nh = b0["head_nodes"]
+    lines = text.splitlines()
+    for d in (1, 2, 3):   # n u_C - sum(u_head) + n axis_d u_PT = 0, axis -z: the PT term only in z
+        i = next(k for k, ln in enumerate(lines) if ln.startswith(f"{nc}, {d}, {nh}, "))
+        n_terms = int(lines[i - 1])
+        body = ", ".join(lines[i:i + (n_terms + 3) // 4]).split(", ")
+        trip = [(int(body[k]), int(body[k + 1]), float(body[k + 2])) for k in range(0, len(body), 3)]
+        assert trip[0] == (nc, d, nh) and all(c == -1.0 and dd == d for _, dd, c in trip[1:1 + nh])
+        assert trip[1 + nh:] == ([(npt, 1, -float(nh))] if d == 3 else [])
     assert b0["k_N_mm"] == pytest.approx(210000 * 84.266 / 60, rel=1e-4)
     assert up.count("*BOUNDARY, FIXED") == 4 and up.count("*CLOAD, OP=NEW") == 4
     assert "*EL FILE" not in up and up.count("*NODE PRINT, NSET=N_BOLTENDS") == 5 and up.count("*NODE PRINT, NSET=N_STAB") == 5
@@ -88,7 +95,15 @@ def test_deck_structure(pull, tmp_path):
             first = eq[i + 2].split(",")
             deps.append((int(first[0]), int(first[1])))
             assert int(first[0]) > n_mesh and nterms >= 2
-    assert len(deps) == len(set(deps)) == 9                          # each DOF dependent in one equation only
+    assert len(deps) == len(set(deps)) == 6                          # each DOF dependent in one equation only
+    # no chains: a dependent DOF is never a term of another equation
+    terms = set()
+    for i, ln in enumerate(eq):
+        if ln.upper().startswith("*EQUATION"):
+            n_t = int(eq[i + 1])
+            body = ", ".join(eq[i + 2:i + 2 + (n_t + 3) // 4]).split(", ")
+            terms |= {(int(body[k]), int(body[k + 1])) for k in range(3, len(body), 3)}
+    assert not set(deps) & terms
 
 
 def test_gasket_law_tabular_and_linear():
@@ -527,8 +542,8 @@ def test_a_nut_on_a_fixed_face(tmp_path):
     held = set(plan["sets"]["feet"]["nodes"])
     eq = text.splitlines()
     deps = [tuple(int(v) for v in eq[i + 2].split(",")[:2]) for i, ln in enumerate(eq) if ln.startswith("*EQUATION")]
-    assert len(deps) == 18 and len(set(deps)) == 18 and not {n for n, _ in deps} & held
-    nut = [i for i, ln in enumerate(eq) if ln.startswith("*EQUATION")][3]   # bolt 1, direction 1, the nut's equation
+    assert len(deps) == 12 and len(set(deps)) == 12 and not {n for n, _ in deps} & held
+    nut = [i for i, ln in enumerate(eq) if ln.startswith("*EQUATION")][0]   # bolt 1, direction 1, the nut's equation
     terms = " ".join(eq[nut + 2:nut + 2 + 4]).replace(" ", "").split(",")
     assert any(int(n) in held for n in terms[3::3] if n.isdigit())
     assert plan["gaskets"][0]["curve_raised"] and list(plan["stabilisation"]["parts"]) == ["cover"]

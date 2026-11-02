@@ -1,6 +1,6 @@
 """joint.py — bolted, gasketed assemblies: several parts in contact, bolt pretension, a gasket law, and the internal
 pressure stepped up to find where the joint leaks and where it lifts off (analysis "joint", CalculiX only).
-Version: 2026.11.02.2
+Version: 2026.11.02.3
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -11,7 +11,7 @@ Bolts are connectors (no bolt geometry): each bolt is a spring (SPRINGA) of the 
 its grip, k = E A_s / grip, from the head's bearing face to the nut's bearing face or to the engaged thread of a
 tapped hole. Each end follows the mean displacement of its bearing nodes (an annulus between the hole and the washer
 around the axis, or the bore over the thread depth), one *EQUATION per direction. The preload acts across a cut at
-the head: u_C = u_B1 - u_PT * axis, where the reference node PT takes the preload as a *CLOAD in the first step and
+the head: u_C = mean(u of the head's bearing nodes) - u_PT * axis, where the reference node PT takes the preload as a *CLOAD in the first step and
 is then held (*BOUNDARY, FIXED), so the bolt force follows the joint. (CalculiX's *PRE-TENSION SECTION on a beam
 element deletes the beam and leaves a rigid link: the bolt would not stretch.) The bolt force is the spring's
 stiffness times its stretch; at the preload it must equal the preload (bolt_preload_error). Bolts carry no shear
@@ -443,7 +443,7 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         plan["selection"][f"gasket {g['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in slave for t in tg]
         plan["selection"][f"gasket {g['name']} (with)"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in master for t in tg]
     # bolts: a spring (SPRINGA, k = E A_s / grip) from a cut node C at the head to the nut, with the pretension as
-    # an equation across the cut: u_C = u_B1 - u_PT * axis (CalculiX's own *PRE-TENSION SECTION on a beam deletes the
+    # an equation across the cut: u_C = mean(u_head) - u_PT * axis (CalculiX's own *PRE-TENSION SECTION on a beam deletes the
     # beam and leaves a rigid link: the bolt would have no stretch). B1 and B2 follow their bearing nodes' mean.
     springs, eqs, pret = [], [], []
     for gi, b in enumerate(study.get("bolts", [])):
@@ -454,10 +454,10 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         geo = bolt_geometry(parts, b)
         rec = {"name": b["name"], "size": b["size"], "preload_N": P, "As": sz["As"], "bolts": []}
         for bg in geo:
-            n1, n2, nc, npt = n_next, n_next + 1, n_next + 2, n_next + 3
-            n_next += 4
+            n2, nc, npt = n_next, n_next + 1, n_next + 2
+            n_next += 3
             L += ["*NODE"] + [f"{n}, {_g(q[0])}, {_g(q[1])}, {_g(q[2])}" for n, q in
-                              ((n1, bg["B1"]), (n2, bg["B2"]), (nc, bg["B1"]), (npt, bg["B1"]))]
+                              ((n2, bg["B2"]), (nc, bg["B1"]), (npt, bg["B1"]))]
             eid = e_next
             e_next += 1
             k = mat["E"] * sz["As"] / bg["grip"]
@@ -465,13 +465,18 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
             in_eq = plan.setdefault("eq_nodes", set())
             in_eq.update(int(q) for q in bg["head"])
             in_eq.update(int(q) for q in bg["nut"])
+            head = [int(q) + 1 for q in bg["head"]]
             for d in (1, 2, 3):
-                eqs += _equation(int(bg["head"][0]) + 1, [int(q) + 1 for q in bg["head"]], n1, d, held)
+                # the nut end B2 follows the mean of its bearing nodes
                 eqs += _equation(int(bg["nut"][0]) + 1, [int(q) + 1 for q in bg["nut"]], n2, d, held)
-            for d in (1, 2, 3):   # the cut: u_C - u_B1 + axis_d u_PT = 0
-                terms = [(nc, d, 1.0), (n1, d, -1.0)] + ([(npt, 1, float(bg["axis"][d - 1]))]
-                                                          if abs(bg["axis"][d - 1]) > 1e-12 else [])
-                eqs += ["*EQUATION", str(len(terms)), ", ".join(f"{n}, {dd}, {_g(c)}" for n, dd, c in terms)]
+                # the cut C at the head: the mean of the head's bearing nodes, less the pretension along the axis,
+                # n u_C - sum(u_head) + n axis_d u_PT = 0. Each dependent DOF (B2, C) is in no other equation: a chain
+                # (C on B1, B1 on the head nodes) gave CalculiX's wrong bolt forces (joint_two_bolt, 2026.11.02.2)
+                n = float(len(head))
+                terms = [(nc, d, n)] + [(q, d, -1.0) for q in head] + (
+                    [(npt, 1, n * float(bg["axis"][d - 1]))] if abs(bg["axis"][d - 1]) > 1e-12 else [])
+                eqs += ["*EQUATION", str(len(terms))] + [", ".join(f"{q}, {dd}, {_g(c)}" for q, dd, c in terms[k:k + 4])
+                                                         for k in range(0, len(terms), 4)]
             pret.append((eid, npt, bg["axis"], P))
             rec["bolts"].append({"k": bg["k"], "element": eid, "pret_node": npt, "ends": [nc, n2], "k_N_mm": k,
                                  "B1": np.round(bg["B1"], 4).tolist(), "B2": np.round(bg["B2"], 4).tolist(),
