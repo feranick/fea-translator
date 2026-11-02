@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.11.01.3
+Version: 2026.11.02.9
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -261,8 +261,10 @@ def study_status(request: str, wait_s: float = 45) -> dict:
 @server.tool()
 @_tool
 def get_deck(study: dict, name: str = "study") -> dict:
-    """Meshes the part and returns the CalculiX input deck (.inp) of one study, without solving. Returns within
-    45 s: a part that takes longer to mesh comes back 'pending' with the path where the deck will be."""
+    """Meshes the part (a joint: every part) and returns the CalculiX input deck (.inp) of one study and its mesh
+    size (nodes, elements; a joint: per part, with the selection, bolts, gaskets' gap and law), without solving:
+    check a mesh's size before running it. Returns within 45 s: a part that takes longer to mesh comes back
+    'pending' with the paths where the deck and this answer will be."""
     return api.deck(study, name, wait=45.0)
 
 

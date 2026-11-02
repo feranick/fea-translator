@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.01.2
+Version: 2026.11.02.9
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -690,9 +690,9 @@ def deck(study: dict, name: str = "study", wait: float | None = None) -> dict:
         pass
     if not proc.is_alive():
         return {"error": "meshing failed in the worker process", "folder": str(folder)}
-    return {"pending": True, "path": str(folder / f"{name}.inp"), "folder": str(folder),
-            "next": f"the part is still being meshed; the deck will be at {folder / (name + '.inp')} "
-                    "(read it with get_file when it exists), or ask get_deck again later"}
+    return {"pending": True, "path": str(folder / f"{name}.inp"), "summary": str(res), "folder": str(folder),
+            "next": f"the part is still being meshed; the deck will be at {folder / (name + '.inp')} and this "
+                    f"answer (node counts, selection) at {res} (read them with get_file when they exist)"}
 
 
 def _deck_job(study: dict, name: str, folder: str, out: str) -> None:
@@ -711,12 +711,32 @@ def _deck_into(study: dict, name: str, folder: Path) -> dict:
     from . import deck as D
     from .mesher import mesh_part
 
-    mesh, info = mesh_part(study, folder)
-    text, plan = D.write(name, study, mesh)
+    extra = {}
+    if study.get("analysis") == "joint":   # an assembly: every part meshed, the whole deck, what each selector took
+        from . import joint as J
+        parts = J.mesh_parts(study, folder)
+        text, plan = J.write(name, study, parts)
+        info = {"nodes": sum(len(p["mesh"].nodes) for p in parts), "elements": sum(len(p["mesh"].tets) for p in parts),
+                "parts": {p["name"]: {k: v for k, v in p["info"].items() if k in ("nodes", "elements", "size", "min_size",
+                                                                                 "curvature", "mesh_notes")} for p in parts}}
+        extra = {"selection": plan["selection"],
+                 "bolts": {r["name"]: {"size": r["size"], "preload_N": round(r["preload_N"], 3), "count": len(r["bolts"]),
+                                       "grip_mm": [b["grip_mm"] for b in r["bolts"]],
+                                       "bearing_nodes": [[b["head_nodes"], b["nut_nodes"]] for b in r["bolts"]]}
+                           for r in plan["bolts"]},
+                 "gaskets": {g["name"]: {"area_mm2": round(g["area"], 3), "gap_mm": g["gap"], "law": g["law"]}
+                             for g in plan["gaskets"]},
+                 "stabilisation": {k: v for k, v in plan["stabilisation"].items() if k != "parts"}
+                 | {"parts": {k: len(v) for k, v in plan["stabilisation"]["parts"].items()}},
+                 "warnings": [w for w in (J.gap_warning(g) for g in plan["gaskets"]) if w]
+                 + [f"part {pn}: {n}" for pn, pi in info["parts"].items() for n in pi.get("mesh_notes", [])]}
+    else:
+        mesh, info = mesh_part(study, folder)
+        text, plan = D.write(name, study, mesh)
     p = folder / f"{name}.inp"
     p.write_text(text)
     head = text if len(text) < 20000 else text[:20000] + "\n** ... (truncated; the whole deck is in the file)\n"
-    return {"path": str(p), "mesh": info, "bytes": len(text), "deck": head}
+    return {"path": str(p), "mesh": info, "bytes": len(text), "deck": head, **extra}
 
 
 def bench(names=None, solver: str | None = None, wait: float | None = None) -> dict:

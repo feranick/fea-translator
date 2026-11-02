@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.10.30.1
+Version: 2026.11.02.9
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (1): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments, split as a shell
@@ -319,9 +319,26 @@ def node_cores() -> int:
     return max(1, os.cpu_count() or 1)
 
 
+def _joint_parts(study: dict) -> list[dict] | None:
+    """A joint study's parts as single-part studies ({part, mesh}: the part's mesh over the study's), else None."""
+    if study.get("analysis") != "joint" or not isinstance(study.get("parts"), dict):
+        return None
+    base = study.get("mesh") if isinstance(study.get("mesh"), dict) else {}
+    return [{"part": p.get("part", {}), "mesh": {**base, **(p.get("mesh") if isinstance(p.get("mesh"), dict) else {})}}
+            for p in study["parts"].values() if isinstance(p, dict)]
+
+
+def _sum(values) -> int | None:
+    values = list(values)
+    return None if not values or any(v is None for v in values) else int(sum(values))
+
+
 def nodes_hint(study: dict) -> int | None:
     """Nodes of a study's (first) mesh when they are known before meshing: box parts (their divisions,
-    or the element size); None for STEP files and goals."""
+    or the element size); None for STEP files and goals. A joint: the sum over its parts."""
+    jp = _joint_parts(study)
+    if jp is not None:
+        return _sum(nodes_hint(p) for p in jp)
     part = study.get("part", {})
     if not isinstance(part, dict) or "box" not in part:
         return None
@@ -431,6 +448,9 @@ def _volume_of(part: dict) -> tuple[float, float, float] | None:
 def estimate_nodes(study: dict) -> int | None:
     """Nodes of a study's (first) mesh before meshing: exact for box parts, else an upper estimate from the
     part's volume and the element size (plus the refinement spheres); None if it cannot be told."""
+    jp = _joint_parts(study)
+    if jp is not None:
+        return _sum(estimate_nodes(p) for p in jp)
     n = nodes_hint(study)
     if n is not None:
         return n

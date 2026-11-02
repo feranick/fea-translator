@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.02.8
+Version: 2026.11.02.9
 """
 import copy
 import math
@@ -617,3 +617,22 @@ def test_curvature_off_and_min_size_coarsen_a_filleted_part(tmp_path):
     coarse, i2 = mesh_part({"part": {"goal": goal}, "mesh": {"size": 10, "min_size": 5, "curvature": 0}}, tmp_path / "b")
     assert i2["curvature"] == 0 and i2["min_size"] == 5 and i1["curvature"] == 12
     assert len(coarse.nodes) < 0.7 * len(fine.nodes), (len(coarse.nodes), len(fine.nodes))
+
+
+def test_get_deck_and_estimates_of_a_joint(tmp_path, monkeypatch):
+    """get_deck meshed only single parts (KeyError: 'part' on a joint); the node estimate was unknown for joints."""
+    from pathlib import Path
+
+    from fea_translator import api, executor
+    monkeypatch.setenv("FEAT_OUT", str(tmp_path))
+    st = copy.deepcopy(cases()["joint_pull"])
+    r = api.deck(st, "pull")
+    assert "error" not in r, r
+    parts = r["mesh"]["parts"]
+    assert set(parts) == {"base", "top"} and r["mesh"]["nodes"] == parts["base"]["nodes"] + parts["top"]["nodes"]
+    assert r["bolts"]["b"]["count"] == 1 and r["bolts"]["b"]["grip_mm"] == [60.0]
+    assert r["gaskets"]["g"]["gap_mm"]["median_mm"] == 0.0 and r["gaskets"]["g"]["law"]["kind"] == "stiffness"
+    assert r["stabilisation"]["parts"] == {"top": 6} and "gasket g" in r["selection"] and Path(r["path"]).is_file()
+    assert executor.nodes_hint(st) == r["mesh"]["nodes"] == executor.estimate_nodes(st)   # box parts: exact
+    st["parts"]["top"]["mesh"] = {"order": 1}
+    assert executor.nodes_hint(st) < r["mesh"]["nodes"]                                     # the part's own mesh
