@@ -1,7 +1,8 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.11.02.1
+Version: 2026.11.02.6
 """
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -157,6 +158,8 @@ def test_benchmark_reference_solver(name, tmp_path):
 def test_benchmark_calculix(name, tmp_path):
     if name in bench.NEEDS and "gmsh" in bench.NEEDS[name] and not HAVE_GMSH:
         pytest.skip("Gmsh not installed")
+    if name in bench.SLOW and os.environ.get("FEAT_SLOW_TESTS", "").strip() not in ("1", "true", "yes"):
+        pytest.skip(f"slow (about {bench.SLOW[name]} min with CalculiX): run with FEAT_SLOW_TESTS=1")
     st = bench.cases("ccx")[name]
     r = run_study(name, st, tmp_path, solver="ccx", timeout=st.get("run", {}).get("timeout_s", 600))
     assert r["ok"], r.get("error")

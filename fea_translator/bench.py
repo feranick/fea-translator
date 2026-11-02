@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.11.02.4
+Version: 2026.11.02.6
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -190,6 +190,9 @@ def cases(solver: str = "ccx") -> dict:
 
 NEEDS = {"euler_column": {"ccx"}, "plate_hole": {"ccx", "gmsh"}, "lame_ring": {"gmsh"}, "coax_capacitor": {"gmsh"},
          "joint_pull": {"ccx"}, "joint_cover": {"ccx", "gmsh"}, "joint_two_bolt": {"ccx"}}
+# benchmarks that take minutes each with CalculiX (measured on mochi, 2026.11.02): the test suite skips them unless
+# FEAT_SLOW_TESTS=1; run_benchmarks and `feat bench` run them as any other
+SLOW = {"joint_pull": 15, "joint_cover": 15, "joint_two_bolt": 3}
 
 
 def _joint_cases() -> dict:
@@ -207,7 +210,9 @@ def _joint_cases() -> dict:
     pull = {"analysis": "joint",
             "parts": {"base": {"part": {"box": [60, 60, 30], "origin": [-30, -30, 0], "divisions": [12, 12, 6]}},
                       "top": {"part": {"box": [60, 60, 30], "origin": [-30, -30, 30], "divisions": [12, 12, 6]}}},
-            "bcs": [{"kind": "fixed", "name": "side", "faces": {"part": "base", "nx": -1}},
+            # the base held on its bottom face, where the nut bears: the joint diagram's clamped member, no bending
+            # (held on a side face, it bent as a cantilever: lift-off 13 % above the diagram, mochi 2026.11.02)
+            "bcs": [{"kind": "fixed", "name": "side", "faces": {"part": "base", "nz": -1}},
                     {"kind": "force", "name": "pull", "faces": {"part": "top", "nz": 1}, "fz": 80000.0}],
             "gaskets": [{"name": "g", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
                          "stiffness": K, "seal": {"stress": 1.0}}],
