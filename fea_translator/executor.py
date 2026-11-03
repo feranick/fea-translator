@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.02.9
+Version: 2026.11.03.1
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (1): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments, split as a shell
@@ -413,15 +413,37 @@ def _volume_pool():
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
 
-        _VPOOL["ex"] = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
+        from .workers import watch_parent
+        _VPOOL["ex"] = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"),
+                                           initializer=watch_parent, initargs=(os.getpid(),))
         atexit.register(_close_volume_pool)
     return _VPOOL["ex"]
 
 
-def _close_volume_pool() -> None:
+def close_volume_pool(terminate: bool = False) -> None:
+    """Stops the volume pool; terminate: also ends its worker processes (shutdown(wait=False) leaves a busy or idle
+    spawn worker running)."""
     ex, _VPOOL["ex"] = _VPOOL["ex"], None
-    if ex is not None:
-        ex.shutdown(wait=False, cancel_futures=True)
+    _PENDING.clear()
+    if ex is None:
+        return
+    procs = list((getattr(ex, "_processes", None) or {}).values())
+    ex.shutdown(wait=False, cancel_futures=True)
+    if terminate:
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        for p in procs:
+            try:
+                p.join(2)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _close_volume_pool() -> None:
+    close_volume_pool(terminate=True)
 
 
 def _volume_of(part: dict) -> tuple[float, float, float] | None:

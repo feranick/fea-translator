@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.02.9
+Version: 2026.11.03.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -37,6 +37,7 @@ import uuid
 from pathlib import Path
 
 from . import __version__, executor
+from .workers import watch_parent
 from .study import study_format as _format
 from .study import validate as _validate
 from .study import validate_study
@@ -141,10 +142,14 @@ class _Pool:
         self.pool = None
         self.jobs: dict[str, dict] = {}   # request folder -> {name: AsyncResult}
 
+    def start(self):
+        if self.pool is None:   # every worker ends with this server (workers.watch_parent)
+            self.pool = mp.get_context("spawn").Pool(int(os.environ.get("FEAT_WORKERS", "2")), maxtasksperchild=20,
+                                                     initializer=watch_parent, initargs=(os.getpid(),))
+        return self.pool
+
     def submit(self, folder: Path, jobs: list[dict]) -> None:
-        workers = int(os.environ.get("FEAT_WORKERS", "2"))
-        if self.pool is None:
-            self.pool = mp.get_context("spawn").Pool(workers, maxtasksperchild=20)
+        self.start()
         self.jobs[str(folder)] = {j["name"]: self.pool.apply_async(_run_one, (dict(j, timeout=executor.timeout_s(j["study"])),)) for j in jobs}
 
 
@@ -161,6 +166,27 @@ def _close_pool() -> None:
         _AUX["pool"] = None
 
 
+def shutdown_workers() -> None:
+    """Stops every worker process this server started: the study and aux pools, the volume pool (CAD sizes) and a
+    get_deck meshing process. The MCP server calls it before os._exit, which skips atexit (carbonio, 2026.11.02:
+    the volume pool's spawn workers outlived three servers and kept their releases 'in use' for llmt gc)."""
+    for stop in (_close_pool, lambda: executor.close_volume_pool(terminate=True), _stop_deck):
+        try:
+            stop()
+        except Exception:  # noqa: BLE001 (stop the others anyway)
+            pass
+
+
+_DECK: dict = {"proc": None}
+
+
+def _stop_deck() -> None:
+    p, _DECK["proc"] = _DECK["proc"], None
+    if p is not None and p.is_alive():
+        p.terminate()
+        p.join(2)
+
+
 # ---- other slow work of a tool call (rendering) in worker processes, as cfd-translator's in_worker: a call
 # returns within its wait (at most 50 s) and a repeated call with the same arguments picks the result up
 _AUX: dict = {"pool": None, "pending": {}}
@@ -168,7 +194,8 @@ _AUX: dict = {"pool": None, "pending": {}}
 
 def _aux_pool():
     if _AUX["pool"] is None:
-        _AUX["pool"] = mp.get_context("spawn").Pool(int(os.environ.get("FEAT_AUX_WORKERS", "2") or 2), maxtasksperchild=20)
+        _AUX["pool"] = mp.get_context("spawn").Pool(int(os.environ.get("FEAT_AUX_WORKERS", "2") or 2), maxtasksperchild=20,
+                                                    initializer=watch_parent, initargs=(os.getpid(),))
     return _AUX["pool"]
 
 
@@ -677,9 +704,10 @@ def deck(study: dict, name: str = "study", wait: float | None = None) -> dict:
     folder = _request_dir("deck")
     if wait is None:
         return _deck_into(study, name, folder)
-    proc = mp.get_context("spawn").Process(target=_deck_job, args=(study, name, str(folder), str(out_root())),
+    proc = mp.get_context("spawn").Process(target=_deck_job, args=(study, name, str(folder), str(out_root()), os.getpid()),
                                            daemon=True, name="feat-deck")
     proc.start()
+    _DECK["proc"] = proc
     t_end = _until(wait)
     res = folder / "deck.json"
     while time.time() < t_end and proc.is_alive() and not res.is_file():
@@ -695,8 +723,9 @@ def deck(study: dict, name: str = "study", wait: float | None = None) -> dict:
                     f"answer (node counts, selection) at {res} (read them with get_file when they exist)"}
 
 
-def _deck_job(study: dict, name: str, folder: str, out: str) -> None:
+def _deck_job(study: dict, name: str, folder: str, out: str, ppid: int | None = None) -> None:
     """Worker process of deck(): writes deck.json (the answer) next to the deck, atomically."""
+    watch_parent(ppid)
     os.environ["FEAT_OUT"] = out
     try:
         r = _deck_into(study, name, Path(folder))

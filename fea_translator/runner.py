@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.02.7
+Version: 2026.11.03.1
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import __version__, deck, results
+from . import __version__, deck, results, workers
 from .meshdata import Mesh, MeshError
 from .mesher import mesh_part
 from .study import EPS0, bc_name, material_of, to_deck_units
@@ -176,7 +176,11 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None) -> st
     with open(log_path, "w") as fh:
         p = subprocess.Popen([exe, "-i", inp.stem], cwd=inp.parent, stdout=fh, stderr=subprocess.STDOUT, env=env,
                              start_new_session=True)   # its own process group: a cancel or timeout ends all of it
-        code = _wait_rss(p, timeout, monitor)    # waits with wait4, which also gives the child's peak memory
+        workers.track(p)   # a worker whose server dies takes its CalculiX run with it
+        try:
+            code = _wait_rss(p, timeout, monitor)    # waits with wait4, which also gives the child's peak memory
+        finally:
+            workers.untrack(p)
     log = log_path.read_text(errors="replace")
     PEAK["threads"] = max(PEAK["threads"], int(env.get("OMP_NUM_THREADS", "1")))
     lines = log.splitlines()

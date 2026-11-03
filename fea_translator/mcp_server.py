@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.11.02.9
+Version: 2026.11.03.1
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -154,8 +154,7 @@ def _exit_soon(why: str, delay: float) -> None:
 
     def go():
         time.sleep(delay)
-        if api._POOL.pool is not None:
-            api._POOL.pool.terminate()
+        api.shutdown_workers()   # os._exit skips atexit: every pool and worker process is stopped here
         os._exit(0)
     threading.Thread(target=go, daemon=True, name="feat-exit").start()
 
