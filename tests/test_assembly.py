@@ -1,7 +1,7 @@
 """Assemblies (analysis "assembly", joint.py): steps and their loads, contacts (hard, penalty, bonded, clearance), nuts
 on a meshed shaft, probes, part stresses, modal steps on the loaded state, validation, pictures. Offline: the CalculiX
 runs are the assembly_* benchmarks (test_fea.test_benchmark_calculix, FEAT_SLOW_TESTS=1).
-Version: 2026.11.04.2
+Version: 2026.11.04.4
 """
 import copy
 import math
@@ -56,7 +56,7 @@ def test_assembly_deck(boxes):
     steps = up.split("*STEP")
     assert len(steps) == 2 and "*FREQUENCY" not in up and "PERTURBATION" not in up   # modal: a separate run
     assert [s["kind"] for s in plan["steps"]] == ["static", "modal"] and plan["steps"][1]["ccx_step"] is None
-    assert "*SECTION PRINT, SURFACE=CS_C, NAME=SP_C\nSOF\n" in steps[1]
+    assert "*SECTION PRINT" not in up and "*NODE PRINT, NSET=N_PR_TIP, FREQUENCY=1000000\nU\n" in steps[1]
     assert "PRESSURE-OVERCLOSURE=LINEAR" in steps[0] and "*CONTACT PAIR, INTERACTION=CI_C" in steps[0]
     law = plan["contacts"][0]["law"]
     assert law["kind"] == "hard" and law["stiffness_MPa_mm"] == pytest.approx(10 * 210000 / law["h_mm"])
@@ -143,13 +143,17 @@ def test_assembly_results(boxes):
     eig = R.parse_dat(EIGEN)["eigen"]
     mfrd = _frd([], [], modes, modal_step=1)
     runs = {2: {"eigen": eig, "tied": ["c"], "free": [], "slipping": ["c"], "frd": mfrd}}
-    res = joint.evaluate(st, parts, plan, sof, frd, runs)
+    res = joint.evaluate(st, parts, plan, EIGEN, frd, runs)
     s0 = res["steps"][0]
     c = s0["contacts"]["c"]
     assert c["pressure_force_N"] == pytest.approx(5.0 * 1600, rel=1e-6) and c["closed_fraction"] == 1.0
-    assert c["force_N"] == 7900.0 and c["shear_N"] == 10.0 and c["force_from"] == "section"   # SOF, compression +
+    assert c["force_from"] == "element forces" and abs(c["force_N"]) < 1e-6   # a rigid shift: no force through the face
     assert 0.3 < c["stick_fraction"] < 0.7 and c["max_slip_mm"] == pytest.approx(0.001)
     assert s0["probes"]["tip"]["ux"] == pytest.approx(0.01) and s0["kind"] == "static" and s0["loads"]["side"] == 1.0
+    # probes from CalculiX's printout of their nodes when it is there (as the bolt ends)
+    pr = "\n displacements (vx,vy,vz) for set N_PR_TIP and time  0.1000000E+01\n\n" + "\n".join(
+        f"{n:10d}  5.000000E-01  0.000000E+00  0.000000E+00" for n in plan["probes"]["tip"]) + "\n"
+    assert joint.evaluate(st, parts, plan, pr + EIGEN, frd, runs)["steps"][0]["probes"]["tip"]["ux"] == 0.5
     assert s0["parts"]["top"]["max_displacement_mm"] == pytest.approx(0.01) and s0["parts"]["top"]["peak_von_mises_MPa"] < 1e-6
     assert res["frequencies"] == pytest.approx([159.1549, 166.9227, 1006.584])
     m = res["modal"][0]
@@ -240,3 +244,19 @@ def test_section_forces_parse():
     (s,) = joint.section_forces(txt)
     assert s == {"set": "CS_A", "time": 2.0, "force": [1.0, 2.0, 3.0], "normal": [0.0, 1.0, 0.0], "area": 50.0,
                  "normal_force": 2.0, "shear_force": 3.1}
+
+
+def test_contact_force_from_element_forces():
+    """The element forces at a face's nodes add up to the stress over it: a box stretched uniformly in z."""
+    from fea_translator.meshdata import box_mesh
+    m = box_mesh(40, 30, 20, 4, 3, 2, order=2, origin=[0, 0, 0])
+    eps = 1e-4
+    U = np.column_stack([np.zeros(len(m.nodes)), np.zeros(len(m.nodes)), eps * m.nodes[:, 2]])
+    f = joint.nodal_internal_forces(m, U, {"E": 210000.0, "nu": 0.3})
+    E, nu = 210000.0, 0.3
+    szz = E * (1 - nu) / ((1 + nu) * (1 - 2 * nu)) * eps                 # (lambda + 2 mu) eps: no lateral strain
+    top = np.nonzero(np.isclose(m.nodes[:, 2], 20))[0]
+    assert f[top].sum(axis=0) == pytest.approx([0, 0, szz * 1200], rel=1e-9, abs=1e-6)
+    lo, hi = m.nodes.min(axis=0) + 1e-9, m.nodes.max(axis=0) - 1e-9
+    inner = np.nonzero(np.all((m.nodes > lo) & (m.nodes < hi), axis=1))[0]
+    assert len(inner) and np.abs(f[inner]).max() < 1e-6 * szz * 1200     # interior nodes: in balance

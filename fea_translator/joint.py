@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.04.3
+Version: 2026.11.04.5
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -660,6 +660,7 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
     for pr in study.get("probes", []) or []:
         sel = select(parts, pr["faces"])
         plan["probes"][pr["name"]] = (_gnodes(sel) + 1).tolist()
+        L += [f"*NSET, NSET=N_PR_{_name(pr['name'])}"] + _lines(plan["probes"][pr["name"]])
         plan["selection"][f"probe {pr['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in sel for t in tg]
     # stabilisation: weak springs to ground on every part that no support holds in every direction (before a gasket
     # or contact is pressed it has no stiffness and friction none: the part could slide, rock about a bolt line, spin)
@@ -719,6 +720,8 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
         # stresses (large: they are computed from the displacements)
         out = [f"*NODE PRINT, NSET=N_BOLTENDS, FREQUENCY={FREQ}", "U"] if pret else []
         out += [f"*NODE PRINT, NSET=N_STAB, FREQUENCY={FREQ}", "U"] if stab_el else []
+        for pn in plan["probes"]:
+            out += [f"*NODE PRINT, NSET=N_PR_{_name(pn)}, FREQUENCY={FREQ}", "U"]
         return out + ["*NODE FILE", "U"] + (["*CONTACT FILE", "CDIS, CSTR"] if has_contact else [])
 
     dl_ever = any(LD[n]["kind"] in ("dload", "grav") for s in dsteps for n in s["loads"] if n in LD)
@@ -751,7 +754,6 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
             dummy_dl = f"{ld['items'][0][0]}, GRAV, 0., 0., 0., -1."
             break
     prev_kind = None
-    sof_done = False
     for s in dsteps:
         if s["kind"] == "modal":   # a separate linear run on the state the previous step left (solve, write(modal=))
             plan["steps"].append(s)
@@ -779,12 +781,6 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
             for g in frictional:
                 L += [f"*CHANGE FRICTION, INTERACTION={g['interaction']}"] + g["friction"]
         L += outputs()
-        if not sof_done:   # each contact's force from its slave face's section force (integrated stresses; summing
-            # the nodal contact pressures of a stiff penalty is off by up to 2x: assembly_clamp, 2026.11.04): once,
-            # CalculiX repeats it in the later steps
-            for c in plan["contacts"]:
-                L += [f"*SECTION PRINT, SURFACE=CS_{_name(c['name'])}, NAME=SP_{_name(c['name'])}", "SOF"]
-            sof_done = True
         L += ["*END STEP"]
         plan["steps"].append(s)
         prev_kind = s["kind"]
@@ -941,6 +937,34 @@ def disp_by_step(blocks: list[dict], steps: list[dict], N: int) -> dict[int, np.
     return out
 
 
+def nodal_internal_forces(mesh, U: np.ndarray, material: dict) -> np.ndarray:
+    """The element forces at each node (N, 3): f_a = sum over elements of the integral of sigma . grad N_a, from the
+    displacements (CalculiX's element formulation: 4 Gauss points for 10-node tetrahedra). At nodes with no load
+    but a contact, their sum over a face is the contact force on it, exactly as the discretization balances it."""
+    from .meshdata import EDGES, simplex_shape
+    from .runner import GAUSS4
+    E, nu = float(material["E"]), float(material["nu"])
+    lam, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
+    quad = mesh.order == 2
+    L = GAUSS4 if quad else np.full((1, 4), 0.25)
+    w = 1.0 / (6 * len(L))
+    _, dN = simplex_shape(L, quad, EDGES)
+    X = mesh.nodes[mesh.tets]
+    dNdxi = dN[:, :, 1:] - dN[:, :, :1]
+    J = np.einsum("qnj,enk->eqjk", dNdxi, X)
+    det = np.abs(np.linalg.det(J))
+    G = np.einsum("eqkj,qnj->eqnk", np.linalg.inv(J), dNdxi)          # dN/dx (E, q, n, 3)
+    gu = np.einsum("eqnk,enc->eqck", G, np.asarray(U, float)[mesh.tets])   # du_c/dx_k
+    eps = 0.5 * (gu + np.swapaxes(gu, -1, -2))
+    tr = np.trace(eps, axis1=-2, axis2=-1)
+    sig = 2 * mu * eps + lam * tr[..., None, None] * np.eye(3)
+    fe = np.einsum("eqnk,eqck,eq->enc", G, sig, det * w)                # (E, n, 3)
+    out = np.zeros((len(mesh.nodes), 3))
+    for a in range(mesh.tets.shape[1]):
+        np.add.at(out, mesh.tets[:, a], fe[:, a])
+    return out
+
+
 def section_forces(dat_text: str) -> list[dict]:
     """CalculiX's *SECTION PRINT SOF blocks: {set, time, force [fx, fy, fz], normal (mean, area-weighted), area,
     normal_force (+ tension), shear_force} (printoutface.f: 'statistics for surface set S and time t', then the
@@ -1076,8 +1100,22 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
                 f"gasket {g['name']}: one edge only (nothing inside it to seal): lift-off is when all of it opens; "
                 "no leak pressure")
     careas = {c["name"]: _node_areas(X, tets, c["slave_faces"]) for c in plan["contacts"]}
-    sofs = section_forces(dat_text) if plan["contacts"] else []
+    # the slave faces' nodes of each contact (0-based, merged) and their part, for the contact forces
+    snodes = {}
+    for c in plan["contacts"]:
+        nodes = np.unique(np.concatenate([tets[e][list(FACES[s - 1]) + ([EDGE_MID[frozenset((FACES[s - 1][i], FACES[s - 1][(i + 1) % 3]))]
+                                                                          for i in range(3)] if tets.shape[1] == 10 else [])]
+                                          for e, s in c["slave_faces"]])) if c["slave_faces"] else np.zeros(0, int)
+        part = next((p for p in parts if p["n0"] <= (nodes[0] if len(nodes) else -1) < p["n0"] + len(p["mesh"].nodes)), None)
+        snodes[c["name"]] = (nodes, part)
     disp = disp_by_step(blocks, steps, N) if (assembly or plan.get("probes")) else {}
+    fint: dict = {}
+    # probes: from CalculiX's printout of their nodes (as the bolt ends), the .frd's displacements otherwise
+    pblocks = {}
+    for pn in plan.get("probes", {}):
+        bl = [b for b in dat["blocks"] if b["set"] == f"N_PR_{_name(pn)}" and b["what"].startswith("displacements")]
+        pblocks[pn] = {solid[j]: np.array([r[1:4] for r in blk["rows"] if len(r) >= 4], float)
+                       for j, blk in enumerate(bl[:len(solid)])}
     for s in solid:
         st = steps[s]
         rec = {"step": s + 1, "kind": st["kind"], "what": st["what"], "load": None if loads[s] is None else round(loads[s], 9),
@@ -1121,23 +1159,30 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
             rec["contacts"] = {}
             for c in plan["contacts"]:
                 cs = contact_state(c, cmap, careas[c["name"]])
-                sf = next((q for q in reversed(sofs) if q["set"] == f"CS_{_name(c['name'])}" and "normal_force" in q
-                           and abs(q["time"] - ccx) < 1e-6), None)
                 if cs is not None:
                     cs["pressure_force_N"] = cs["force_N"]
-                    nrm = float(np.linalg.norm(sf.get("normal", [0, 0, 0]))) if sf else 0.0
-                    if sf and nrm > 0.9:   # a flat face: the section force through it (compression positive)
-                        cs["force_N"] = round(-sf["normal_force"], 3)
-                        cs["shear_N"] = round(sf["shear_force"], 3)
-                        cs["force_from"] = "section"
-                    else:                  # a curved face (a press fit): the nodal pressures' integral
+                    nodes, part = snodes[c["name"]]
+                    n = np.asarray(c["normal"], float)
+                    flat = part is not None and len(nodes) and ccx in disp and float(np.linalg.norm(n)) > 0.9
+                    if flat:   # the element forces at the slave face's nodes balance the contact force on it exactly
+                        # (summing a stiff penalty's nodal pressures was up to 2x off; CalculiX's section force,
+                        # from extrapolated stresses, 7 %: assembly_clamp, mochi 2026.11.04)
+                        sl = slice(part["n0"], part["n0"] + len(part["mesh"].nodes))
+                        key = (ccx, part["name"])
+                        if key not in fint:
+                            fint[key] = nodal_internal_forces(part["mesh"], disp[ccx][sl], part["material"])
+                        F = fint[key][nodes - part["n0"]].sum(axis=0)
+                        cs["force_N"] = round(float(-(F @ n)), 3)        # compression positive
+                        cs["shear_N"] = round(float(np.linalg.norm(F - (F @ n) * n)), 3)
+                        cs["force_from"] = "element forces"
+                    else:      # a curved face (a press fit): the nodal pressures' integral
                         cs["force_from"] = "pressures"
                 rec["contacts"][c["name"]] = cs
-        if plan.get("probes") and ccx in disp:
-            U = disp[ccx]
+        if plan.get("probes") and (ccx in disp or any(s in pb for pb in pblocks.values())):
             rec["probes"] = {}
             for pn, nodes in plan["probes"].items():
-                m = U[np.asarray(nodes) - 1].mean(axis=0)
+                rows = pblocks.get(pn, {}).get(s)
+                m = rows.mean(axis=0) if rows is not None and len(rows) else disp[ccx][np.asarray(nodes) - 1].mean(axis=0)
                 rec["probes"][pn] = {"ux": round(float(m[0]), 9), "uy": round(float(m[1]), 9), "uz": round(float(m[2]), 9),
                                      "u": round(float(np.linalg.norm(m)), 9)}
         if assembly and ccx in disp:   # each part's peak von Mises (nodal, from the displacements)
@@ -1698,7 +1743,7 @@ MAX_FAILED_ATTEMPTS = 3   # unconverged attempts of one increment before the run
 CHATTER_ITERS = 16        # iterations of one attempt looked at for contact chatter
 CHATTER_FLIPS = 6         # direction changes of the contact count among them
 CHATTER_SPREAD = 0.05     # the contact count's swing, relative to its largest value
-SETTLE_ITERS = 25         # iterations of one attempt after which the contact must have settled ...
+SETTLE_ITERS = 25         # iterations of a retried attempt after which the contact must have settled ...
 SETTLE_RATIO = 3.0        # ... to within this factor (assembly_press_fit, mochi 2026.11.04: 213k down to 13 contact
                           # elements and back to 30k in one increment: a frictionless ring drifting off its shaft)
 
@@ -1759,7 +1804,9 @@ def stall_reason(sta: str, cvg: str, plan: dict | None = None) -> tuple[str, int
             if flips >= CHATTER_FLIPS and hi > 0 and (hi - lo) / hi >= CHATTER_SPREAD:
                 return (f"{_what(s, plan)} did not converge: contact chatter ({hi - lo} contact elements switching, "
                         f"{lo} to {hi}; step {s}, increment {i}, attempt {a}, iteration {cur[-1][3]})"), s
-            if len(cur) >= SETTLE_ITERS and hi > 100 and hi >= SETTLE_RATIO * max(lo, 1):
+            # ... only once CalculiX has cut the increment back (attempt 2 on): a too large increment diverges like
+            # this and its cutback then converges (assembly_press_fit, mochi 2026.11.04: stopped in attempt 1)
+            if a >= 2 and len(cur) >= SETTLE_ITERS and hi > 100 and hi >= SETTLE_RATIO * max(lo, 1):
                 return (f"{_what(s, plan)} did not converge: the contact does not settle ({lo} to {hi} contact "
                         f"elements over the last {CHATTER_ITERS} iterations; step {s}, increment {i}, attempt {a}, "
                         f"iteration {cur[-1][3]}): a part may be free to slide or turn on a frictionless contact; "

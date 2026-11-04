@@ -1,7 +1,7 @@
 """Bolted, gasketed joints (joint.py): the deck (contact, bolt connectors, pretension, steps), the gasket's ring
 stress, reading multi-step .frd/.dat output, leak and lift-off from synthetic results, validation. Offline: the
 CalculiX runs are the joint_pull and joint_cover benchmarks (test_fea.test_benchmark_calculix).
-Version: 2026.11.04.3
+Version: 2026.11.04.5
 """
 import copy
 import math
@@ -425,7 +425,8 @@ def test_stall_reason_contact_chatter_and_failed_attempts():
     # assembly_press_fit (mochi, 2026.11.04): the contact collapsing and coming back, no up-and-down chatter
     drift = [212779, 90176, 47838, 25101, 12711, 6390, 3021, 1469, 699, 290, 87, 41, 23, 13, 29913, 23485, 12835,
              6919, 3204, 1196, 468, 260, 131, 61, 37]
-    why, step = joint.stall_reason("", _cvg(drift, inc=3))
+    assert joint.stall_reason("", _cvg(drift, inc=3)) is None      # attempt 1: CalculiX cuts the increment back itself
+    why, step = joint.stall_reason("", _cvg(drift, inc=3, att=2))
     assert step == 1 and "the contact does not settle (13 to 29913 contact elements" in why and "free to slide" in why
     assert joint.stall_reason("", _cvg(drift[:20], inc=3)) is None or "chatter" in joint.stall_reason("", _cvg(drift[:20], inc=3))[0]
 
