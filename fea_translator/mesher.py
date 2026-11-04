@@ -1,5 +1,5 @@
 """mesher.py — the part as a tetrahedral mesh: Gmsh from a STEP file (or a build123d-translator goal).
-Version: 2026.11.02.8
+Version: 2026.11.04.8
 
     mesh_part(study, workdir) -> (Mesh, info)
 
@@ -209,8 +209,10 @@ def mesh_step(step: Path, size: float | None = None, order: int = 2, refine=(), 
     if tets.shape[1] == 10:
         tets = tets[:, GMSH_TET10]
     tets = order_known(nodes, tets)
-    nodes, straightened = straighten_inverted(nodes, tets)
+    mask: list = []
+    nodes, straightened = straighten_inverted(nodes, tets, mask_out=mask)
     mesh = Mesh(nodes, tets, surfaces, info).build()
+    mesh.straightened = np.nonzero(mask[0])[0] if mask else np.zeros(0, int)   # their stresses are approximate
     info = {"size": h, "min_size": round(min(hmin, h), 6), "curvature": int(curvature), "diag": diag,
             "nodes": len(nodes), "elements": len(tets), "order": order, "straightened_elements": straightened}
     if notes:

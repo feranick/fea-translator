@@ -1,5 +1,5 @@
 """meshdata.py — the mesh as CalculiX needs it: node ordering, boundary faces, face selection, loads.
-Version: 2026.10.18.1
+Version: 2026.11.04.8
 
 Pure NumPy (no Gmsh, no CalculiX), so every step from a mesh to the deck is testable on its own.
 
@@ -83,18 +83,23 @@ def min_jacobian(nodes: np.ndarray, tets: np.ndarray) -> np.ndarray:
     return det.min(axis=1) / np.maximum(np.abs(ref), 1e-300)
 
 
-def straighten_inverted(nodes: np.ndarray, tets: np.ndarray, threshold: float = 0.05, rounds: int = 10):
+def straighten_inverted(nodes: np.ndarray, tets: np.ndarray, threshold: float = 0.05, rounds: int = 10,
+                        mask_out: list | None = None):
     """Moves the mid-edge nodes of inverted or nearly inverted quadratic elements onto their straight
     edges (an element with straight edges and positive corner volume is always valid). Returns the new
     node coordinates and how many elements were straightened. A curved second-order mesher can tangle
     elements in thin ligaments relative to the element size; this keeps them usable."""
     if tets.shape[1] != 10:
+        if mask_out is not None:
+            mask_out.append(np.zeros(len(tets), bool))
         return nodes, 0
     nodes = nodes.copy()
     fixed = np.zeros(len(tets), bool)
     for _ in range(rounds):
         bad = min_jacobian(nodes, tets) <= threshold
         if not bad.any():
+            if mask_out is not None:
+                mask_out.append(fixed)
             return nodes, int(fixed.sum())
         for k, (a, b) in enumerate(EDGES):
             e = tets[bad]

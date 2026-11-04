@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.04.1
+Version: 2026.11.04.8
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -295,8 +295,11 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, b
         if sb:
             rows = np.array(sb["rows"])
             try:
-                ours = recompute_stresses(mesh, np.nan_to_num(U), study, plan)
-                chk = check_stresses(rows, ours)
+                ours, err = recompute_stresses(mesh, np.nan_to_num(U), study, plan, bound=True)
+                chk = check_stresses(rows, ours, err)
+                if "worst_element" in chk:
+                    e_ = chk.pop("worst_element")
+                    chk["worst_at"] = np.round(mesh.nodes[mesh.tets[e_, :4]].mean(axis=0), 4).tolist()
             except Exception as exc:  # noqa: BLE001
                 ours, chk = None, {"error": f"{type(exc).__name__}: {exc}"[:200]}
             out["stress_check"] = chk
@@ -318,6 +321,8 @@ def evaluate(study: dict, mesh: Mesh, plan: dict, dat: dict, frd: dict | None, b
                 k = int(np.argmax(np.where(off, vm, -1)))
                 out["max_von_mises_off_bc"] = round(float(vm[k]), 6)
                 out["max_von_mises_off_bc_at"] = np.round(mesh.nodes[mesh.tets[el[k], :4]].mean(axis=0), 4).tolist()
+        if sb and study.get("stress_probes"):
+            out["stress_probes"] = stress_probes(study["stress_probes"], mesh, rows, frd)
         if frd and "STRESS" in frd:
             ids = np.array(list(frd["STRESS"].keys())) - 1
             vmn = results.von_mises(np.array([v[:6] for v in frd["STRESS"].values()]))
@@ -444,7 +449,10 @@ GAUSS4 = np.array([[0.5854101966249685, 0.1381966011250105, 0.1381966011250105, 
                    [0.1381966011250105, 0.1381966011250105, 0.1381966011250105, 0.5854101966249685]])
 
 
-def recompute_stresses(mesh: Mesh, U: np.ndarray, study: dict, plan: dict) -> np.ndarray:
+DAT_DIGITS = 5e-7   # the .dat prints values to 7 significant digits: half a unit of the 7th, relative
+
+
+def recompute_stresses(mesh: Mesh, U: np.ndarray, study: dict, plan: dict, bound: bool = False):
     """Stresses (E, q, 6: sxx, syy, szz, sxy, sxz, syz) at CalculiX's integration points (4 for 10-node
     tetrahedra, 1 for 4-node), from the displacements: sigma = D (B u - thermal strain). The same element
     formulation as CalculiX, so they agree to its printed digits unless its stress step went wrong."""
@@ -469,12 +477,70 @@ def recompute_stresses(mesh: Mesh, U: np.ndarray, study: dict, plan: dict) -> np
     sig = np.empty_like(eps)
     sig[..., :3] = lam * tr[..., None] + 2 * mu * eps[..., :3]
     sig[..., 3:] = mu * eps[..., 3:]
-    return sig
+    if not bound:
+        return sig
+    # how far the .dat's rounding of the displacements can move these stresses, per element: a small or distorted
+    # element has large shape-function gradients, so 7 digits of a 1.7 mm displacement can be worth hundreds of
+    # MPa there (an S50 casing, 1.7 M nodes, 0.06 mm elements at a 0.25 mm fillet: carbonio, 2026.11.04)
+    du = DAT_DIGITS * np.abs(np.asarray(U, float)).max(axis=1)[mesh.tets]            # (E, n)
+    err = (lam + 2 * mu) * 2.0 * np.einsum("eqnk,en->eq", np.abs(G), du).max(axis=1)  # (E,)
+    return sig, err
 
 
-def check_stresses(rows: np.ndarray, ours: np.ndarray) -> dict:
+def stress_probes(probes: list, mesh: Mesh, rows: np.ndarray, frd: dict | None) -> dict:
+    """Peak and mean von Mises (and the largest principal stress) at the integration points within each sphere
+    {name, at, r}; the peak again without the straightened elements (their stresses are approximate) and, when
+    the .frd has them, the nodal peak there."""
+    from .meshdata import EDGES, simplex_shape, tet_volumes
+    quad = mesh.order == 2
+    L = GAUSS4 if quad else np.full((1, 4), 0.25)
+    N, _ = simplex_shape(L, quad, EDGES)
+    el = rows[:, 0].astype(int) - 1
+    ip = np.clip(rows[:, 1].astype(int) - 1, 0, len(L) - 1)
+    Xq = np.einsum("qn,enk->eqk", N, mesh.nodes[mesh.tets])                   # (E, q, 3)
+    P = Xq[el, ip]
+    vm = results.von_mises(rows[:, 2:8])
+    w = (np.abs(tet_volumes(mesh.nodes, mesh.tets)) / len(L))[el]
+    st = np.zeros(len(mesh.tets), bool)
+    st[np.asarray(getattr(mesh, "straightened", np.zeros(0, int)), int)] = True
+    out = {}
+    for pr in probes:
+        c, r = np.asarray(pr["at"], float), float(pr["r"])
+        inside = np.linalg.norm(P - c, axis=1) <= r
+        if not inside.any():
+            out[pr["name"]] = {"points": 0, "note": f"no integration point within {r:g} mm of {pr['at']}: a larger r"}
+            continue
+        idx = np.nonzero(inside)[0]
+        k = idx[int(np.argmax(vm[idx]))]
+        S = rows[idx, 2:8]
+        T = np.zeros((len(idx), 3, 3))
+        T[:, 0, 0], T[:, 1, 1], T[:, 2, 2] = S[:, 0], S[:, 1], S[:, 2]
+        T[:, 0, 1] = T[:, 1, 0] = S[:, 3]
+        T[:, 0, 2] = T[:, 2, 0] = S[:, 4]
+        T[:, 1, 2] = T[:, 2, 1] = S[:, 5]
+        rec = {"peak_von_mises_MPa": round(float(vm[k]), 4), "peak_at": np.round(P[k], 4).tolist(),
+               "mean_von_mises_MPa": round(float((vm[idx] * w[idx]).sum() / w[idx].sum()), 4),
+               "max_principal_MPa": round(float(np.linalg.eigvalsh(T)[:, -1].max()), 4),
+               "points": int(len(idx)), "elements": int(len(np.unique(el[idx]))),
+               "straightened_elements": int(len(np.unique(el[idx][st[el[idx]]])))}
+        keep = idx[~st[el[idx]]]
+        if rec["straightened_elements"] and len(keep):
+            rec["peak_von_mises_unstraightened_MPa"] = round(float(vm[keep].max()), 4)
+        if frd and "STRESS" in frd:
+            ids = np.array(list(frd["STRESS"].keys())) - 1
+            near = np.linalg.norm(mesh.nodes[ids] - c, axis=1) <= r
+            if near.any():
+                vals = results.von_mises(np.array([v[:6] for v in frd["STRESS"].values()]))[near]
+                rec["peak_von_mises_nodal_MPa"] = round(float(vals.max()), 4)
+        out[pr["name"]] = rec
+    return out
+
+
+def check_stresses(rows: np.ndarray, ours: np.ndarray, err: np.ndarray | None = None) -> dict:
     """Compares CalculiX's integration-point stresses (rows: elem, ip, 6 components) with ours, element by
-    element (sorted von Mises values, so the point order does not matter)."""
+    element (sorted von Mises values, so the point order does not matter). err (E,): how far the .dat's rounding
+    of the displacements can move ours in each element: a difference within it cannot be told from rounding (it
+    is counted as unverifiable, not as a disagreement)."""
     el = rows[:, 0].astype(int) - 1
     vm_c = results.von_mises(rows[:, 2:8])
     vm_o = results.von_mises(ours.reshape(-1, 6)).reshape(ours.shape[0], ours.shape[1])
@@ -484,7 +550,7 @@ def check_stresses(rows: np.ndarray, ours: np.ndarray) -> dict:
     by_el = {}
     for e, v in zip(el, vm_c):
         by_el.setdefault(int(e), []).append(v)
-    bad, worst = [], 0.0
+    bad, worst, unver, worst_bad, worst_el = [], 0.0, 0, 0.0, None
     for e, vals in by_el.items():
         if len(vals) != q:
             bad.append(e)
@@ -492,10 +558,20 @@ def check_stresses(rows: np.ndarray, ours: np.ndarray) -> dict:
         d = float(np.abs(np.sort(vals) - np.sort(vm_o[e])).max())
         worst = max(worst, d)
         if d > tol:
-            bad.append(e)
+            if err is not None and d <= tol + float(err[e]):
+                unver += 1
+            else:
+                bad.append(e)
+                if d > worst_bad:
+                    worst_bad, worst_el = d, e
     missing = ours.shape[0] - len(by_el)
-    return {"elements_disagreeing": len(bad) + max(missing, 0), "max_difference_MPa": round(worst, 6),
-            "agree": not bad and missing <= 0}
+    out = {"elements_disagreeing": len(bad) + max(missing, 0), "max_difference_MPa": round(worst_bad if bad else worst, 6),
+           "agree": not bad and missing <= 0}
+    if err is not None:
+        out["elements_within_rounding"] = unver
+    if worst_el is not None:
+        out["worst_element"] = int(worst_el)
+    return out
 
 
 def _field_results(study: dict, mesh: Mesh, plan: dict, dat: dict, band: float | None) -> dict:

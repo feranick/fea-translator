@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.11.04.7
+Version: 2026.11.04.8
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -16,6 +16,8 @@ Units the caller writes: mm, N, MPa, kg/m3, W/(m K), W/(m2 K), W/m2, W, degrees 
 The deck uses mm, N, s, t (tonne), mW: conversions are in `to_deck_units`.
 """
 from __future__ import annotations
+
+import re
 
 ANALYSES = ("static", "modal", "buckling", "thermal", "electric", "electrostatic", "joule", "joint", "assembly")
 MECH = ("static", "modal", "buckling", "thermal", "joule")      # analyses that take mechanical bcs (thermal, joule: with stress)
@@ -174,6 +176,7 @@ def study_format() -> dict:
                                   "threads and queue, overriding the machine's defaults within the caps in status",
                            "mesh": "{size, order (1|2), refine: [{at, r, size}]}", "bcs": "list of boundary conditions",
                            "probes": "[{name, faces}]: mean and largest displacement (or temperature) there",
+                           "stress_probes": "[{name, at, r}]: peak and mean von Mises within a sphere (a local peak)",
                            "expect": "[{quantity, value, tol}]", "converge": "true: rerun at 0.6 x size and report the change",
                            "equation_solver": "auto (iterative above 50k nodes for static and thermal) | direct | iterative",
                            "images": "true (per analysis) or [{name, field | mode: n | setup: true, surface: part|<bc>, deformed: "
@@ -490,6 +493,18 @@ def validate_study(st: dict) -> dict:
             bad = _selector(pr["faces"])
             if bad:
                 errors.append(f"probe {j + 1}: faces: {bad}")
+    sp = st.get("stress_probes", [])
+    if sp and not (an == "static" or (st.get("stress") and an in ("thermal", "joule"))):
+        errors.append("stress_probes: for static studies (and thermal or joule with stress: true)")
+    names_sp = []
+    for j, pr in enumerate(sp if isinstance(sp, list) else [None]):
+        if not (isinstance(pr, dict) and isinstance(pr.get("name"), str) and re.fullmatch(r"[A-Za-z0-9_]+", pr["name"])
+                and _point(pr.get("at")) and _num(pr.get("r")) and pr["r"] > 0 and not set(pr) - {"name", "at", "r"}):
+            errors.append(f"stress_probes[{j}]: {{name (a word), at: [x, y, z], r: radius mm > 0}}")
+        elif pr["name"] in names_sp:
+            errors.append(f"stress_probes[{j}]: name {pr['name']!r} twice")
+        else:
+            names_sp.append(pr["name"])
     for j, ex in enumerate(st.get("expect", [])):
         if not isinstance(ex, dict) or not isinstance(ex.get("quantity"), str) or not _num(ex.get("value")):
             errors.append(f"expect {j + 1}: needs 'quantity' (a results path) and a numeric 'value'")
@@ -502,7 +517,7 @@ def validate_study(st: dict) -> dict:
     if "images" in st:
         from .render import image_errors
         errors += image_errors(st["images"], st)
-    extra = set(st) - {"part", "material", "analysis", "modes", "mesh", "bcs", "probes", "expect", "converge", "notes",
+    extra = set(st) - {"part", "material", "analysis", "modes", "mesh", "bcs", "probes", "stress_probes", "expect", "converge", "notes",
                        "equation_solver", "stress_band", "stress", "T_ref", "procs", "queue", "run", "images"}
     if extra:
         warnings.append(f"unknown study keys ignored: {sorted(extra)}")
