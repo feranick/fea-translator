@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.04.1
+Version: 2026.11.04.3
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -423,8 +423,14 @@ def deck_steps(study: dict) -> list[dict]:
         elif k == "modal":
             out.append({"kind": "modal", "what": f"modal ({int(s.get('modes', 6))} modes)", "factor": None,
                         "modes": int(s.get("modes", 6)), "loads": {}, "name": s.get("name")})
+    k = 0
     for i, s in enumerate(out):
         s["step"] = i + 1
+        if s["kind"] != "modal":   # modal steps are separate linear runs: the deck's own step numbers skip them
+            k += 1
+            s["ccx_step"] = k
+        else:
+            s["ccx_step"] = None
     return out
 
 
@@ -440,9 +446,11 @@ def contact_law(c: dict, parts: list[dict], slave, master) -> dict:
     return {"kind": law, "stiffness_MPa_mm": HARD_FACTOR * E / h, "E_MPa": E, "h_mm": h}
 
 
-def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
+def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) -> tuple[str, dict]:
     """The deck of a joint or assembly study, and its plan (node sets, connectors, gaskets, contacts, steps) for
-    reading the results."""
+    reading the results. modal {modes, ties: {pair names}, tol}: instead, the linear frequency run of a modal step
+    on the state its previous step left: the pairs in ties (bonded, and closed then) tied with *TIE, the others free,
+    the bolts and nuts at their preloaded length."""
     order = parts[0]["mesh"].order
     etype = "C3D10" if order == 2 else "C3D4"
     an = study.get("analysis", "joint")
@@ -596,9 +604,12 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         law = gasket_linear(g, clamp / area if area else 0.0)
         L += [f"*SURFACE, NAME=GS_{gn}"] + [f"{e + 1}, S{s}" for e, s in sf]
         L += [f"*SURFACE, NAME=GM_{gn}"] + [f"{e + 1}, S{s}" for e, s in mf]
-        L += [f"*SURFACE INTERACTION, NAME=GI_{gn}", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR",
-              _g(law["stiffness_MPa_mm"])] + friction_lines(law["stiffness_MPa_mm"], g, stick)
-        L += [f"*CONTACT PAIR, INTERACTION=GI_{gn}, TYPE=SURFACE TO SURFACE", f"GS_{gn}, GM_{gn}"]
+        if modal is None:
+            L += [f"*SURFACE INTERACTION, NAME=GI_{gn}", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR",
+                  _g(law["stiffness_MPa_mm"])] + friction_lines(law["stiffness_MPa_mm"], g, stick)
+            L += [f"*CONTACT PAIR, INTERACTION=GI_{gn}, TYPE=SURFACE TO SURFACE", f"GS_{gn}, GM_{gn}"]
+        elif g["name"] in modal["ties"]:
+            L += [f"*TIE, NAME=T_{gn}, POSITION TOLERANCE={_g(modal['tol'])}", f"GS_{gn}, GM_{gn}"]
         nrm = sum((p["mesh"].groups[tg_].normal * p["mesh"].groups[tg_].area[:, None]).sum(axis=0)
                   for p, tgs in slave for tg_ in tgs)
         gap = face_gap(X, sn, _gnodes(master), _unit(nrm))
@@ -620,17 +631,21 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         mu = 0.0 if law["kind"] == "bonded" else float(c.get("friction", 0.2))
         L += [f"*SURFACE, NAME=CS_{cn}"] + [f"{e + 1}, S{s}" for e, s in sf]
         L += [f"*SURFACE, NAME=CM_{cn}"] + [f"{e + 1}, S{s}" for e, s in mf]
-        L += [f"*SURFACE INTERACTION, NAME=CI_{cn}"]
-        if law["kind"] == "bonded":
-            L += ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TIED", _g(K)]
-            fr = []
+        fr = friction_lines(K, {"friction": mu}) if mu > 0 and law["kind"] != "bonded" else []
+        if modal is not None:
+            if c["name"] in modal["ties"]:
+                L += [f"*TIE, NAME=T_{cn}, POSITION TOLERANCE={_g(modal['tol'])}", f"CS_{cn}, CM_{cn}"]
         else:
-            fr = friction_lines(K, {"friction": mu}) if mu > 0 else []
-            L += ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR", _g(K)] + (
-                friction_lines(K, {"friction": mu}, stick) if mu > 0 else [])
-        L += [f"*CONTACT PAIR, INTERACTION=CI_{cn}, TYPE=SURFACE TO SURFACE", f"CS_{cn}, CM_{cn}"]
-        if "clearance" in c:
-            L += [f"*CLEARANCE, MASTER=CM_{cn}, SLAVE=CS_{cn}, VALUE={_g(float(c['clearance']))}"]
+            L += [f"*SURFACE INTERACTION, NAME=CI_{cn}"]
+            if law["kind"] == "bonded":   # tied in every direction: CalculiX takes the tangential stiffness from
+                # the stick slope, which TIED needs ('a stick slope using the *FRICTION card is mandatory')
+                L += ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TIED", _g(K), "*FRICTION", f"1., {_g(K)}"]
+            else:
+                L += ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR", _g(K)] + (
+                    friction_lines(K, {"friction": mu}, stick) if mu > 0 else [])
+            L += [f"*CONTACT PAIR, INTERACTION=CI_{cn}, TYPE=SURFACE TO SURFACE", f"CS_{cn}, CM_{cn}"]
+            if "clearance" in c:
+                L += [f"*CLEARANCE, MASTER=CM_{cn}, SLAVE=CS_{cn}, VALUE={_g(float(c['clearance']))}"]
         nrm = sum((p["mesh"].groups[tg_].normal * p["mesh"].groups[tg_].area[:, None]).sum(axis=0)
                   for p, tgs in slave for tg_ in tgs)
         plan["contacts"].append({"name": c["name"], "slave_faces": sf, "tags": gtags(parts, slave),
@@ -691,7 +706,13 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
     if pret:
         L += ["*NSET, NSET=N_PRETENSION"] + _lines(pnodes) + ["*NSET, NSET=N_BOLTENDS"] + _lines(ends)
     plan["pret_nodes"] = pnodes
-    has_contact = bool(plan["gaskets"] or plan["contacts"])
+    has_contact = bool(plan["gaskets"] or plan["contacts"]) and modal is None
+    if modal is not None:   # the frequency run: supports, the bolts held at their preloaded length, nothing else
+        L += ["*STEP", "*FREQUENCY", str(int(modal["modes"])), "*BOUNDARY"] + bnd + (["N_PRETENSION, 1, 1"] if pret else [])
+        L += ["*NODE FILE", "U", "*END STEP"]
+        plan["steps"] = [{"step": 1, "kind": "modal", "what": "frequencies", "modes": int(modal["modes"]),
+                          "factor": None, "loads": {}, "ccx_step": 1}]
+        return "\n".join(L) + "\n", plan
     frictional = [g for g in plan["gaskets"]] + [c for c in plan["contacts"] if c["friction"]]
 
     def outputs():   # bolt forces from the springs' ends; contact stresses from the contact output; no element
@@ -730,13 +751,12 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
             dummy_dl = f"{ld['items'][0][0]}, GRAV, 0., 0., 0., -1."
             break
     prev_kind = None
+    sof_done = False
     for s in dsteps:
-        if s["kind"] == "modal":   # the frequencies of the preloaded, loaded assembly: its last state's stiffness
-            L += ["*STEP, PERTURBATION", "*FREQUENCY", str(s["modes"]), "*NODE FILE", "U", "*END STEP"]
+        if s["kind"] == "modal":   # a separate linear run on the state the previous step left (solve, write(modal=))
             plan["steps"].append(s)
-            prev_kind = "modal"
             continue
-        first = s["step"] == 1
+        first = s["ccx_step"] == 1
         # the first step from a small increment (the contact is found at a twentieth of the load); later steps add a
         # part of the load in one increment (CalculiX cuts it back if contact needs it)
         L += ["*STEP, INC=1000", "*STATIC", "0.05, 1., 1e-05, 0.25" if first else "1., 1., 1e-08, 1."]
@@ -758,7 +778,14 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         if prev_kind == "preload":   # the friction at its full stick slope once the faces are pressed
             for g in frictional:
                 L += [f"*CHANGE FRICTION, INTERACTION={g['interaction']}"] + g["friction"]
-        L += outputs() + ["*END STEP"]
+        L += outputs()
+        if not sof_done:   # each contact's force from its slave face's section force (integrated stresses; summing
+            # the nodal contact pressures of a stiff penalty is off by up to 2x: assembly_clamp, 2026.11.04): once,
+            # CalculiX repeats it in the later steps
+            for c in plan["contacts"]:
+                L += [f"*SECTION PRINT, SURFACE=CS_{_name(c['name'])}, NAME=SP_{_name(c['name'])}", "SOF"]
+            sof_done = True
+        L += ["*END STEP"]
         plan["steps"].append(s)
         prev_kind = s["kind"]
     return "\n".join(L) + "\n", plan
@@ -901,17 +928,51 @@ def contact_pressure_by_step(blocks: list[dict]) -> dict[int, dict[int, float]]:
 
 
 def disp_by_step(blocks: list[dict], steps: list[dict], N: int) -> dict[int, np.ndarray]:
-    """{step (1-based): U (N, 3)} of the static steps (a modal step's blocks are its mode shapes)."""
-    modal = {s["step"] for s in steps if s["kind"] == "modal"}
+    """{CalculiX step (1-based): U (N, 3)} of the deck's (static) steps."""
     out = {}
     for b in blocks:
         s = b["step"]
-        if not b["name"].startswith("DISP") or not s or s in modal:
+        if not b["name"].startswith("DISP") or not s:
             continue
         U = out.setdefault(s, np.zeros((N, 3)))
         for n, v in b["data"].items():
             if 1 <= n <= N:
                 U[n - 1] = v[:3]
+    return out
+
+
+def section_forces(dat_text: str) -> list[dict]:
+    """CalculiX's *SECTION PRINT SOF blocks: {set, time, force [fx, fy, fz], normal (mean, area-weighted), area,
+    normal_force (+ tension), shear_force} (printoutface.f: 'statistics for surface set S and time t', then the
+    total force and moment, the centre of gravity and mean normal, the moment about it, and area, normal and shear
+    force)."""
+    out, cur, nums = [], None, []
+    head = re.compile(r"statistics for surface set\s+(\S+)\s+and time\s+(\S+)", re.I)
+    for line in dat_text.splitlines():
+        m = head.search(line)
+        if m:
+            cur, nums = {"set": m.group(1).upper(), "time": float(m.group(2).replace("D", "E"))}, []
+            out.append(cur)
+            continue
+        if cur is None:
+            continue
+        tk = line.split()
+        try:
+            vals = [float(x.replace("D", "E")) for x in tk] if tk else None
+        except ValueError:
+            vals = None
+            if tk and not tk[0][0].isalpha() and "(" not in line:
+                cur = None
+            continue
+        if vals:
+            nums.append(vals)
+            if len(nums) == 1 and len(vals) >= 3:
+                cur["force"] = vals[:3]
+            elif len(nums) == 2 and len(vals) >= 6:
+                cur["normal"] = vals[3:6]
+            elif len(nums) == 4 and len(vals) >= 3:
+                cur["area"], cur["normal_force"], cur["shear_force"] = vals[:3]
+                cur = None
     return out
 
 
@@ -957,7 +1018,8 @@ def contact_state(c: dict, cmap: dict | None, area: dict) -> dict | None:
     return out
 
 
-def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text: str) -> dict:
+def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text: str,
+             modal_runs: dict | None = None) -> dict:
     """Bolt and nut forces, gasket stresses, contact states, probes and part stresses at every static step; the
     leak and lift-off loads of a sweep; the frequencies of modal steps."""
     X = all_nodes(parts)
@@ -1014,6 +1076,7 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
                 f"gasket {g['name']}: one edge only (nothing inside it to seal): lift-off is when all of it opens; "
                 "no leak pressure")
     careas = {c["name"]: _node_areas(X, tets, c["slave_faces"]) for c in plan["contacts"]}
+    sofs = section_forces(dat_text) if plan["contacts"] else []
     disp = disp_by_step(blocks, steps, N) if (assembly or plan.get("probes")) else {}
     for s in solid:
         st = steps[s]
@@ -1029,7 +1092,8 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
             if np.isfinite(fv).any():
                 rec["bolts"][brec["name"]] = {"min_N": round(float(np.nanmin(fv)), 3), "max_N": round(float(np.nanmax(fv)), 3),
                                               "mean_N": round(float(np.nanmean(fv)), 3)}
-        cmap = cb.get(s + 1)
+        ccx = st.get("ccx_step") or (s + 1)
+        cmap = cb.get(ccx)
         for g in plan["gaskets"]:
             adj, area, inner, outer = graphs[g["name"]]
             if cmap is None:
@@ -1054,17 +1118,31 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
                                          "leak": bool(not math.isinf(ring) and ring < thr),
                                          "open": bool(not math.isinf(ring) and ring <= 1e-9)}
         if plan["contacts"]:
-            rec["contacts"] = {c["name"]: contact_state(c, cmap, careas[c["name"]]) for c in plan["contacts"]}
-        if plan.get("probes") and (s + 1) in disp:
-            U = disp[s + 1]
+            rec["contacts"] = {}
+            for c in plan["contacts"]:
+                cs = contact_state(c, cmap, careas[c["name"]])
+                sf = next((q for q in reversed(sofs) if q["set"] == f"CS_{_name(c['name'])}" and "normal_force" in q
+                           and abs(q["time"] - ccx) < 1e-6), None)
+                if cs is not None:
+                    cs["pressure_force_N"] = cs["force_N"]
+                    nrm = float(np.linalg.norm(sf.get("normal", [0, 0, 0]))) if sf else 0.0
+                    if sf and nrm > 0.9:   # a flat face: the section force through it (compression positive)
+                        cs["force_N"] = round(-sf["normal_force"], 3)
+                        cs["shear_N"] = round(sf["shear_force"], 3)
+                        cs["force_from"] = "section"
+                    else:                  # a curved face (a press fit): the nodal pressures' integral
+                        cs["force_from"] = "pressures"
+                rec["contacts"][c["name"]] = cs
+        if plan.get("probes") and ccx in disp:
+            U = disp[ccx]
             rec["probes"] = {}
             for pn, nodes in plan["probes"].items():
                 m = U[np.asarray(nodes) - 1].mean(axis=0)
                 rec["probes"][pn] = {"ux": round(float(m[0]), 9), "uy": round(float(m[1]), 9), "uz": round(float(m[2]), 9),
                                      "u": round(float(np.linalg.norm(m)), 9)}
-        if assembly and (s + 1) in disp:   # each part's peak von Mises (nodal, from the displacements)
+        if assembly and ccx in disp:   # each part's peak von Mises (nodal, from the displacements)
             from .render import nodal_stress, von_mises
-            U = disp[s + 1]
+            U = disp[ccx]
             rec["parts"] = {}
             for p in parts:
                 sl = slice(p["n0"], p["n0"] + len(p["mesh"].nodes))
@@ -1074,29 +1152,27 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
                                            "at": np.round(p["mesh"].nodes[k], 3).tolist(),
                                            "max_displacement_mm": round(float(np.linalg.norm(U[sl], axis=1).max()), 9)}
         res["steps"].append(rec)
-    # modal steps: CalculiX's eigenvalue tables in order, one per modal step; each with the state it started from
-    eig = dat.get("eigen") or []
-    tables, cur = [], []
-    for e in eig:
-        if e["mode"] == 1 and cur:
-            tables.append(cur)
-            cur = []
-        cur.append(e)
-    if cur:
-        tables.append(cur)
+    # modal steps: each a linear frequency run (solve) on the state its previous step left
     modal = [s for s in steps if s["kind"] == "modal"]
     if modal:
         res["modal"] = []
-        for j, s in enumerate(modal):
+        for s in modal:
+            run = (modal_runs or {}).get(s["step"]) or {}
             base = next((r for r in reversed(res["steps"]) if r["step"] < s["step"]), None)
-            fr = [round(float(e["hz"]), 6) for e in (tables[j] if j < len(tables) else [])][:s["modes"]]
+            fr = [round(float(e["hz"]), 6) for e in run.get("eigen", [])][:s["modes"]]
             res["modal"].append({"step": s["step"], "name": s.get("name"), "after_step": base["step"] if base else None,
-                                 "frequencies_Hz": fr,
+                                 "frequencies_Hz": fr, "tied": run.get("tied", []), "free": run.get("free", []),
                                  "contacts": {k: {q: v[q] for q in ("closed_fraction", "stick_fraction", "force_N")}
                                               for k, v in (base or {}).get("contacts", {}).items() if v}})
+            if run.get("error"):
+                res.setdefault("warnings", []).append(f"modal step {s['step']}: {run['error']}")
+            for k in run.get("slipping", []):
+                res.setdefault("warnings", []).append(
+                    f"modal step {s['step']}: contact {k} was closed but partly slipping at step "
+                    f"{base['step'] if base else '?'}: tied for the frequencies, which are an upper bound there")
         res["frequencies"] = res["modal"][0]["frequencies_Hz"]
         if not res["frequencies"]:
-            res.setdefault("warnings", []).append("modal step: no frequencies in CalculiX's output")
+            res.setdefault("warnings", []).append("modal step: no frequencies")
     # bolts summary
     i0 = 0
     for brec in plan["bolts"]:
@@ -1200,7 +1276,8 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
 
 
 # ---- the state for pictures (render.py) ------------------------------------------------------------
-def save_state(folder: Path, study: dict, parts: list[dict], plan: dict, res: dict, frd_text: str) -> None:
+def save_state(folder: Path, study: dict, parts: list[dict], plan: dict, res: dict, frd_text: str,
+               modes_frd: str | None = None) -> None:
     """state.npz / state.json as render.py reads them, for the whole assembly: the merged nodes, elements and
     boundary triangles (face tags made unique per part), and per step (1 = the preload) the displacements U_steps,
     the nodal stress tensors S_steps (from the displacements, each part with its material) and the gasket stress
@@ -1230,9 +1307,9 @@ def save_state(folder: Path, study: dict, parts: list[dict], plan: dict, res: di
             if i:
                 U[i], cp[i] = U[i - 1], cp[i - 1]
             continue
-        if s["step"] in disp:
-            U[i] = disp[s["step"]]
-        for n, v in (cbs.get(s["step"]) or {}).items():
+        if s.get("ccx_step", s["step"]) in disp:
+            U[i] = disp[s.get("ccx_step", s["step"])]
+        for n, v in (cbs.get(s.get("ccx_step", s["step"])) or {}).items():
             if 1 <= n <= N:
                 cp[i, n - 1] = max(0.0, v)
     S = np.zeros((nsteps, N, 6))
@@ -1245,8 +1322,8 @@ def save_state(folder: Path, study: dict, parts: list[dict], plan: dict, res: di
             S[s, sl] = nodal_stress(p["mesh"], U[s, sl], {"material": p["material"]}, {})
     fields = {"U_steps": U.astype(np.float32), "S_steps": S.astype(np.float32), "cp_steps": cp.astype(np.float32)}
     first_modal = next((s for s in steps if s["kind"] == "modal"), None)
-    if first_modal is not None:
-        shapes = mode_shapes(blocks, first_modal["step"], N)
+    if first_modal is not None and modes_frd:
+        shapes = mode_shapes(frd_steps(modes_frd), 1, N)
         if shapes:
             fields["modes"] = np.array(shapes, np.float32)
     bcs = [{"name": n, "kind": plan["kinds"][n], "tags": plan.get("bc_tags", {}).get(n, [])} for n in plan["kinds"]]
@@ -1621,6 +1698,9 @@ MAX_FAILED_ATTEMPTS = 3   # unconverged attempts of one increment before the run
 CHATTER_ITERS = 16        # iterations of one attempt looked at for contact chatter
 CHATTER_FLIPS = 6         # direction changes of the contact count among them
 CHATTER_SPREAD = 0.05     # the contact count's swing, relative to its largest value
+SETTLE_ITERS = 25         # iterations of one attempt after which the contact must have settled ...
+SETTLE_RATIO = 3.0        # ... to within this factor (assembly_press_fit, mochi 2026.11.04: 213k down to 13 contact
+                          # elements and back to 30k in one increment: a frictionless ring drifting off its shaft)
 
 
 def read_sta(text: str) -> list[tuple[int, int, int, bool]]:
@@ -1647,12 +1727,20 @@ def read_cvg(text: str) -> list[tuple[int, int, int, int, int, float]]:
 
 
 def _what(step: int, plan: dict | None) -> str:
-    if step == 1:
+    """The deck's step `step` in words (its CalculiX step number)."""
+    steps = (plan or {}).get("steps") or []
+    st = next((s for i, s in enumerate(steps) if s.get("ccx_step", i + 1) == step), None)
+    if st is None:
+        return "preload" if step == 1 else f"step {step}"
+    kind = st.get("kind") or ("preload" if step == 1 else "sweep" if st.get("factor") is not None else "static")
+    if kind == "preload":
         return "preload"
-    st = (plan or {}).get("steps") or []
-    f = st[step - 1]["factor"] if step - 1 < len(st) else None
+    n = st.get("step", step)
     sw = (plan or {}).get("sweep") or {}
-    return f"step {step}" + (f" ({sw.get('bc')} at {100 * f:.0f} %)" if f is not None else "")
+    f = st.get("factor")
+    if kind == "sweep" and f is not None:
+        return f"step {n} ({sw.get('bc')} at {100 * f:.0f} %)"
+    return f"step {n} ({st.get('what') or kind})"
 
 
 def stall_reason(sta: str, cvg: str, plan: dict | None = None) -> tuple[str, int] | None:
@@ -1671,6 +1759,11 @@ def stall_reason(sta: str, cvg: str, plan: dict | None = None) -> tuple[str, int
             if flips >= CHATTER_FLIPS and hi > 0 and (hi - lo) / hi >= CHATTER_SPREAD:
                 return (f"{_what(s, plan)} did not converge: contact chatter ({hi - lo} contact elements switching, "
                         f"{lo} to {hi}; step {s}, increment {i}, attempt {a}, iteration {cur[-1][3]})"), s
+            if len(cur) >= SETTLE_ITERS and hi > 100 and hi >= SETTLE_RATIO * max(lo, 1):
+                return (f"{_what(s, plan)} did not converge: the contact does not settle ({lo} to {hi} contact "
+                        f"elements over the last {CHATTER_ITERS} iterations; step {s}, increment {i}, attempt {a}, "
+                        f"iteration {cur[-1][3]}): a part may be free to slide or turn on a frictionless contact; "
+                        "friction, a support or a bonded contact can hold it"), s
     failed: dict = {}
     for s, i, a, ok in read_sta(sta):
         if not ok:
@@ -1710,6 +1803,54 @@ def completed_steps(sta: str) -> int:
     return done
 
 
+TIE_CLOSED = 0.5      # a pair at least this closed at the base step is tied for its frequencies
+STICK_WARN = 0.9      # ... and when less of it sticks, the frequencies are an upper bound (it was partly slipping)
+
+
+def modal_ties(plan: dict, base: dict | None) -> tuple[list[str], list[str], list[str]]:
+    """(tied, free, slipping) pairs for a modal step on the state `base` (a result step): bonded contacts, and
+    contacts and gaskets closed over TIE_CLOSED of their area, are tied; the others are free."""
+    tied, free, slip = [], [], []
+    cst = (base or {}).get("contacts") or {}
+    gst = (base or {}).get("gaskets") or {}
+    for c in plan["contacts"]:
+        st = cst.get(c["name"]) or {}
+        if c["law"]["kind"] == "bonded" or (st.get("closed_fraction") or 0) >= TIE_CLOSED:
+            tied.append(c["name"])
+            if c["law"]["kind"] != "bonded" and st.get("stick_fraction") is not None and st["stick_fraction"] < STICK_WARN:
+                slip.append(c["name"])
+        else:
+            free.append(c["name"])
+    for g in plan["gaskets"]:
+        (tied if (gst.get(g["name"]) or {}).get("contact_fraction", 0) >= TIE_CLOSED else free).append(g["name"])
+    return tied, free, slip
+
+
+def modal_run(name: str, study: dict, parts: list[dict], plan: dict, res: dict, step: dict, folder: Path,
+              timeout: float) -> dict:
+    """The frequencies of a modal step: a linear CalculiX *FREQUENCY run of the assembly with the pairs that were
+    closed (and the bonded ones) tied, the others free, the bolts and nuts at their preloaded length. (A PERTURBATION
+    step after frictional contact kept no tangential stiffness: assembly_clamped_beam's first mode was 0 Hz.)"""
+    from .runner import SolverError, run_ccx
+    base = next((r for r in reversed(res["steps"]) if r["step"] < step["step"]), None)
+    tied, free, slip = modal_ties(plan, base)
+    h = min(float(p["info"].get("size") or 1.0) for p in parts)
+    gaps = [max(float((x.get("gap") or {}).get("max_mm") or 0.0), abs(float(x.get("clearance_mm") or 0.0)))
+            for x in plan["contacts"] + plan["gaskets"] if x["name"] in tied]
+    tol = 0.25 * h + max(gaps, default=0.0)
+    out = {"tied": tied, "free": free, "slipping": slip}
+    try:
+        text, _ = write(f"{name}_modal{step['step']}", study, parts, modal={"modes": step["modes"], "ties": set(tied), "tol": tol})
+        inp = folder / f"{name}_modal{step['step']}.inp"
+        inp.write_text(text)
+        run_ccx(inp, timeout, serial=True)
+        out["eigen"] = results.parse_dat(inp.with_suffix(".dat").read_text(errors="replace")).get("eigen") or []
+        out["frd"] = inp.with_suffix(".frd").read_text(errors="replace") if inp.with_suffix(".frd").is_file() else None
+    except (SolverError, OSError, MeshError) as exc:
+        out["error"] = str(exc)[:500]
+    return out
+
+
 # ---- one joint study end to end (runner.solve_once calls this) -----------------------------------
 def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, progress=None) -> dict:
     """Meshes the parts, writes and runs the deck (CalculiX: contact and pretension), evaluates the joint."""
@@ -1736,28 +1877,42 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
     watch = Watch(inp, plan)
     stopped = None
     try:
-        # a modal step: single-threaded, as modal studies (CalculiX's threaded eigenvalue step once gave a wrong mode)
-        run_ccx(inp, timeout, serial=any(s["kind"] == "modal" for s in plan["steps"]), monitor=watch)
+        run_ccx(inp, timeout, monitor=watch)
     except (Stopped, subprocess.TimeoutExpired) as exc:
         sta = inp.with_suffix(".sta")
         done = completed_steps(sta.read_text(errors="replace")) if sta.is_file() else 0
         why = str(exc) if isinstance(exc, Stopped) else f"CalculiX ran past the time limit ({timeout:g} s) in {_what(done + 1, plan)}"
-        if done < 1 or not inp.with_suffix(".dat").is_file():   # not even the preload: nothing to report
+        if done < 1 or not inp.with_suffix(".dat").is_file():   # not even the first step: nothing to report
             gaps = [w for w in (gap_warning(g) for g in plan["gaskets"]) if w]
             raise SolverError(why + ". " + (" ".join(gaps) + ". " if gaps else "")
-                              + "Check that each gasket's faces touch (parts.move), that every part is held by "
-                              "supports or bolts, and the start of the gasket curve; the stabilisation springs were on."
-                              ) from exc
+                              + "Check that the contact and gasket faces touch (parts.move, or a contact's clearance), "
+                              "that every part is held by supports, bolts or contacts, and the start of a gasket curve; "
+                              "the stabilisation springs were on.") from exc
         stopped = (why, done)
-        plan = dict(plan, steps=plan["steps"][:done])
+        cut = next((i for i, s in enumerate(plan["steps"]) if s.get("ccx_step") and s["ccx_step"] > done),
+                   len(plan["steps"]))
+        plan = dict(plan, steps=plan["steps"][:cut])
+    dat_text = inp.with_suffix(".dat").read_text(errors="replace")
+    frd_text = inp.with_suffix(".frd").read_text(errors="replace") if inp.with_suffix(".frd").is_file() else ""
+    res = evaluate(study, parts, plan, dat_text, frd_text)
+    # modal steps: a linear frequency run each, on the state its previous step left
+    runs, modes_frd = {}, None
+    for s in [q for q in plan["steps"] if q["kind"] == "modal"]:
+        check_cancel()
+        run = modal_run(name, study, parts, plan, res, s, Path(folder), timeout)
+        runs[s["step"]] = run
+        if modes_frd is None and run.get("frd"):
+            modes_frd = run["frd"]
+    if runs:
+        res = evaluate(study, parts, plan, dat_text, frd_text, runs)
     t2 = time.perf_counter()
-    res = evaluate(study, parts, plan, inp.with_suffix(".dat").read_text(errors="replace"),
-                   inp.with_suffix(".frd").read_text(errors="replace") if inp.with_suffix(".frd").is_file() else "")
     if stopped:
         res["stopped"] = {"why": stopped[0], "completed_steps": stopped[1]}
+        last = res["steps"][-1] if res["steps"] else {}
+        at = (f"{last['load']:.4g} {res.get('swept', {}).get('unit', '')}".strip() if last.get("load") is not None
+              else last.get("what", ""))
         res.setdefault("warnings", []).append(
-            f"{stopped[0]}: the results stop at step {stopped[1]} ({res['steps'][-1]['load']:.4g} {res['swept']['unit']}); "
-            "leak and lift-off beyond it are not known")
+            f"{stopped[0]}: the results stop at step {last.get('step', '?')} ({at}); the later steps are not known")
     minfo = {"nodes": n_nodes, "elements": sum(len(p["mesh"].tets) for p in parts), "order": parts[0]["mesh"].order,
              "parts": {p["name"]: {k: v for k, v in p["info"].items() if k in ("nodes", "elements", "size", "mesh_notes",
                                                                               "straightened_elements")} for p in parts}}
@@ -1771,7 +1926,8 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
                    "gaskets": len(plan["gaskets"])}
     try:   # the state for pictures (images, render_images): the results stand without it
         frd = inp.with_suffix(".frd")
-        save_state(Path(folder), study, parts, plan, res, frd.read_text(errors="replace") if frd.is_file() else "")
+        save_state(Path(folder), study, parts, plan, res, frd.read_text(errors="replace") if frd.is_file() else "",
+                   modes_frd)
         res["files"]["state"] = str(Path(folder) / "state.npz")
     except Exception as exc:  # noqa: BLE001
         res.setdefault("warnings", []).append(f"could not save the state for pictures: {type(exc).__name__}: {exc}"[:300])

@@ -1,7 +1,7 @@
 """Assemblies (analysis "assembly", joint.py): steps and their loads, contacts (hard, penalty, bonded, clearance), nuts
 on a meshed shaft, probes, part stresses, modal steps on the loaded state, validation, pictures. Offline: the CalculiX
 runs are the assembly_* benchmarks (test_fea.test_benchmark_calculix, FEAT_SLOW_TESTS=1).
-Version: 2026.11.04.1
+Version: 2026.11.04.2
 """
 import copy
 import math
@@ -54,7 +54,9 @@ def test_assembly_deck(boxes):
     st, parts, text, plan = boxes
     up = text.upper()
     steps = up.split("*STEP")
-    assert len(steps) == 3 and steps[2].startswith(", PERTURBATION\n*FREQUENCY\n3\n")
+    assert len(steps) == 2 and "*FREQUENCY" not in up and "PERTURBATION" not in up   # modal: a separate run
+    assert [s["kind"] for s in plan["steps"]] == ["static", "modal"] and plan["steps"][1]["ccx_step"] is None
+    assert "*SECTION PRINT, SURFACE=CS_C, NAME=SP_C\nSOF\n" in steps[1]
     assert "PRESSURE-OVERCLOSURE=LINEAR" in steps[0] and "*CONTACT PAIR, INTERACTION=CI_C" in steps[0]
     law = plan["contacts"][0]["law"]
     assert law["kind"] == "hard" and law["stiffness_MPa_mm"] == pytest.approx(10 * 210000 / law["h_mm"])
@@ -73,7 +75,7 @@ def test_bonded_clearance_and_held_by_bonding(tmp_path):
                            "law": "bonded"}])
     parts = joint.mesh_parts(st, tmp_path / "a")
     text, plan = joint.write("b", st, parts)
-    assert "PRESSURE-OVERCLOSURE=TIED" in text and "*FRICTION" not in text
+    assert "PRESSURE-OVERCLOSURE=TIED\n" in text and "*FRICTION\n1., " in text   # TIED needs a stick slope
     assert plan["stabilisation"]["springs"] == 0          # tied to the fixed base: held
     st2 = _boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
                             "law": {"stiffness": 1000}, "friction": 0.0, "clearance": -0.01}])
@@ -127,24 +129,41 @@ def test_assembly_results(boxes):
     top0 = parts[1]["n0"]
     dm = {n: (0.01 * (n > top0), 0.0, 0.0) for n in range(1, len(X) + 1)}
     modes = [{n: (1.0 * (n > top0), 0.0, 0.0) for n in range(1, len(X) + 1)}] * 3
-    frd = _frd([cm], [dm], modes, modal_step=2)
-    res = joint.evaluate(st, parts, plan, EIGEN, frd)
+    frd = _frd([cm], [dm])
+    sof = ("\n statistics for surface set CS_C and time  0.1000000E+01\n\n"
+           "   total surface force (fx,fy,fz) and moment about the origin(mx,my,mz)\n\n"
+           "   -1.000000E+01  0.000000E+00 -7.900000E+03  0.000000E+00  0.000000E+00  0.000000E+00\n\n"
+           "   center of gravity and mean normal\n\n"
+           "    0.000000E+00  0.000000E+00  2.000000E+01  0.000000E+00  0.000000E+00 -1.000000E+00\n\n"
+           "   moment about the center of gravity(mx,my,mz)\n\n"
+           "    0.000000E+00  0.000000E+00  0.000000E+00\n\n"
+           "   area,  normal force (+ = tension) and shear force (size)\n\n"
+           "    1.600000E+03 -7.900000E+03  1.000000E+01\n")
+    from fea_translator import results as R
+    eig = R.parse_dat(EIGEN)["eigen"]
+    mfrd = _frd([], [], modes, modal_step=1)
+    runs = {2: {"eigen": eig, "tied": ["c"], "free": [], "slipping": ["c"], "frd": mfrd}}
+    res = joint.evaluate(st, parts, plan, sof, frd, runs)
     s0 = res["steps"][0]
     c = s0["contacts"]["c"]
-    assert c["force_N"] == pytest.approx(5.0 * 1600, rel=1e-6) and c["closed_fraction"] == 1.0
+    assert c["pressure_force_N"] == pytest.approx(5.0 * 1600, rel=1e-6) and c["closed_fraction"] == 1.0
+    assert c["force_N"] == 7900.0 and c["shear_N"] == 10.0 and c["force_from"] == "section"   # SOF, compression +
     assert 0.3 < c["stick_fraction"] < 0.7 and c["max_slip_mm"] == pytest.approx(0.001)
     assert s0["probes"]["tip"]["ux"] == pytest.approx(0.01) and s0["kind"] == "static" and s0["loads"]["side"] == 1.0
     assert s0["parts"]["top"]["max_displacement_mm"] == pytest.approx(0.01) and s0["parts"]["top"]["peak_von_mises_MPa"] < 1e-6
     assert res["frequencies"] == pytest.approx([159.1549, 166.9227, 1006.584])
     m = res["modal"][0]
-    assert m["step"] == 2 and m["after_step"] == 1 and m["contacts"]["c"]["closed_fraction"] == 1.0
+    assert m["step"] == 2 and m["after_step"] == 1 and m["contacts"]["c"]["closed_fraction"] == 1.0 and m["tied"] == ["c"]
+    assert any("partly slipping" in w for w in res["warnings"])
+    assert joint.modal_ties(plan, s0) == (["c"], [], ["c"])
+    assert joint.modal_ties(plan, {"contacts": {"c": dict(c, closed_fraction=0.2)}})[1] == ["c"]   # open: free
     assert "leak" not in res and "bolt_preload_error" not in res and res["contacts"]["c"]["law"]["kind"] == "hard"
     # pictures: the state keeps the static step for the modal step, and the mode shapes
     from fea_translator import render
     import tempfile
     from pathlib import Path
     d = Path(tempfile.mkdtemp())
-    joint.save_state(d, st, parts, plan, res, frd)
+    joint.save_state(d, st, parts, plan, res, frd, mfrd)
     state = render.load_state(d)
     assert state["fields"]["modes"].shape == (3, len(X), 3)
     assert np.allclose(state["fields"]["U_steps"][1], state["fields"]["U_steps"][0])
@@ -196,3 +215,28 @@ def test_a_nut_on_a_meshed_shaft(tmp_path):
     assert np.allclose(np.linalg.norm(X[geo["nut"], :2], axis=1), 15, atol=0.05)     # the shaft's surface
     assert f"\n{b['pret_node']}, 1, -40000\n" in text                                 # pushes the faces apart
     assert set(plan["stabilisation"]["parts"]) == {"sleeve", "hub"}
+
+
+def test_the_modal_run_deck(boxes):
+    """The frequency run: the closed pairs tied, the supports, no contact pairs, no loads."""
+    st, parts, text, plan = boxes
+    t, pl = joint.write("asm_modal2", st, parts, modal={"modes": 5, "ties": {"c"}, "tol": 1.0})
+    up = t.upper()
+    assert "*TIE, NAME=T_C, POSITION TOLERANCE=1\nCS_C, CM_C" in up and "*CONTACT PAIR" not in up
+    assert up.count("*STEP") == 1 and "*FREQUENCY\n5\n*BOUNDARY\nN_ROOT, 1, 3\nN_STABGROUND, 1, 3" in up
+    assert "*CLOAD" not in up and "*DLOAD" not in up and pl["steps"][0]["kind"] == "modal"
+    t2, _ = joint.write("asm_modal_free", st, parts, modal={"modes": 5, "ties": set(), "tol": 1.0})
+    assert "*TIE" not in t2
+
+
+def test_section_forces_parse():
+    txt = ("\n statistics for surface set CS_A and time  0.2000000E+01\n\n"
+           "   total surface force (fx,fy,fz) and moment about the origin(mx,my,mz)\n\n"
+           "    1.0E+00  2.0E+00  3.0E+00  0.0E+00  0.0E+00  0.0E+00\n\n"
+           "   center of gravity and mean normal\n\n"
+           "    0.0E+00  0.0E+00  0.0E+00  0.0E+00  1.0E+00  0.0E+00\n\n"
+           "   moment about the center of gravity(mx,my,mz)\n\n    0.0E+00  0.0E+00  0.0E+00\n\n"
+           "   area,  normal force (+ = tension) and shear force (size)\n\n    5.0E+01  2.0E+00  3.1E+00\n")
+    (s,) = joint.section_forces(txt)
+    assert s == {"set": "CS_A", "time": 2.0, "force": [1.0, 2.0, 3.0], "normal": [0.0, 1.0, 0.0], "area": 50.0,
+                 "normal_force": 2.0, "shear_force": 3.1}

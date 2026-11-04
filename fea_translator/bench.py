@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.11.04.1
+Version: 2026.11.04.3
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -317,15 +317,17 @@ def _assembly_cases() -> dict:
              "expect": [{"quantity": "steps.0.contacts.hub_sleeve.force_N", "value": P, "tol": 0.03},
                         {"quantity": "steps.0.contacts.sleeve_shoulder.force_N", "value": P, "tol": 0.03},
                         {"quantity": "bolts.nut.max_N", "value": P, "tol": 0.01}]}
-    # assembly_press_fit: a ring ri 20 ro 40 on a solid shaft r 20, both 30 long, radial interference 0.02 mm; plane
+    # assembly_press_fit: a ring ri 20 ro 40 on a solid shaft r 20, both 10 thick, radial interference 0.02 mm; plane
     # stress, same material: p = E d (c^2 - b^2) / (2 b c^2)
     E, d, b_, c_ = 210000.0, 0.02, 20.0, 40.0
-    press = {"analysis": "assembly", "mesh": {"size": 3},
-             "parts": {"shaft": {"part": cyl(20, 30)}, "ring": {"part": ring(20, 40, 30)}},
+    press = {"analysis": "assembly", "mesh": {"size": 3},     # thin (10 mm): plane stress
+             "parts": {"shaft": {"part": cyl(20, 10)}, "ring": {"part": ring(20, 40, 10)}},
              "bcs": [{"kind": "slider", "name": "shaft_base", "faces": {"part": "shaft", "nz": -1}},
                      {"kind": "slider", "name": "ring_base", "faces": {"part": "ring", "nz": -1}}],
              "contacts": [{"name": "fit", "faces": {"part": "ring", "cyl_r": 20, "side": "inner"},
-                           "with": {"part": "shaft", "cyl_r": 20}, "friction": 0.0, "clearance": -d}],
+                           "with": {"part": "shaft", "cyl_r": 20}, "clearance": -d}],   # friction 0.2: holds the
+             # parts sideways (frictionless, the ring drifted off the shaft: mochi 2026.11.04) and, the fit being
+             # symmetric, does not change the pressure
              "steps": [{"kind": "static"}], "run": {"timeout_s": 1800},
              "expect": [{"quantity": "steps.0.contacts.fit.mean_pressure_MPa",
                          "value": E * d * (c_ ** 2 - b_ ** 2) / (2 * b_ * c_ ** 2), "tol": 0.10}]}
