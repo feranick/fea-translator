@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.03.1
+Version: 2026.11.04.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -741,7 +741,7 @@ def _deck_into(study: dict, name: str, folder: Path) -> dict:
     from .mesher import mesh_part
 
     extra = {}
-    if study.get("analysis") == "joint":   # an assembly: every part meshed, the whole deck, what each selector took
+    if study.get("analysis") in ("joint", "assembly"):   # every part meshed, the whole deck, what each selector took
         from . import joint as J
         parts = J.mesh_parts(study, folder)
         text, plan = J.write(name, study, parts)
@@ -755,6 +755,10 @@ def _deck_into(study: dict, name: str, folder: Path) -> dict:
                            for r in plan["bolts"]},
                  "gaskets": {g["name"]: {"area_mm2": round(g["area"], 3), "gap_mm": g["gap"], "law": g["law"]}
                              for g in plan["gaskets"]},
+                 "contacts": {c["name"]: {"area_mm2": round(c["area"], 3), "gap_mm": c["gap"], "law": c["law"],
+                                          "friction": c["friction_mu"], "clearance_mm": c.get("clearance_mm")}
+                              for c in plan.get("contacts", [])},
+                 "steps": [{"step": s["step"], "kind": s["kind"], "what": s["what"]} for s in plan["steps"]],
                  "stabilisation": {k: v for k, v in plan["stabilisation"].items() if k != "parts"}
                  | {"parts": {k: len(v) for k, v in plan["stabilisation"]["parts"].items()}},
                  "warnings": [w for w in (J.gap_warning(g) for g in plan["gaskets"]) if w]

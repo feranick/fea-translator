@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.03.1
+Version: 2026.11.04.1
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (1): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments, split as a shell
@@ -321,7 +321,7 @@ def node_cores() -> int:
 
 def _joint_parts(study: dict) -> list[dict] | None:
     """A joint study's parts as single-part studies ({part, mesh}: the part's mesh over the study's), else None."""
-    if study.get("analysis") != "joint" or not isinstance(study.get("parts"), dict):
+    if study.get("analysis") not in ("joint", "assembly") or not isinstance(study.get("parts"), dict):
         return None
     base = study.get("mesh") if isinstance(study.get("mesh"), dict) else {}
     return [{"part": p.get("part", {}), "mesh": {**base, **(p.get("mesh") if isinstance(p.get("mesh"), dict) else {})}}

@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.11.02.6
+Version: 2026.11.04.1
 """
 import os
 import shutil
@@ -165,9 +165,12 @@ def test_benchmark_calculix(name, tmp_path):
     assert r["ok"], r.get("error")
     assert r["passed"], (r["checks"], r.get("warnings"))
     assert r.get("equilibrium_error", 0) < 1e-4 and r.get("heat_balance_error", 0) < 1e-3
-    if name.startswith("joint"):   # the bolts carry the preload; the stabilisation springs (unheld parts) next to nothing
-        assert r["bolt_preload_error"] < 1e-3, r["bolt_preload_error"]
-        assert ((r.get("stabilisation") or {}).get("fraction_of_preload") or 0) < 0.01, r.get("stabilisation")
+    if name.startswith(("joint", "assembly")):   # bolts and nuts carry the preload; the stabilisation springs
+        # (parts no support holds) next to nothing
+        if "bolt_preload_error" in r:
+            assert r["bolt_preload_error"] < 1e-3, r["bolt_preload_error"]
+        stab = r.get("stabilisation") or {}
+        assert (stab.get("fraction_of_preload", stab.get("fraction_of_load")) or 0) < 0.01, stab
 
 
 @pytest.mark.skipif(not HAVE_GMSH, reason="Gmsh not installed")

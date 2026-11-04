@@ -1,6 +1,6 @@
 """render.py — pictures of a solved study: a field on the part's surface (deformed or not), mode shapes, the
 "setup" view (which faces each support and load took), and section cuts; plus the saved state they are drawn from.
-Version: 2026.11.01.6
+Version: 2026.11.04.1
 
     render(folder, specs, name) -> ({name: {path, what, ...}}, warnings)    from <folder>/state.npz into <folder>/images
     default_images(state | study) -> specs (for "images": true)
@@ -33,11 +33,12 @@ FIELDS = {"von_mises": "von Mises stress (MPa)", "displacement": "displacement m
           "max_principal": "max principal stress (MPa)", "safety_factor": "safety factor (yield / von Mises)",
           "temperature": "temperature (°C)", "heat_flux": "heat flux magnitude (W/m²)", "potential": "potential (V)",
           "current_density": "current density magnitude (A/mm²)", "e_field": "electric field magnitude (kV/mm)",
-          "gasket_stress": "gasket stress (contact pressure, MPa)"}
+          "gasket_stress": "gasket stress (contact pressure, MPa)", "contact_pressure": "contact pressure (MPa)"}
 MODE_LABEL = "mode shape: displacement magnitude (relative)"
 CMAPS = {"von_mises": "jet", "max_principal": "coolwarm", "safety_factor": "RdYlGn", "temperature": "inferno",
          "heat_flux": "inferno", "potential": "viridis", "current_density": "plasma", "e_field": "plasma",
-         "ux": "coolwarm", "uy": "coolwarm", "uz": "coolwarm", "displacement": "viridis", "gasket_stress": "turbo"}
+         "ux": "coolwarm", "uy": "coolwarm", "uz": "coolwarm", "displacement": "viridis", "gasket_stress": "turbo",
+         "contact_pressure": "turbo"}
 MECH = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal", "safety_factor")
 PALETTE = ("#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22",
            "#7f7f7f", "#393b79", "#ad494a")
@@ -45,14 +46,15 @@ PART_GREY = "#c8c8c8"
 DEFORM_FRACTION = 0.05      # deformed: true scales the largest displacement to 5 % of the part's size
 SIZE_IN, DPI = (9, 7), 130
 SPEC_KEYS = ("name", "surface", "field", "deformed", "view", "clim", "quality", "mode", "setup", "slice", "step")
-JOINT_FIELDS = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal", "gasket_stress")
+JOINT_FIELDS = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal", "gasket_stress", "contact_pressure")
+SURFACE_FIELDS = ("gasket_stress", "contact_pressure")     # on a gasket's (or contact's) slave faces
 
 
 # ---- which fields an analysis has ----------------------------------------------------------------
 def fields_of(study: dict) -> tuple:
     """The fields a study's pictures can show (safety_factor needs the material's yield)."""
     an = study.get("analysis")
-    if an == "joint":
+    if an in ("joint", "assembly"):
         return JOINT_FIELDS
     mech = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal")
     from .study import material_of
@@ -75,13 +77,24 @@ def default_images(study: dict, modes: int | None = None) -> list[dict]:
     electrostatic: potential and electric field; joule: temperature, potential and current density."""
     an = study.get("analysis")
     vm = {"name": "von_mises", "field": "von_mises", "deformed": True}
-    if an == "joint":   # the setup, each gasket's stress at the preload and at the last step, the deformed assembly
-        last = joint_steps(study)
+    if an in ("joint", "assembly"):   # the setup, each gasket's stress at the first and last static step, each
+        # contact's pressure at the last, the deformed assembly; the first modes of a modal step
+        from .joint import deck_steps
+        ds = deck_steps(study)
+        solid = [s["step"] for s in ds if s["kind"] != "modal"] or [1]
+        first, last = solid[0], solid[-1]
         out = [{"name": "setup", "setup": True}]
-        for g in study.get("gaskets", []):
-            out += [{"name": f"{g['name']}_preload", "field": "gasket_stress", "surface": g["name"], "step": 1},
+        for g in study.get("gaskets", []) or []:
+            out += [{"name": f"{g['name']}_{'preload' if ds and ds[0]['kind'] == 'preload' else 'first'}",
+                     "field": "gasket_stress", "surface": g["name"], "step": first},
                     {"name": f"{g['name']}_last", "field": "gasket_stress", "surface": g["name"], "step": last}]
-        return out + [{"name": "displacement", "field": "displacement", "deformed": True, "step": last}]
+        for c in study.get("contacts", []) or []:
+            out.append({"name": f"{c['name']}_pressure", "field": "contact_pressure", "surface": c["name"], "step": last})
+        out.append({"name": "displacement", "field": "displacement", "deformed": True, "step": last})
+        mod = next((s for s in ds if s["kind"] == "modal"), None)
+        if mod:
+            out += [{"name": f"mode{k}", "mode": k} for k in range(1, min(3, mod["modes"]) + 1)]
+        return out
     if an == "static":
         return [vm, {"name": "setup", "setup": True}]
     if an == "modal":
@@ -104,10 +117,21 @@ def _num(v) -> bool:
 
 
 def joint_steps(study: dict) -> int:
-    """A joint study's steps: the preload, then the swept load's steps."""
-    sw = study.get("sweep") if isinstance(study.get("sweep"), dict) else {}
-    n = sw.get("steps", 10)
-    return 1 + (int(n) if _num(n) else 10)
+    """A joint or assembly study's CalculiX steps (a joint: the preload, then the swept load's steps)."""
+    from .joint import deck_steps
+    try:
+        return max(1, len(deck_steps(study)))
+    except Exception:  # noqa: BLE001 (an invalid study: its own errors say why)
+        return 1
+
+
+def modal_modes(study: dict) -> int:
+    """The modes of an assembly's first modal step (0: none)."""
+    from .joint import deck_steps
+    try:
+        return next((s["modes"] for s in deck_steps(study) if s["kind"] == "modal"), 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def image_errors(images, study: dict) -> list[str]:
@@ -120,10 +144,14 @@ def image_errors(images, study: dict) -> list[str]:
     from .study import bc_name
     an = study.get("analysis")
     bcs = [bc_name(i, b) for i, b in enumerate(study.get("bcs", []) or []) if isinstance(b, dict)]
-    gaskets = [g.get("name") for g in study.get("gaskets", []) or [] if isinstance(g, dict)] if an == "joint" else []
-    bcs += gaskets
+    multi = an in ("joint", "assembly")
+    gaskets = [g.get("name") for g in study.get("gaskets", []) or [] if isinstance(g, dict)] if multi else []
+    contacts = [c.get("name") for c in study.get("contacts", []) or [] if isinstance(c, dict)] if multi else []
+    bcs += gaskets + contacts
     have = fields_of(study)
     modes = int(study.get("modes", 6 if an == "modal" else 3)) if _num(study.get("modes", 0)) else 6
+    if an == "assembly":
+        modes = modal_modes(study)
     errs, names = [], []
     for i, sp in enumerate(images):
         w = f"images[{i}]"
@@ -145,8 +173,8 @@ def image_errors(images, study: dict) -> list[str]:
         if sp.get("setup") not in (None, True):
             errs.append(f"{w}.setup: true (the faces each support and load took)")
         if "mode" in sp:
-            if an not in ("modal", "buckling"):
-                errs.append(f"{w}.mode: for modal and buckling studies")
+            if an not in ("modal", "buckling") and not (an == "assembly" and modes):
+                errs.append(f"{w}.mode: for modal and buckling studies, and assemblies with a modal step")
             elif not _num(sp["mode"]) or int(sp["mode"]) != sp["mode"] or not 1 <= sp["mode"] <= modes:
                 errs.append(f"{w}.mode: a mode number from 1 to {modes} (the study's modes)")
         if "field" in sp and sp["field"] not in have:
@@ -157,14 +185,18 @@ def image_errors(images, study: dict) -> list[str]:
         if not what and not have:
             errs.append(f"{w}: a {an} study's pictures are mode shapes: give mode: n")
         if "surface" in sp and sp["surface"] != "part" and sp["surface"] not in bcs:
-            errs.append(f"{w}.surface: part or a bc{' or gasket' if an == 'joint' else ''} name ({', '.join(bcs) or 'none'})")
+            errs.append(f"{w}.surface: part or a bc{', gasket or contact' if multi else ''} name ({', '.join(map(str, bcs)) or 'none'})")
         if sp.get("field") == "gasket_stress" and sp.get("surface", gaskets[0] if gaskets else None) not in gaskets:
             errs.append(f"{w}: gasket_stress is drawn on a gasket: surface: {' | '.join(map(str, gaskets)) or 'a gasket'}")
+        on = contacts + gaskets
+        if sp.get("field") == "contact_pressure" and sp.get("surface", on[0] if on else None) not in on:
+            errs.append(f"{w}: contact_pressure is drawn on a contact or gasket: surface: {' | '.join(map(str, on)) or 'one'}")
         if "step" in sp:
-            if an != "joint":
-                errs.append(f"{w}.step: for joint studies")
+            if not multi:
+                errs.append(f"{w}.step: for joint and assembly studies")
             elif not _num(sp["step"]) or int(sp["step"]) != sp["step"] or not 1 <= sp["step"] <= joint_steps(study):
-                errs.append(f"{w}.step: 1 (the preload) to {joint_steps(study)} (the full swept load)")
+                errs.append(f"{w}.step: 1 to {joint_steps(study)} (the study's CalculiX steps"
+                            + (": 1 the preload, the last the full swept load)" if an == "joint" else ")"))
         if "setup" in sp and any(k in sp for k in ("deformed", "clim")):
             errs.append(f"{w}: the setup view takes no deformed or clim")
         if "deformed" in sp:
@@ -257,7 +289,7 @@ def field_values(state: dict, field: str | None, mode: int | None = None) -> np.
         return m / max(float(m.max()), 1e-300)
     need = {"von_mises": "S", "max_principal": "S", "safety_factor": "S", "displacement": "U", "ux": "U", "uy": "U",
             "uz": "U", "temperature": "T", "heat_flux": "q", "potential": "phi", "current_density": "J", "e_field": "E",
-            "gasket_stress": "cp"}
+            "gasket_stress": "cp", "contact_pressure": "cp"}
     key = need.get(field)
     if key is None:
         raise ValueError(f"unknown field {field!r}")
@@ -359,8 +391,8 @@ def at_step(state: dict, spec: dict) -> tuple[dict, dict]:
     fields = dict(f, U=np.asarray(f["U_steps"][k - 1], float), S=np.asarray(f["S_steps"][k - 1], float),
                   cp=np.asarray(f["cp_steps"][k - 1], float))
     spec = dict(spec, step=k)
-    if spec.get("field") == "gasket_stress":
-        gs = state["meta"].get("gaskets") or {}
+    if spec.get("field") in SURFACE_FIELDS:
+        gs = {**(state["meta"].get("gaskets") or {}), **(state["meta"].get("contacts") or {})}
         g = spec.get("surface") or next(iter(gs), None)
         spec["surface"] = g
         if "view" not in spec and g in gs:
@@ -627,10 +659,14 @@ def title_of(state: dict, spec: dict, name: str) -> str:
     if steps and spec.get("step"):
         k = int(spec["step"])
         st = steps[k - 1] if k <= len(steps) else None
-        if k == 1:
-            s += ", step 1 (preload)"
-        elif st:
+        if st and st.get("kind") == "preload":
+            s += f", step {k} (preload)"
+        elif st and st.get("load") is not None and state["meta"].get("swept"):
             s += f", step {k} ({state['meta'].get('swept')} = {st['load']:.4g} {state['meta'].get('unit') or ''})".rstrip()
+        elif st:
+            s += f", step {k} ({st.get('what') or st.get('kind')})"
+        elif k == 1:
+            s += ", step 1 (preload)"
     if spec.get("slice"):
         s += f", cut at {spec['slice']['axis']} = {float(spec['slice']['at']):g} mm"
     return s

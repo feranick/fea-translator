@@ -4,7 +4,7 @@ Turns an **FEA study** (one solid part, a material, an analysis, supports and lo
 
 It is the FEA counterpart of [build123d-translator](https://github.com/feranick/build123d-translator): an LLM writes the study (the flexible part), the translator computes everything else (which mesh faces, which nodes, consistent nodal loads, element face numbers, the deck), and a checker confirms the result: closed-form benchmarks, equilibrium and heat balance on every run, expected values, and mesh convergence. Parts are STEP files or build123d-translator goals, so the same face conventions select CAD features and boundary conditions.
 
-Analyses: **linear static** (displacements, von Mises stress, reactions, safety factor), **modal** (natural frequencies), **linear buckling** (load factors), **steady heat transfer** (temperatures, heat flows; with `stress: true`, thermal stresses), **DC electric conduction** (terminal currents, resistance, power, current density), **electrostatics** (charges, capacitance, field, margin to breakdown), **Joule heating** (electric, then thermal, optionally stresses) and **bolted joints** (an assembly of parts with gaskets and pretensioned bolts: leak and lift-off pressures).
+Analyses: **linear static** (displacements, von Mises stress, reactions, safety factor), **modal** (natural frequencies), **linear buckling** (load factors), **steady heat transfer** (temperatures, heat flows; with `stress: true`, thermal stresses), **DC electric conduction** (terminal currents, resistance, power, current density), **electrostatics** (charges, capacitance, field, margin to breakdown), **Joule heating** (electric, then thermal, optionally stresses), **bolted joints** (gaskets and pretensioned bolts: leak and lift-off pressures) and **assemblies** (parts in contact, bolts and nuts, static and modal steps).
 
 ## Install
 
@@ -125,6 +125,36 @@ Every run also returns `checks` (the `expect` list, pass or fail), `passed`, `wa
 - **Bolt forces**: each spring's stiffness times its stretch; at the preload it equals the preload (`bolt_preload_error`).
 - **Benchmarks** (the test suite skips them unless `FEAT_SLOW_TESTS=1`: about 35 min together with CalculiX; `run_benchmarks` runs them always) (joint diagram, C = k_b / (k_b + k_j)): `joint_pull` (two blocks, the base held on its bottom face where the nut bears, an M12 bolt, a pull: preload force 3 %, lift-off F = P / (1 - C) 10 %) and `joint_cover` (a cover with a spigot on a ring, 8 M12 bolts, internal pressure: leak and lift-off pressures 15 %) and `joint_two_bolt` (a plate on two M10 at 25 N m on a gasket whose curve starts with no stiffness: the preload converges, the gasket carries the bolts' preload).
 
+### Assembly studies
+
+`"analysis": "assembly"` (CalculiX only) is the general multi-part study; a joint study is an assembly whose steps are a preload and a sweep. It takes the joint's `parts`, `bcs`, `gaskets` and `bolts`, and:
+
+```json
+{"analysis": "assembly", "mesh": {"size": 4},
+ "parts": {"shaft": {"part": {"step": "shaft.step"}}, "sleeve": {"part": {"step": "sleeve.step"}},
+           "impeller": {"part": {"step": "impeller.step"}, "material": "cast_iron"}},
+ "bcs": [{"kind": "fixed", "name": "bearings", "faces": [{"part": "shaft", "cyl_r": 20, "at": [0, 0, 40]}]},
+         {"kind": "force", "name": "side", "faces": {"part": "impeller", "cyl_r": 80}, "fy": 310}],
+ "contacts": [{"name": "hub_sleeve", "faces": {"part": "impeller", "nz": -1, "at": [0, 18, 300]},
+               "with": {"part": "sleeve", "nz": 1}, "friction": 0.2},
+              {"name": "sleeve_shoulder", "faces": {"part": "sleeve", "nz": -1}, "with": {"part": "shaft", "nz": 1, "at": [0, 20, 260]}},
+              {"name": "bore", "faces": {"part": "sleeve", "cyl_r": 15, "side": "inner"}, "with": {"part": "shaft", "cyl_r": 15},
+               "clearance": 0.01}],
+ "nuts": [{"name": "nut", "size": "M20", "torque": 120, "at": [[0, 0, 340]], "bears_on": {"part": "impeller", "nz": 1},
+           "thread": {"part": "shaft", "depth": 16}}],
+ "probes": [{"name": "tip", "faces": {"part": "shaft", "nz": 1, "at": [0, 0, 360]}}],
+ "steps": [{"kind": "preload"}, {"kind": "static", "loads": ["side"]}, {"kind": "modal", "modes": 6}]}
+```
+
+- **Contacts** `[{name, faces, with, law, friction, clearance}]`: face-to-face penalty contact between two parts' faces. `law` `hard` (default: a linear penalty of 10 E / h, the softer part's E and the finer element size), `{"stiffness": MPa/mm}`, or `bonded` (tied in every direction, CalculiX's TIED law: a one-piece reference, or a fallback when friction will not converge). `friction` 0.2 (0: frictionless). `clearance` (mm) sets the pair's initial gap: > 0 a clearance, < 0 an interference (a press fit), whatever the CAD shows.
+- **Nuts** `[{name, size, preload | torque, at, bears_on, thread {part, depth}}]`: a nut on a meshed shaft. It presses `bears_on` (e.g. the impeller hub's face) and grips the shaft's thread over `depth` beyond it, pushing the two apart; the clamp runs through the parts and contacts in between to the shaft's shoulder. The nut is a stiff connector (10 E A_s / d); the shaft carries the tension in its own mesh. `preload` is the axial clamp force; `torque` gives it with k 0.2.
+- **Steps** `[...]`, in order: `{kind: preload}` (first; added by itself when there are bolts or nuts), `{kind: static, loads: [bc names], scale, name}`, `{kind: sweep, bc, steps}` (at most one), `{kind: modal, modes}` (after a static step: CalculiX `*FREQUENCY` with `PERTURBATION`, the stiffness of that state, with its contacts as they are then: closed, sticking or slipping). A load bc no step names acts in every step from the preload on; a static step adds the loads it names (x `scale`); loads do not carry over from one static step to the next. Modal steps run single-threaded and need every part's density.
+- **Probes** `[{name, faces}]`: the faces' mean displacement at every step (e.g. a tip deflection).
+- **Results**: `steps[]` (one per static, preload and sweep step): `contacts.<pair>` (`force_N`, `max_pressure_MPa`, `mean_pressure_MPa`, `closed_fraction`, `stick_fraction` (of the closed area, shear below mu x pressure), `max_opening_mm`, `max_slip_mm`), `bolts.<name>` (nut forces positive in compression), `gaskets`, `probes.<name>` (`ux`, `uy`, `uz`, `u`), `parts.<name>` (`peak_von_mises_MPa` at nodes, from the displacements with each part's material; `max_displacement_mm`). `modal[]`: `frequencies_Hz`, `after_step` and the contact state that step left (`closed_fraction`, `stick_fraction`, `force_N` per pair); `frequencies` is the first modal step's. `contacts.<pair>` gives the law, friction, area, clearance and starting gap.
+- **Stabilisation**: parts that no support holds in every direction, and that no bonded contact ties to such a part, get the weak springs to ground (1e-6 of the softest bolt's stiffness, or without bolts 1e-9 E h); `stabilisation.fraction_of_load` (or `fraction_of_preload`) says what they carried.
+- **Pictures**: as joints, plus `contact_pressure` on a contact's faces and the mode shapes of the first modal step (`mode: n`); `step` picks a CalculiX step (a modal step shows the state it started from).
+- **Benchmarks** (`FEAT_SLOW_TESTS=1`): `assembly_clamp` (an M30 nut at 40 kN on a hub, sleeve and shaft shoulder: the force through both contacts and the nut 40 kN), `assembly_press_fit` (a ring on a shaft, interference 0.02 mm: Lame's contact pressure 78.75 MPa, 10 %), `assembly_bonded_beam` (a cantilever in two bonded pieces: tip deflection F L^3 / 3EI 5 %, first bending frequency 3 %), `assembly_clamped_beam` (the same held by friction under a 50 MPa clamp: closed, and the same deflection and frequency).
+
 ## The checker
 
 `feat bench` runs studies whose answers are known in closed form, the FEA counterpart of the FreeCAD comparison in build123d-translator:
@@ -238,7 +268,7 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 | `fea_translator/runner.py` | One study end to end, checks |
 | `fea_translator/refsolver.py` | Reference solver (static, modal, thermal) |
 | `fea_translator/bench.py` | Benchmark studies with closed-form answers |
-| `fea_translator/joint.py` | Bolted, gasketed assemblies: meshing parts, bolt connectors, gasket contact, the multi-step deck, leak and lift-off |
+| `fea_translator/joint.py` | Assemblies and joints: meshing parts, contacts, gaskets, bolt and nut connectors, the steps, contact states, leak and lift-off, frequencies |
 | `fea_translator/render.py` | Pictures: fields from the nodal solution, the saved state, validation, defaults, Matplotlib |
 | `fea_translator/render_vtk.py` | Pictures with VTK (PyVista) in a child process; the offscreen probe |
 | `fea_translator/workers.py` | Worker processes that end with their server (parent watch, their CalculiX runs) |
@@ -250,6 +280,7 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
+| Package, `joint.py`, `render.py`, `study.py`, `bench.py`, `runner.py`, `api.py`, `executor.py`, `mcp_server.py` | 2026.11.04.1 (`analysis: "assembly"`: parts with general contacts (hard, penalty, bonded; friction; clearance or interference), gaskets, bolts and nuts on meshed shafts, probes, and a list of steps (preload, static with its loads, sweep, modal on the preloaded state with `*FREQUENCY, PERTURBATION`); every step's contact state (force, pressure, closed and sticking fractions, opening, slip), each part's peak stress and the modal frequencies with the state they started from; `joint` is an assembly with steps [preload, sweep]; stabilisation springs skip parts bonded to a held part and are 1e-9 E h without bolts; benchmarks `assembly_clamp`, `assembly_press_fit`, `assembly_bonded_beam`, `assembly_clamped_beam`) |
 | Package, `workers.py` (new), `api.py`, `executor.py`, `mcp_server.py`, `runner.py` | 2026.11.03.1 (worker processes end with their server: on carbonio 7 orphaned spawn workers and a resource_tracker from three releases (2026.11.01.1, .01.3, .02.8) kept them 'in use' for `llmt gc`. The stale-server exit (`os._exit`, which skips atexit) stopped only the study pool; it now stops the study, aux and volume pools (the volume pool's processes terminated: `shutdown(wait=False)` left them) and a `get_deck` process (`api.shutdown_workers`). As a backstop for a crash or `kill -9`, every worker watches its parent pid (each second) and ends itself and its CalculiX run when the parent is gone; not `PR_SET_PDEATHSIG`, which fires when the creating *thread* exits, and the pools are created from the server's worker threads) |
 | Package, `api.py`, `executor.py`, `mcp_server.py` | 2026.11.02.9 (`get_deck` on a joint study failed with `KeyError: 'part'`: it meshes every part and answers with the node counts per part, the selection, the bolts (grip, bearing nodes), the gaskets (gap, law) and the stabilisation, so a joint's mesh size can be checked before running it; a pending answer names where it will be; validation's node estimate (memory, SLURM sizing) sums a joint's parts, each with its own mesh) |
 | Package, `mesher.py`, `study.py`, `joint.py` | 2026.11.02.8 (`mesh.min_size` (no element smaller, mm) and `mesh.curvature` (elements per full circle on curved faces, default 12, 0 off) for every study and per joint part: a detailed S50 head (379 cm3) gave 390-500k nodes even at size 8-12, from curvature and small-feature refinement; a joint part's `mesh` now adds to the study's instead of replacing it; mesh keys checked for joint studies and parts too) |

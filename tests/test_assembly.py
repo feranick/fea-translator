@@ -1,0 +1,198 @@
+"""Assemblies (analysis "assembly", joint.py): steps and their loads, contacts (hard, penalty, bonded, clearance), nuts
+on a meshed shaft, probes, part stresses, modal steps on the loaded state, validation, pictures. Offline: the CalculiX
+runs are the assembly_* benchmarks (test_fea.test_benchmark_calculix, FEAT_SLOW_TESTS=1).
+Version: 2026.11.04.1
+"""
+import copy
+import math
+
+import numpy as np
+import pytest
+
+from fea_translator import joint
+from fea_translator.bench import cases
+from fea_translator.study import validate_study
+
+
+def _boxes(**extra):
+    """Two boxes stacked (base fixed), a side force on the top, a contact between them."""
+    st = {"analysis": "assembly",
+          "parts": {"base": {"part": {"box": [40, 40, 20], "origin": [-20, -20, 0], "divisions": [4, 4, 2]}},
+                    "top": {"part": {"box": [40, 40, 20], "origin": [-20, -20, 20], "divisions": [4, 4, 2]}}},
+          "bcs": [{"kind": "fixed", "name": "root", "faces": {"part": "base", "nz": -1}},
+                  {"kind": "force", "name": "side", "faces": {"part": "top", "nz": 1}, "fx": 100.0},
+                  {"kind": "pressure", "name": "clamp", "faces": {"part": "top", "nz": 1}, "p": 5.0}],
+          "contacts": [{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1}}],
+          "probes": [{"name": "tip", "faces": {"part": "top", "nz": 1}}],
+          "steps": [{"kind": "static", "loads": ["side"]}, {"kind": "modal", "modes": 3}]}
+    st.update(extra)
+    return st
+
+
+def test_steps_and_their_loads():
+    st = _boxes(steps=[{"kind": "static", "name": "a", "loads": ["side"], "scale": 2}, {"kind": "static"},
+                       {"kind": "sweep", "bc": "side", "steps": 2}, {"kind": "modal", "modes": 4}])
+    ds = joint.deck_steps(st)
+    assert [s["kind"] for s in ds] == ["static", "static", "sweep", "sweep", "modal"]
+    assert ds[0]["loads"] == {"clamp": 1.0, "side": 2.0} and ds[1]["loads"] == {"clamp": 1.0}   # no carry-over
+    assert ds[3]["loads"] == {"clamp": 1.0, "side": 1.0} and ds[4]["modes"] == 4 and ds[0]["what"] == "a"
+    nut = dict(_boxes(), nuts=[{"name": "n"}])
+    assert [s["kind"] for s in joint.deck_steps(nut)][:2] == ["preload", "static"]               # a preload first
+    j = cases()["joint_pull"]
+    assert [s["kind"] for s in joint.deck_steps(j)] == ["preload"] + ["sweep"] * 8
+
+
+@pytest.fixture(scope="module")
+def boxes(tmp_path_factory):
+    st = _boxes()
+    parts = joint.mesh_parts(st, tmp_path_factory.mktemp("asm"))
+    text, plan = joint.write("asm", st, parts)
+    return st, parts, text, plan
+
+
+def test_assembly_deck(boxes):
+    st, parts, text, plan = boxes
+    up = text.upper()
+    steps = up.split("*STEP")
+    assert len(steps) == 3 and steps[2].startswith(", PERTURBATION\n*FREQUENCY\n3\n")
+    assert "PRESSURE-OVERCLOSURE=LINEAR" in steps[0] and "*CONTACT PAIR, INTERACTION=CI_C" in steps[0]
+    law = plan["contacts"][0]["law"]
+    assert law["kind"] == "hard" and law["stiffness_MPa_mm"] == pytest.approx(10 * 210000 / law["h_mm"])
+    # no preload: the friction at its full stick slope from the start, never changed
+    assert f"*FRICTION\n0.2, {joint._g(law['stiffness_MPa_mm'] / 100)}\n" in steps[0] and "CHANGE FRICTION" not in up
+    assert "*CLOAD\n" in steps[1] and "*DLOAD\n" in steps[1] and "0.05, 1., 1E-05, 0.25" in steps[1]
+    assert "N_PRETENSION" not in up and "N_BOLTENDS" not in up
+    # the top box (no support) gets springs; the base (fixed) none
+    assert list(plan["stabilisation"]["parts"]) == ["top"]
+    assert plan["stabilisation"]["k_N_mm"] == pytest.approx(1e-9 * 210000 * parts[0]["info"]["size"])
+    assert plan["probes"]["tip"] and plan["contacts"][0]["gap"]["median_mm"] == 0.0
+
+
+def test_bonded_clearance_and_held_by_bonding(tmp_path):
+    st = _boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
+                           "law": "bonded"}])
+    parts = joint.mesh_parts(st, tmp_path / "a")
+    text, plan = joint.write("b", st, parts)
+    assert "PRESSURE-OVERCLOSURE=TIED" in text and "*FRICTION" not in text
+    assert plan["stabilisation"]["springs"] == 0          # tied to the fixed base: held
+    st2 = _boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
+                            "law": {"stiffness": 1000}, "friction": 0.0, "clearance": -0.01}])
+    text2, plan2 = joint.write("p", st2, joint.mesh_parts(st2, tmp_path / "b"))
+    assert "*CLEARANCE, MASTER=CM_C, SLAVE=CS_C, VALUE=-0.01" in text2 and "*FRICTION" not in text2
+    assert plan2["contacts"][0]["law"] == {"kind": "penalty", "stiffness_MPa_mm": 1000.0}
+
+
+def _frd(contact_steps, disp_steps, modes=None, modal_step=None):
+    out = ["    1C"]
+    for k, (cm, dm) in enumerate(zip(contact_steps, disp_steps), start=1):
+        out += [f"    1PSTEP              {k}           1           {k}", " -4  DISP        4    1",
+                " -5  D1          1    2    1    0", " -5  D2          1    2    2    0", " -5  D3          1    2    3    0"]
+        out += [f" -1{n:10d}" + "".join(f"{x:12.5E}" for x in u) for n, u in sorted(dm.items())] + [" -3"]
+        out += [f"    1PSTEP              {k}           1           {k}", " -4  CONTACT     6    1"]
+        out += [f" -5  {c:<10s}1    1    {i + 1}    0" for i, c in enumerate(("COPEN", "CSLIP1", "CSLIP2", "CPRESS", "CSHEAR1", "CSHEAR2"))]
+        out += [f" -1{n:10d}" + "".join(f"{x:12.5E}" for x in v) for n, v in sorted(cm.items())] + [" -3"]
+    for j, mm in enumerate(modes or []):
+        out += [f"    1PSTEP              {j + 1}           1           {modal_step}", " -4  DISP        4    1",
+                " -5  D1          1    2    1    0", " -5  D2          1    2    2    0", " -5  D3          1    2    3    0"]
+        out += [f" -1{n:10d}" + "".join(f"{x:12.5E}" for x in u) for n, u in sorted(mm.items())] + [" -3"]
+    return "\n".join(out + [" 9999"]) + "\n"
+
+
+EIGEN = """
+                        S T E P       2
+
+
+     E I G E N V A L U E   O U T P U T
+
+ MODE NO    EIGENVALUE                       FREQUENCY
+                                     REAL PART            IMAGINARY PART
+                           (RAD/TIME)      (CYCLES/TIME     (RAD/TIME)
+
+      1   0.1000000E+07   0.1000000E+04   0.1591549E+03   0.0000000E+00
+      2   0.1100000E+07   0.1048809E+04   0.1669227E+03   0.0000000E+00
+      3   0.4000000E+08   0.6324555E+04   0.1006584E+04   0.0000000E+00
+
+     P A R T I C I P A T I O N   F A C T O R S
+"""
+
+
+def test_assembly_results(boxes):
+    st, parts, text, plan = boxes
+    X = joint.all_nodes(parts)
+    tets = np.concatenate([p["mesh"].tets + p["n0"] for p in parts])
+    area = joint._node_areas(X, tets, plan["contacts"][0]["slave_faces"])
+    nodes = sorted(area)
+    # contact closed with 5 MPa, half of the nodes slipping (shear at the friction limit), the rest sticking
+    cm = {n: (0.0, 0.001 * (i % 2), 0.0, 5.0, (1.0 if i % 2 else 0.2), 0.0) for i, n in enumerate(nodes)}
+    top0 = parts[1]["n0"]
+    dm = {n: (0.01 * (n > top0), 0.0, 0.0) for n in range(1, len(X) + 1)}
+    modes = [{n: (1.0 * (n > top0), 0.0, 0.0) for n in range(1, len(X) + 1)}] * 3
+    frd = _frd([cm], [dm], modes, modal_step=2)
+    res = joint.evaluate(st, parts, plan, EIGEN, frd)
+    s0 = res["steps"][0]
+    c = s0["contacts"]["c"]
+    assert c["force_N"] == pytest.approx(5.0 * 1600, rel=1e-6) and c["closed_fraction"] == 1.0
+    assert 0.3 < c["stick_fraction"] < 0.7 and c["max_slip_mm"] == pytest.approx(0.001)
+    assert s0["probes"]["tip"]["ux"] == pytest.approx(0.01) and s0["kind"] == "static" and s0["loads"]["side"] == 1.0
+    assert s0["parts"]["top"]["max_displacement_mm"] == pytest.approx(0.01) and s0["parts"]["top"]["peak_von_mises_MPa"] < 1e-6
+    assert res["frequencies"] == pytest.approx([159.1549, 166.9227, 1006.584])
+    m = res["modal"][0]
+    assert m["step"] == 2 and m["after_step"] == 1 and m["contacts"]["c"]["closed_fraction"] == 1.0
+    assert "leak" not in res and "bolt_preload_error" not in res and res["contacts"]["c"]["law"]["kind"] == "hard"
+    # pictures: the state keeps the static step for the modal step, and the mode shapes
+    from fea_translator import render
+    import tempfile
+    from pathlib import Path
+    d = Path(tempfile.mkdtemp())
+    joint.save_state(d, st, parts, plan, res, frd)
+    state = render.load_state(d)
+    assert state["fields"]["modes"].shape == (3, len(X), 3)
+    assert np.allclose(state["fields"]["U_steps"][1], state["fields"]["U_steps"][0])
+    specs = render.default_images(st)
+    assert [s["name"] for s in specs] == ["setup", "c_pressure", "displacement", "mode1", "mode2", "mode3"]
+    assert validate_study(dict(st, images=specs))["ok"], validate_study(dict(st, images=specs))["errors"]
+
+
+def test_assembly_validation():
+    def errs(st):
+        return " | ".join(validate_study(st)["errors"])
+    assert errs(_boxes()) == ""
+    assert "steps: a list" in errs({k: v for k, v in _boxes().items() if k != "steps"})
+    assert "kind: preload | static | sweep | modal" in errs(_boxes(steps=[{"kind": "dynamic"}]))
+    assert "a modal step follows a static" in errs(_boxes(steps=[{"kind": "modal"}]))
+    assert "a preload step needs bolts or nuts" in errs(_boxes(steps=[{"kind": "preload"}, {"kind": "static"}]))
+    assert "names of load bcs" in errs(_boxes(steps=[{"kind": "static", "loads": ["root"]}]))
+    assert ".law: hard" in errs(_boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1},
+                                                 "with": {"part": "base", "nz": 1}, "law": "glued"}]))
+    assert "bonded contact takes no clearance" in errs(_boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1},
+                                                                        "with": {"part": "base", "nz": 1},
+                                                                        "law": "bonded", "clearance": 0.1}]))
+    assert "meet only through contacts" in errs(_boxes(contacts=[]))
+    assert "names used twice" in errs(_boxes(probes=[{"name": "c", "faces": {"part": "top", "nz": 1}}]))
+    assert "bears_on" in errs(_boxes(nuts=[{"name": "n", "size": "M20", "preload": 1000, "at": [[0, 0, 40]],
+                                            "thread": {"part": "base", "depth": 10}}]))
+    assert "sweep: in an assembly" in errs(_boxes(sweep={"bc": "side"}))
+    no_rho = _boxes()
+    no_rho["parts"]["top"]["material"] = {"E": 70000, "nu": 0.3}
+    assert "needs a density" in errs(no_rho)
+    for name in ("assembly_clamp", "assembly_press_fit", "assembly_bonded_beam", "assembly_clamped_beam"):
+        assert validate_study(cases()[name])["ok"], name
+
+
+def test_a_nut_on_a_meshed_shaft(tmp_path):
+    """assembly_clamp: the nut bears on the hub's top face and grips the shaft above it; it pushes them apart."""
+    pytest.importorskip("gmsh")
+    pytest.importorskip("build123d_translator")
+    st = copy.deepcopy(cases()["assembly_clamp"])
+    st["mesh"] = {"size": 8}
+    parts = joint.mesh_parts(st, tmp_path)
+    text, plan = joint.write("clamp", st, parts)
+    rec = plan["bolts"][0]
+    assert rec["kind"] == "nut" and rec["sign"] == -1.0 and rec["axis"] == pytest.approx([0, 0, 1])
+    b = rec["bolts"][0]
+    assert b["B1"][2] == pytest.approx(80, abs=1e-6) and 80 < b["B2"][2] < 95
+    X = joint.all_nodes(parts)
+    (geo,) = joint.bolt_geometry(parts, joint.connectors(st)[0])
+    assert np.allclose(np.linalg.norm(X[geo["nut"], :2], axis=1), 15, atol=0.05)     # the shaft's surface
+    assert f"\n{b['pret_node']}, 1, -40000\n" in text                                 # pushes the faces apart
+    assert set(plan["stabilisation"]["parts"]) == {"sleeve", "hub"}

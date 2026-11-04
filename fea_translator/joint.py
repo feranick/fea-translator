@@ -1,6 +1,9 @@
-"""joint.py — bolted, gasketed assemblies: several parts in contact, bolt pretension, a gasket law, and the internal
-pressure stepped up to find where the joint leaks and where it lifts off (analysis "joint", CalculiX only).
-Version: 2026.11.02.8
+"""joint.py — assemblies of parts (analysis "assembly", and "joint" for bolted, gasketed joints; CalculiX only):
+parts in contact (hard, penalty or bonded, with friction, clearance or interference), gaskets, bolts and nuts with
+pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
+find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
+A joint study is an assembly whose steps are [preload, sweep].
+Version: 2026.11.04.1
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -53,6 +56,7 @@ BOLTS = {"M3": (3, 0.5, 3.4, 7), "M4": (4, 0.7, 4.5, 9), "M5": (5, 0.8, 5.5, 10)
          "M36": (36, 4.0, 39.0, 66)}
 JOINT_KEYS = {"parts", "analysis", "bcs", "bolts", "gaskets", "sweep", "mesh", "expect", "notes", "procs", "queue", "run",
               "equation_solver", "images"}
+ASSEMBLY_KEYS = (JOINT_KEYS - {"sweep"}) | {"contacts", "nuts", "steps", "probes"}
 SUPPORTS = ("fixed", "slider", "displacement")
 LOADS = ("pressure", "force", "gravity")
 FREQ = 1000000          # output only the end of each step (CalculiX always writes the final increment)
@@ -183,11 +187,12 @@ def bolt_geometry(parts: list[dict], b: dict) -> list[dict]:
     hp, htags = head[0]
     if "axis" in b:
         axis = _unit(b["axis"])
-    else:   # into the joint: against the head bearing face's outward normal
+    else:   # a bolt: into the joint, against the head bearing face's outward normal; a nut: out of the face it
+        # bears on, towards the thread it grips
         g = hp["mesh"].groups[htags[0]]
         if not g.planar:
-            raise MeshError(f"bolts {b['name']}: the head face is not flat; give 'axis' (from head to nut)")
-        axis = -_unit(g.normal[0])
+            raise MeshError(f"{b.get('_kind', 'bolt')}s {b['name']}: the bearing face is not flat; give 'axis'")
+        axis = (1.0 if b.get("_kind") == "nut" else -1.0) * _unit(g.normal[0])
     X = all_nodes(parts)
     hn = _gnodes(head)
     if "nut" in b:
@@ -261,9 +266,14 @@ def _equation(dep: int, others: list[int], ref: int, d: int, avoid: set) -> list
 MIN_SLOPE = 0.02          # no gasket-curve segment softer than 2 % of the curve's secant slope (stress / closure at its end)
 PRELOAD_STICK = 0.01      # the friction's stick slope in the preload step, relative to the later steps'
 STAB_FRACTION = 1e-6      # stabilisation springs: each 1e-6 of the softest bolt's stiffness
+STAB_FRACTION_E = 1e-9    # without bolts: each 1e-9 of E x the element size (N/mm)
 STAB_NODES = 6            # per part that no support holds: 6 well-spread nodes, 3 springs each
 STAB_WARN = 0.01          # warn when the springs carry more than 1 % of the preload
 GAP_TOL = 0.01            # mm: gasket faces further apart than this (median) do not touch at the start
+HARD_FACTOR = 10.0        # 'hard' contact: a linear penalty of 10 E / h (the softer part's E, the finer element size h)
+NUT_STIFF = 10.0          # a nut on a meshed shaft: a connector of 10 x E A_s / d, stiff against the shaft it grips
+STEP_KINDS = ("preload", "static", "sweep", "modal")
+CONTACT_LAWS = ("hard", "bonded")
 
 
 def face_gap(X: np.ndarray, slave_nodes: np.ndarray, master_nodes: np.ndarray, normal) -> dict:
@@ -359,11 +369,84 @@ def spread_nodes(X: np.ndarray, cand: np.ndarray, n: int) -> list[int]:
     return [int(cand[k]) for k in pick]
 
 
+def connectors(study: dict) -> list[dict]:
+    """The bolts and the nuts as connectors. A nut bears on a part ('bears_on') and grips a meshed shaft's thread:
+    it pushes them apart (the clamp runs through the parts between the nut and the shaft's shoulder), with its own
+    stiffness (NUT_STIFF x E A_s / d), since the shaft itself is meshed."""
+    out = [dict(b, _kind="bolt") for b in study.get("bolts", []) or []]
+    for n in study.get("nuts", []) or []:
+        c = {k: v for k, v in n.items() if k != "bears_on"}
+        c.update(head=n["bears_on"], _kind="nut")
+        out.append(c)
+    return out
+
+
+def study_steps(study: dict) -> list[dict]:
+    """The study's steps: a joint: the preload, then its sweep; an assembly: its 'steps', with a preload first when
+    it has bolts or nuts."""
+    if study.get("analysis") == "joint":
+        sw = study.get("sweep", {}) or {}
+        return [{"kind": "preload"}, {"kind": "sweep", "bc": sw.get("bc"), "steps": int(sw.get("steps", 10))}]
+    steps = [dict(s) for s in study.get("steps", []) or [] if isinstance(s, dict)]
+    if (study.get("bolts") or study.get("nuts")) and (not steps or steps[0].get("kind") != "preload"):
+        steps = [{"kind": "preload"}] + steps
+    return steps
+
+
+def deck_steps(study: dict) -> list[dict]:
+    """The CalculiX steps: {step, kind, what, factor (a sweep's), loads {bc: factor}, modes}. A load bc named by no
+    static step and no sweep acts in every step (from the preload on); a static step adds the loads it names (x its
+    scale), a sweep its bc in equal parts; loads do not carry over from one static step to the next."""
+    load_names = [bc_name(i, b) for i, b in enumerate(study.get("bcs", []) or []) if isinstance(b, dict)
+                  and b.get("kind") in LOADS]
+    steps = study_steps(study)
+    used = set()
+    for s in steps:
+        if s.get("kind") == "static":
+            used |= set(s.get("loads", []) or [])
+        elif s.get("kind") == "sweep":
+            used.add(s.get("bc"))
+    const = {n: 1.0 for n in load_names if n not in used}
+    out = []
+    for s in steps:
+        k = s.get("kind")
+        if k == "preload":
+            out.append({"kind": "preload", "what": "preload", "factor": 0.0, "loads": dict(const)})
+        elif k == "static":
+            f = float(s.get("scale", 1.0))
+            out.append({"kind": "static", "what": s.get("name") or "static", "name": s.get("name"), "factor": None,
+                        "loads": {**const, **{n: f for n in s.get("loads", []) or []}}})
+        elif k == "sweep":
+            n = int(s.get("steps", 10))
+            out += [{"kind": "sweep", "what": "swept load", "factor": j / n, "loads": {**const, s["bc"]: j / n}}
+                    for j in range(1, n + 1)]
+        elif k == "modal":
+            out.append({"kind": "modal", "what": f"modal ({int(s.get('modes', 6))} modes)", "factor": None,
+                        "modes": int(s.get("modes", 6)), "loads": {}, "name": s.get("name")})
+    for i, s in enumerate(out):
+        s["step"] = i + 1
+    return out
+
+
+def contact_law(c: dict, parts: list[dict], slave, master) -> dict:
+    """A contact's linear law: 'hard' (a penalty of HARD_FACTOR x E / h, E and h the softer and finer of its parts),
+    'bonded' (the same stiffness, tied in every direction: CalculiX's TIED), or {stiffness: MPa/mm}."""
+    law = c.get("law", "hard")
+    if isinstance(law, dict):
+        return {"kind": "penalty", "stiffness_MPa_mm": float(law["stiffness"])}
+    ps = [p for p, _ in slave] + [p for p, _ in master]
+    E = min(float(p["material"]["E"]) for p in ps)
+    h = min(float(p["info"].get("size") or 1.0) for p in ps)
+    return {"kind": law, "stiffness_MPa_mm": HARD_FACTOR * E / h, "E_MPa": E, "h_mm": h}
+
+
 def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
-    """The deck of a joint study, and its plan (node sets, bolts, gaskets, steps) for reading the results."""
+    """The deck of a joint or assembly study, and its plan (node sets, connectors, gaskets, contacts, steps) for
+    reading the results."""
     order = parts[0]["mesh"].order
     etype = "C3D10" if order == 2 else "C3D4"
-    L = [f"** {name}: written by fea-translator {__version__} (joint: contact, bolt pretension, gasket)",
+    an = study.get("analysis", "joint")
+    L = [f"** {name}: written by fea-translator {__version__} ({an}: parts in contact, bolt pretension)",
          "** units: mm, N, s, t (tonne); stresses MPa", "*NODE, NSET=NALL"]
     for p in parts:
         L += [f"{p['n0'] + i + 1}, {_g(x)}, {_g(y)}, {_g(z)}" for i, (x, y, z) in enumerate(p["mesh"].nodes)]
@@ -372,13 +455,14 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
     for p in parts:
         L.append(f"*ELEMENT, TYPE={etype}, ELSET=E_{_name(p['name'])}")
         L += [f"{p['e0'] + e + 1}, " + ", ".join(str(p["n0"] + n + 1) for n in row) for e, row in enumerate(p["mesh"].tets)]
-    plan = {"analysis": "joint", "sets": {}, "supports": [], "loads": [], "kinds": {}, "bolts": [], "gaskets": [],
-            "steps": [], "sweep": None, "selection": {}, "n_nodes": n_next - 1, "n_elements": e_next - 1, "element": etype}
-    sweep = study.get("sweep", {})
-    swept = sweep.get("bc")
-    nsteps = int(sweep.get("steps", 10))
-    # boundary conditions
-    bnd, held, cload_const, dload_const, swept_cload, swept_dload = [], set(), {}, [], {}, []
+    plan = {"analysis": an, "sets": {}, "supports": [], "loads": [], "kinds": {}, "bolts": [], "gaskets": [],
+            "contacts": [], "probes": {}, "steps": [], "sweep": None, "selection": {}, "n_nodes": n_next - 1,
+            "n_elements": e_next - 1, "element": etype, "load_mag": {}}
+    dsteps = deck_steps(study)
+    sweep_step = next((s for s in study_steps(study) if s.get("kind") == "sweep"), None)
+    swept = sweep_step.get("bc") if sweep_step else None
+    # boundary conditions: supports in step 1; each load's lines, applied per step
+    bnd, held, full_parts, LD = [], set(), set(), {}
     X = all_nodes(parts)
     for i, bc in enumerate(study.get("bcs", [])):
         k, bname = bc["kind"], bc_name(i, bc)
@@ -394,7 +478,8 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
             L.append(f"*NSET, NSET={sname}")
             L += _lines((nodes + 1).tolist())
             held.update((nodes + 1).tolist())
-            plan.setdefault("held_parts", set()).update(p["name"] for p, _ in sel)
+            if k == "fixed" or (k == "displacement" and all(c in bc for c in ("ux", "uy", "uz"))):
+                full_parts.update(p["name"] for p, _ in sel)     # held in every direction: no stabilisation
             if k == "fixed":
                 bnd.append(f"{sname}, 1, 3")
             elif k == "slider":
@@ -407,31 +492,35 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
                         bnd.append(f"{sname}, {d + 1}, {d + 1}, {_g(bc[key])}")
             plan["supports"].append(bname)
         elif k == "pressure":
-            faces = _gfaces(sel)
-            rows = [(e + 1, s) for e, s in faces]
-            (swept_dload if bname == swept else dload_const).append((rows, float(bc["p"])))
+            rows = [(e + 1, s) for e, s in _gfaces(sel)]
+            area = sum(p["mesh"].area_of(tg) for p, tg in sel)
+            c = np.concatenate([(p["mesh"].groups[t].centroid * p["mesh"].groups[t].area[:, None]).sum(axis=0, keepdims=True)
+                                / p["mesh"].groups[t].total_area for p, tg in sel for t in tg]).mean(axis=0)
+            LD[bname] = {"kind": "dload", "rows": rows, "p": float(bc["p"])}
+            plan["load_mag"][bname] = abs(float(bc["p"])) * area
             plan["loads"].append(bname)
             if bname == swept:
-                c = np.concatenate([(p["mesh"].groups[t].centroid * p["mesh"].groups[t].area[:, None]).sum(axis=0, keepdims=True)
-                                    / p["mesh"].groups[t].total_area for p, tg in sel for t in tg]).mean(axis=0)
-                plan["sweep"] = {"bc": bname, "kind": "pressure", "max": float(bc["p"]), "steps": nsteps, "center": c.tolist()}
+                plan["sweep"] = {"bc": bname, "kind": "pressure", "max": float(bc["p"]),
+                                 "steps": int(sweep_step.get("steps", 10)), "center": c.tolist()}
         elif k == "force":
             f = np.array([float(bc.get(c, 0.0)) for c in ("fx", "fy", "fz")])
             area = sum(p["mesh"].area_of(tg) for p, tg in sel)
-            tgt = swept_cload if bname == swept else cload_const
+            nodes_f = {}
             for p, tg in sel:
                 fp = f * p["mesh"].area_of(tg) / area
                 for n, v in p["mesh"].force_nodes(tg, fp).items():
-                    tgt[n + p["n0"]] = tgt.get(n + p["n0"], np.zeros(3)) + v
+                    nodes_f[n + p["n0"]] = nodes_f.get(n + p["n0"], np.zeros(3)) + v
+            LD[bname] = {"kind": "cload", "nodes": nodes_f}
+            plan["load_mag"][bname] = float(np.linalg.norm(f))
             plan["loads"].append(bname)
             if bname == swept:
-                plan["sweep"] = {"bc": bname, "kind": "force", "max": float(np.linalg.norm(f)), "steps": nsteps,
-                                 "center": X[_gnodes(sel)].mean(axis=0).tolist()}
+                plan["sweep"] = {"bc": bname, "kind": "force", "max": float(np.linalg.norm(f)),
+                                 "steps": int(sweep_step.get("steps", 10)), "center": X[_gnodes(sel)].mean(axis=0).tolist()}
         elif k == "gravity":
             gv = np.array([float(bc.get("gx", 0.0)), float(bc.get("gy", 0.0)), float(bc.get("gz", -9.81))])
             gm = float(np.linalg.norm(gv))
-            for p in parts:
-                dload_const.append(([(f"E_{_name(p['name'])}", "GRAV")], (gm * G_SCALE, gv / gm)))
+            LD[bname] = {"kind": "grav", "items": [(f"E_{_name(p['name'])}", gm * G_SCALE, gv / gm) for p in parts]}
+            plan["load_mag"][bname] = 0.0
             plan["loads"].append(bname)
     # materials and sections
     for p in parts:
@@ -440,18 +529,21 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         if "density" in m:
             L += ["*DENSITY", _g(m["density"])]
         L.append(f"*SOLID SECTION, ELSET=E_{_name(p['name'])}, MATERIAL=M_{_name(p['name'])}")
-    # bolts: a spring (SPRINGA, k = E A_s / grip) from a cut node C at the head to the nut, with the pretension as
-    # an equation across the cut: u_C = mean(u_head) - u_PT * axis (CalculiX's own *PRE-TENSION SECTION on a beam deletes the
-    # beam and leaves a rigid link: the bolt would have no stretch). B1 and B2 follow their bearing nodes' mean.
+    # connectors (bolts, nuts): a spring (SPRINGA) from a cut node C at the head (a nut: its bearing face) to the nut or
+    # thread end B2, the pretension an equation across the cut: u_C = mean(u_head) - u_PT * axis (CalculiX's own
+    # *PRE-TENSION SECTION on a beam deletes the beam and leaves a rigid link: the bolt would have no stretch)
     springs, eqs, pret = [], [], []
-    gasket_nodes = {g["name"]: _gnodes(select(parts, g["faces"])) for g in study.get("gaskets", [])}
-    for gi, b in enumerate(study.get("bolts", [])):
+    eq_nodes: set = set()
+    gasket_nodes = {g["name"]: _gnodes(select(parts, g["faces"])) for g in study.get("gaskets", []) or []}
+    for b in connectors(study):
         bn = _name(b["name"])
         sz = bolt_size(b)
         P = preload_N(b)
+        nut = b["_kind"] == "nut"
         mat = to_deck_units(material_of({"material": b.get("material", "steel")}))
         geo = bolt_geometry(parts, b)
-        rec = {"name": b["name"], "size": b["size"], "preload_N": P, "As": sz["As"], "bolts": []}
+        rec = {"name": b["name"], "kind": b["_kind"], "size": b["size"], "preload_N": P, "As": sz["As"], "bolts": [],
+               "sign": -1.0 if nut else 1.0}
         for bg in geo:
             n2, nc, npt = n_next, n_next + 1, n_next + 2
             n_next += 3
@@ -459,24 +551,22 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
                               ((n2, bg["B2"]), (nc, bg["B1"]), (npt, bg["B1"]))]
             eid = e_next
             e_next += 1
-            k = mat["E"] * sz["As"] / bg["grip"]
+            k = mat["E"] * sz["As"] * (NUT_STIFF / sz["d"] if nut else 1.0 / bg["grip"])
             springs.append((eid, nc, n2, bn, k))
-            in_eq = plan.setdefault("eq_nodes", set())
-            in_eq.update(int(q) for q in bg["head"])
-            in_eq.update(int(q) for q in bg["nut"])
+            eq_nodes.update(int(q) for q in bg["head"])
+            eq_nodes.update(int(q) for q in bg["nut"])
             head = [int(q) + 1 for q in bg["head"]]
             for d in (1, 2, 3):
-                # the nut end B2 follows the mean of its bearing nodes
+                # the far end B2 follows the mean of its bearing nodes
                 eqs += _equation(int(bg["nut"][0]) + 1, [int(q) + 1 for q in bg["nut"]], n2, d, held)
                 # the cut C at the head: the mean of the head's bearing nodes, less the pretension along the axis,
-                # n u_C - sum(u_head) + n axis_d u_PT = 0. Each dependent DOF (B2, C) is in no other equation: a chain
-                # (C on B1, B1 on the head nodes) gave CalculiX's wrong bolt forces (joint_two_bolt, 2026.11.02.2)
+                # n u_C - sum(u_head) + n axis_d u_PT = 0. Each dependent DOF (B2, C) is in no other equation
                 n = float(len(head))
                 terms = [(nc, d, n)] + [(q, d, -1.0) for q in head] + (
                     [(npt, 1, n * float(bg["axis"][d - 1]))] if abs(bg["axis"][d - 1]) > 1e-12 else [])
-                eqs += ["*EQUATION", str(len(terms))] + [", ".join(f"{q}, {dd}, {_g(c)}" for q, dd, c in terms[k:k + 4])
-                                                         for k in range(0, len(terms), 4)]
-            pret.append((eid, npt, bg["axis"], P))
+                eqs += ["*EQUATION", str(len(terms))] + [", ".join(f"{q}, {dd}, {_g(c)}" for q, dd, c in terms[j:j + 4])
+                                                         for j in range(0, len(terms), 4)]
+            pret.append((eid, npt, bg["axis"], P * rec["sign"]))   # a nut pushes its faces apart
             rec["bolts"].append({"k": bg["k"], "element": eid, "pret_node": npt, "ends": [nc, n2], "k_N_mm": k,
                                  "B1": np.round(bg["B1"], 4).tolist(), "B2": np.round(bg["B2"], 4).tolist(),
                                  "grip_mm": round(bg["grip"], 4), "head_nodes": len(bg["head"]),
@@ -487,10 +577,12 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
     for eid, nc, n2, bn, k in springs:   # one element set per spring: each has its own stiffness (its grip)
         L += [f"*ELEMENT, TYPE=SPRINGA, ELSET=ES{eid}", f"{eid}, {nc}, {n2}", f"*SPRING, ELSET=ES{eid}", _g(k)]
     L += eqs
+    has_preload = any(s["kind"] == "preload" for s in dsteps)
+    stick = PRELOAD_STICK if has_preload else 1.0        # friction soft until the preload has pressed the faces
     # gaskets: face-to-face contact. CalculiX ignores a TABULAR pressure-overclosure law in face-to-face contact (the
     # parts pass through each other: joint_two_bolt and an S50 cover, 2026.11.02): a curve becomes the LINEAR law of
     # its secant at the gasket's mean stress under the preload (the bolts nearest to it, over its area)
-    for g in study.get("gaskets", []):
+    for g in study.get("gaskets", []) or []:
         gn = _name(g["name"])
         slave, master = select(parts, g["faces"]), select(parts, g["with"])
         sf, mf = _gfaces(slave), _gfaces(master)
@@ -505,7 +597,7 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
         L += [f"*SURFACE, NAME=GS_{gn}"] + [f"{e + 1}, S{s}" for e, s in sf]
         L += [f"*SURFACE, NAME=GM_{gn}"] + [f"{e + 1}, S{s}" for e, s in mf]
         L += [f"*SURFACE INTERACTION, NAME=GI_{gn}", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR",
-              _g(law["stiffness_MPa_mm"])] + friction_lines(law["stiffness_MPa_mm"], g, PRELOAD_STICK)
+              _g(law["stiffness_MPa_mm"])] + friction_lines(law["stiffness_MPa_mm"], g, stick)
         L += [f"*CONTACT PAIR, INTERACTION=GI_{gn}, TYPE=SURFACE TO SURFACE", f"GS_{gn}, GM_{gn}"]
         nrm = sum((p["mesh"].groups[tg_].normal * p["mesh"].groups[tg_].area[:, None]).sum(axis=0)
                   for p, tgs in slave for tg_ in tgs)
@@ -517,14 +609,64 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
                                 "interaction": f"GI_{gn}", "gap": gap, "area": area})
         plan["selection"][f"gasket {g['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in slave for t in tg]
         plan["selection"][f"gasket {g['name']} (with)"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in master for t in tg]
-    # stabilisation: weak springs to ground on every part no support holds (before the gasket is pressed it has no
-    # stiffness and friction none: the part could slide and rock about the bolt line, and the preload chatters)
-    k_stab = STAB_FRACTION * min((q["k_N_mm"] for rec in plan["bolts"] for q in rec["bolts"]), default=1.0)
+    # contacts between parts: hard (a stiff penalty) or penalty contact with friction, or bonded (tied), with an
+    # optional initial clearance (> 0) or interference (< 0)
+    for c in study.get("contacts", []) or []:
+        cn = _name(c["name"])
+        slave, master = select(parts, c["faces"]), select(parts, c["with"])
+        sf, mf = _gfaces(slave), _gfaces(master)
+        law = contact_law(c, parts, slave, master)
+        K = law["stiffness_MPa_mm"]
+        mu = 0.0 if law["kind"] == "bonded" else float(c.get("friction", 0.2))
+        L += [f"*SURFACE, NAME=CS_{cn}"] + [f"{e + 1}, S{s}" for e, s in sf]
+        L += [f"*SURFACE, NAME=CM_{cn}"] + [f"{e + 1}, S{s}" for e, s in mf]
+        L += [f"*SURFACE INTERACTION, NAME=CI_{cn}"]
+        if law["kind"] == "bonded":
+            L += ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TIED", _g(K)]
+            fr = []
+        else:
+            fr = friction_lines(K, {"friction": mu}) if mu > 0 else []
+            L += ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR", _g(K)] + (
+                friction_lines(K, {"friction": mu}, stick) if mu > 0 else [])
+        L += [f"*CONTACT PAIR, INTERACTION=CI_{cn}, TYPE=SURFACE TO SURFACE", f"CS_{cn}, CM_{cn}"]
+        if "clearance" in c:
+            L += [f"*CLEARANCE, MASTER=CM_{cn}, SLAVE=CS_{cn}, VALUE={_g(float(c['clearance']))}"]
+        nrm = sum((p["mesh"].groups[tg_].normal * p["mesh"].groups[tg_].area[:, None]).sum(axis=0)
+                  for p, tgs in slave for tg_ in tgs)
+        plan["contacts"].append({"name": c["name"], "slave_faces": sf, "tags": gtags(parts, slave),
+                                 "with_tags": gtags(parts, master), "normal": _unit(nrm).tolist(), "law": law,
+                                 "friction_mu": mu, "friction": fr, "interaction": f"CI_{cn}",
+                                 "clearance_mm": c.get("clearance"),
+                                 "gap": face_gap(X, _gnodes(slave), _gnodes(master), _unit(nrm)),
+                                 "area": sum(p["mesh"].area_of(tg) for p, tg in slave)})
+        plan["selection"][f"contact {c['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in slave for t in tg]
+        plan["selection"][f"contact {c['name']} (with)"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in master for t in tg]
+    # probes: mean displacement of faces (read from the .frd)
+    for pr in study.get("probes", []) or []:
+        sel = select(parts, pr["faces"])
+        plan["probes"][pr["name"]] = (_gnodes(sel) + 1).tolist()
+        plan["selection"][f"probe {pr['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in sel for t in tg]
+    # stabilisation: weak springs to ground on every part that no support holds in every direction (before a gasket
+    # or contact is pressed it has no stiffness and friction none: the part could slide, rock about a bolt line, spin)
+    # their stiffness: 1e-6 of the softest bolt's (verified on the joint benchmarks), else 1e-9 E h (against a slender
+    # part's own stiffness: a cantilever's tip stiffness is far below E h)
+    ks = [q["k_N_mm"] for rec in plan["bolts"] if rec.get("kind", "bolt") == "bolt" for q in rec["bolts"]]
+    k_stab = (STAB_FRACTION * min(ks) if ks else
+              STAB_FRACTION_E * min(float(p["material"]["E"]) * float(p["info"].get("size") or 1.0) for p in parts))
+    # a part bonded (tied) to a part held in every direction is held too
+    bonded = [({p["name"] for p, _ in select(parts, c["faces"])}, {p["name"] for p, _ in select(parts, c["with"])})
+              for c in study.get("contacts", []) or [] if c.get("law", "hard") == "bonded"]
+    grew = True
+    while grew:
+        grew = False
+        for a_, b_ in bonded:
+            for x, y in ((a_, b_), (b_, a_)):
+                if x & full_parts and not y <= full_parts:
+                    full_parts |= y
+                    grew = True
     stab, ground, stab_el = {}, [], []
-    held_parts = plan.pop("held_parts", set())
-    eq_nodes = plan.pop("eq_nodes", set())
     for p in parts:
-        if p["name"] in held_parts:
+        if p["name"] in full_parts:
             continue
         surf = np.unique(np.concatenate([np.asarray(tri).ravel() for tri in p["mesh"].surfaces.values()])) + p["n0"]
         cand = np.array([q for q in surf if int(q) not in eq_nodes and int(q) + 1 not in held], int)
@@ -546,52 +688,79 @@ def write(name: str, study: dict, parts: list[dict]) -> tuple[str, dict]:
     plan["stabilisation"] = {"k_N_mm": k_stab, "parts": stab, "springs": len(stab_el)}
     pnodes = [npt for _, npt, _, _ in pret]
     ends = [n for _, nc, n2, _, _ in springs for n in (nc, n2)]
-    L += ["*NSET, NSET=N_PRETENSION"] + _lines(pnodes) + ["*NSET, NSET=N_BOLTENDS"] + _lines(ends)
+    if pret:
+        L += ["*NSET, NSET=N_PRETENSION"] + _lines(pnodes) + ["*NSET, NSET=N_BOLTENDS"] + _lines(ends)
     plan["pret_nodes"] = pnodes
+    has_contact = bool(plan["gaskets"] or plan["contacts"])
+    frictional = [g for g in plan["gaskets"]] + [c for c in plan["contacts"] if c["friction"]]
 
-    def outputs():   # bolt forces from the beam ends' displacements (CalculiX reports no reaction at a pretension
-        # node held with *BOUNDARY, FIXED); gasket stresses from the contact output; no element stresses (large)
-        stab_out = [f"*NODE PRINT, NSET=N_STAB, FREQUENCY={FREQ}", "U"] if stab_el else []
-        return ([f"*NODE PRINT, NSET=N_BOLTENDS, FREQUENCY={FREQ}", "U"] + stab_out
-                + ["*NODE FILE", "U", "*CONTACT FILE", "CDIS, CSTR"])
+    def outputs():   # bolt forces from the springs' ends; contact stresses from the contact output; no element
+        # stresses (large: they are computed from the displacements)
+        out = [f"*NODE PRINT, NSET=N_BOLTENDS, FREQUENCY={FREQ}", "U"] if pret else []
+        out += [f"*NODE PRINT, NSET=N_STAB, FREQUENCY={FREQ}", "U"] if stab_el else []
+        return out + ["*NODE FILE", "U"] + (["*CONTACT FILE", "CDIS, CSTR"] if has_contact else [])
 
-    def dloads(items, factor):
-        out = []
-        for rows, val in items:
-            if isinstance(val, tuple):   # gravity
-                gm, gv = val
-                out += [f"{rows[0][0]}, GRAV, {_g(gm * factor)}, " + ", ".join(_g(c) for c in gv)]
+    dl_ever = any(LD[n]["kind"] in ("dload", "grav") for s in dsteps for n in s["loads"] if n in LD)
+
+    def step_loads(active: dict):
+        cl, dl = {}, {}
+        for bn_, f in active.items():
+            ld = LD.get(bn_)
+            if ld is None:
+                continue
+            if ld["kind"] == "cload":
+                for n, v in ld["nodes"].items():
+                    cl[n] = cl.get(n, np.zeros(3)) + v * f
+            elif ld["kind"] == "dload":
+                for e, s in ld["rows"]:
+                    dl[f"{e}, P{s}"] = dl.get(f"{e}, P{s}", 0.0) + ld["p"] * f
             else:
-                out += [f"{e}, P{s}, {_g(val * factor)}" for e, s in rows]
-        return out
+                for elset, gm, gv in ld["items"]:
+                    dl[f"{elset}, GRAV"] = f"{_g(gm * f)}, " + ", ".join(_g(c) for c in gv)
+        cl_lines = [f"{n + 1}, {k + 1}, {_g(cl[n][k])}" for n in sorted(cl) for k in range(3) if cl[n][k] != 0]
+        dl_lines = [f"{key}, {v}" if isinstance(v, str) else f"{key}, {_g(v)}" for key, v in dl.items()]
+        return cl_lines, dl_lines
 
-    def cloads(d, factor):
-        out = []
-        for n in sorted(d):
-            out += [f"{n + 1}, {k + 1}, {_g(d[n][k] * factor)}" for k in range(3) if d[n][k] != 0]
-        return out
-    # step 1: the preload (and the loads that do not change)
-    # a small first increment: the contact is found at a twentieth of the preload
-    L += ["*STEP, INC=1000", "*STATIC", "0.05, 1., 1e-05, 0.25", "*BOUNDARY"] + bnd
-    L += ["*CLOAD"] + [f"{npt}, 1, {_g(P)}" for _, npt, _, P in pret] + cloads(cload_const, 1.0)
-    if dload_const:
-        L += ["*DLOAD"] + dloads(dload_const, 1.0)
-    L += outputs() + ["*END STEP"]
-    plan["steps"].append({"step": 1, "what": "preload", "factor": 0.0})
-    # steps 2..n+1: the bolts held at their preload length, the swept load in equal steps
-    for k in range(1, nsteps + 1):
-        f = k / nsteps
-        # each step adds 1/n of the load: one increment (CalculiX cuts it back if contact needs it)
-        L += ["*STEP, INC=1000", "*STATIC", "1., 1., 1e-08, 1.", "*BOUNDARY, FIXED", "N_PRETENSION, 1, 1"]
-        cl = cloads(cload_const, 1.0) + cloads(swept_cload, f)
-        L += ["*CLOAD, OP=NEW"] + (cl or [f"{springs[0][2]}, 1, 0."])
-        if k == 1:   # the gasket's friction at its full stick slope once it is pressed
-            for g in plan["gaskets"]:
+    dummy_dl = None
+    for n_, ld in LD.items():
+        if ld["kind"] == "dload" and ld["rows"]:
+            dummy_dl = f"{ld['rows'][0][0]}, P{ld['rows'][0][1]}, 0."
+            break
+        if ld["kind"] == "grav":
+            dummy_dl = f"{ld['items'][0][0]}, GRAV, 0., 0., 0., -1."
+            break
+    prev_kind = None
+    for s in dsteps:
+        if s["kind"] == "modal":   # the frequencies of the preloaded, loaded assembly: its last state's stiffness
+            L += ["*STEP, PERTURBATION", "*FREQUENCY", str(s["modes"]), "*NODE FILE", "U", "*END STEP"]
+            plan["steps"].append(s)
+            prev_kind = "modal"
+            continue
+        first = s["step"] == 1
+        # the first step from a small increment (the contact is found at a twentieth of the load); later steps add a
+        # part of the load in one increment (CalculiX cuts it back if contact needs it)
+        L += ["*STEP, INC=1000", "*STATIC", "0.05, 1., 1e-05, 0.25" if first else "1., 1., 1e-08, 1."]
+        if first:
+            L += ["*BOUNDARY"] + bnd if bnd else []
+        elif pret:
+            L += ["*BOUNDARY, FIXED", "N_PRETENSION, 1, 1"]
+        cl, dl = step_loads(s["loads"])
+        pre = [f"{npt}, 1, {_g(P)}" for _, npt, _, P in pret] if s["kind"] == "preload" else []
+        if first:
+            if pre + cl:
+                L += ["*CLOAD"] + pre + cl
+            if dl:
+                L += ["*DLOAD"] + dl
+        else:
+            L += ["*CLOAD, OP=NEW"] + (cl or [f"{(springs[0][2] if springs else 1)}, 1, 0."])
+            if dl_ever:
+                L += ["*DLOAD, OP=NEW"] + (dl or [dummy_dl])
+        if prev_kind == "preload":   # the friction at its full stick slope once the faces are pressed
+            for g in frictional:
                 L += [f"*CHANGE FRICTION, INTERACTION={g['interaction']}"] + g["friction"]
-        if swept_dload:
-            L += ["*DLOAD"] + dloads(swept_dload, f)
         L += outputs() + ["*END STEP"]
-        plan["steps"].append({"step": k + 1, "what": "swept load", "factor": f})
+        plan["steps"].append(s)
+        prev_kind = s["kind"]
     return "\n".join(L) + "\n", plan
 
 
@@ -623,18 +792,6 @@ def frd_steps(text: str) -> list[dict]:
         elif line.startswith(" -3") and cur is not None:
             out.append(cur)
             cur = None
-    return out
-
-
-def contact_pressure_by_step(blocks: list[dict]) -> dict[int, dict[int, float]]:
-    """{step: {node (1-based): contact pressure}} from the last CONTACT block of each step."""
-    out = {}
-    for b in blocks:
-        if not b["name"].startswith("CONTACT"):
-            continue
-        comps = b["components"]
-        k = comps.index("CPRESS") if "CPRESS" in comps else 3
-        out[b["step"]] = {n: (v[k] if len(v) > k else 0.0) for n, v in b["data"].items()}
     return out
 
 
@@ -724,42 +881,118 @@ def _crossing(xs: list[float], gs: list[float], floor: float | None = None) -> f
     return None
 
 
+def contact_by_step(blocks: list[dict]) -> dict[int, dict[int, dict]]:
+    """{step: {node (1-based): {copen, cslip1, cslip2, cpress, cshear1, cshear2}}} from the last CONTACT block of
+    each step."""
+    names = ("COPEN", "CSLIP1", "CSLIP2", "CPRESS", "CSHEAR1", "CSHEAR2")
+    out = {}
+    for b in blocks:
+        if not b["name"].startswith("CONTACT"):
+            continue
+        comps = b["components"]
+        idx = {n: (comps.index(n) if n in comps else i) for i, n in enumerate(names)}
+        out[b["step"]] = {n: {k.lower(): (v[i] if len(v) > i else 0.0) for k, i in idx.items()} for n, v in b["data"].items()}
+    return out
+
+
+def contact_pressure_by_step(blocks: list[dict]) -> dict[int, dict[int, float]]:
+    """{step: {node (1-based): contact pressure}} from the last CONTACT block of each step."""
+    return {s: {n: c["cpress"] for n, c in d.items()} for s, d in contact_by_step(blocks).items()}
+
+
+def disp_by_step(blocks: list[dict], steps: list[dict], N: int) -> dict[int, np.ndarray]:
+    """{step (1-based): U (N, 3)} of the static steps (a modal step's blocks are its mode shapes)."""
+    modal = {s["step"] for s in steps if s["kind"] == "modal"}
+    out = {}
+    for b in blocks:
+        s = b["step"]
+        if not b["name"].startswith("DISP") or not s or s in modal:
+            continue
+        U = out.setdefault(s, np.zeros((N, 3)))
+        for n, v in b["data"].items():
+            if 1 <= n <= N:
+                U[n - 1] = v[:3]
+    return out
+
+
+def mode_shapes(blocks: list[dict], step: int, N: int) -> list[np.ndarray]:
+    out = []
+    for b in blocks:
+        if b["name"].startswith("DISP") and b["step"] == step:
+            U = np.zeros((N, 3))
+            for n, v in b["data"].items():
+                if 1 <= n <= N:
+                    U[n - 1] = v[:3]
+            out.append(U)
+    return out
+
+
+def _node_areas(X, tets, faces):
+    _, area, _ = gasket_graph(X, tets, [(e, s) for e, s in faces])
+    return area
+
+
+def contact_state(c: dict, cmap: dict | None, area: dict) -> dict | None:
+    """A contact pair at one step: its force, pressures, the fraction closed (pressure > 0), sticking (shear below
+    mu x pressure) and the largest opening and slip."""
+    if cmap is None:
+        return None
+    A = sum(area.values()) or 1.0
+    p = {n: max(0.0, float(cmap.get(n, {}).get("cpress", 0.0))) for n in area}
+    sh = {n: math.hypot(cmap.get(n, {}).get("cshear1", 0.0), cmap.get(n, {}).get("cshear2", 0.0)) for n in area}
+    sl = [math.hypot(cmap.get(n, {}).get("cslip1", 0.0), cmap.get(n, {}).get("cslip2", 0.0)) for n in area]
+    op = [float(cmap.get(n, {}).get("copen", 0.0)) for n in area]
+    closed = sum(a for n, a in area.items() if p[n] > 0)
+    out = {"force_N": round(sum(p[n] * a for n, a in area.items()), 3), "max_pressure_MPa": round(max(p.values(), default=0.0), 6),
+           "mean_pressure_MPa": round(sum(p[n] * a for n, a in area.items()) / A, 6),
+           "closed_fraction": round(closed / A, 6), "max_opening_mm": round(max(op, default=0.0), 8),
+           "max_slip_mm": round(max(sl, default=0.0), 8)}
+    mu = c.get("friction_mu", 0.0)
+    if c.get("law", {}).get("kind") == "bonded":
+        out["stick_fraction"] = None
+    elif mu > 0 and closed > 0:
+        out["stick_fraction"] = round(sum(a for n, a in area.items() if p[n] > 0 and sh[n] < 0.999 * mu * p[n]) / closed, 6)
+    else:
+        out["stick_fraction"] = None
+    return out
+
+
 def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text: str) -> dict:
-    """Bolt forces, gasket stresses at the preload and at every step of the swept load, leak and lift-off loads."""
+    """Bolt and nut forces, gasket stresses, contact states, probes and part stresses at every static step; the
+    leak and lift-off loads of a sweep; the frequencies of modal steps."""
     X = all_nodes(parts)
+    N = len(X)
     tets = np.concatenate([p["mesh"].tets + p["n0"] for p in parts])
     dat = results.parse_dat(dat_text)
-    ub = [b for b in dat["blocks"] if b["set"] == "N_BOLTENDS" and b["what"].startswith("displacements")]
     blocks = frd_steps(frd_text)
-    cp = contact_pressure_by_step(blocks)
+    cb = contact_by_step(blocks)
+    steps = plan["steps"]
+    solid = [i for i, s in enumerate(steps) if s["kind"] != "modal"]
     sw = plan.get("sweep") or {}
-    nsteps = len(plan["steps"])
-    loads = [sw.get("max", 0.0) * s["factor"] for s in plan["steps"]]
     unit = "MPa" if sw.get("kind") == "pressure" else "N"
-    res = {"analysis": "joint", "swept": {"bc": sw.get("bc"), "kind": sw.get("kind"), "max": sw.get("max"), "unit": unit},
-           "bolts": {}, "gaskets": {}, "steps": [], "leak": {}, "lift_off": {}}
-    # bolt forces: each spring's stiffness times its stretch (its ends' distance change along the axis); in step 1
-    # it must equal the preload (bolt_preload_error)
+    loads = [sw.get("max", 0.0) * s["factor"] if sw and s.get("factor") is not None else None for s in steps]
+    assembly = plan.get("analysis") == "assembly"
+    res = {"analysis": plan.get("analysis", "joint"), "bolts": {}, "gaskets": {}, "steps": [], "leak": {}, "lift_off": {}}
+    if sw:
+        res["swept"] = {"bc": sw.get("bc"), "kind": sw.get("kind"), "max": sw.get("max"), "unit": unit}
+    # connector forces: each spring's stiffness times its stretch (its ends' distance change along the axis), a nut's
+    # as a compression; at the preload it must equal the preload (bolt_preload_error). The .dat has one block per
+    # static step, in order
+    ub = [b for b in dat["blocks"] if b["set"] == "N_BOLTENDS" and b["what"].startswith("displacements")]
+    Ub = {solid[j]: {int(r[0]): np.asarray(r[1:4], float) for r in blk["rows"] if len(r) >= 4}
+          for j, blk in enumerate(ub[:len(solid)])}
     blist = [(rec, b_) for rec in plan["bolts"] for b_ in rec["bolts"]]
-    forces = np.full((nsteps, len(blist)), np.nan)
-    U = [{int(r[0]): np.asarray(r[1:4], float) for r in blk["rows"] if len(r) >= 4} for blk in ub]
-
-    def stretch(s, rec, b_):
-        n1, n2 = b_["ends"]
-        if s >= len(U) or n1 not in U[s] or n2 not in U[s]:
-            return None
-        return float((U[s][n2] - U[s][n1]) @ np.asarray(rec["axis"], float))
+    forces = np.full((len(steps), len(blist)), np.nan)
     for i, (rec, b_) in enumerate(blist):
-        for s in range(nsteps):
-            e = stretch(s, rec, b_)
-            if e is not None:
-                forces[s, i] = b_["k_N_mm"] * e
-    pre = [rec["preload_N"] for rec, _ in blist]
-    if blist and np.isfinite(forces[0]).all():
-        err = float(np.max(np.abs(forces[0] - pre) / np.maximum(pre, 1e-9)))
-        res_pre_err = round(err, 6)
-    else:
-        res_pre_err = None
+        n1, n2 = b_["ends"]
+        for s, u in Ub.items():
+            if n1 in u and n2 in u:
+                forces[s, i] = rec.get("sign", 1.0) * b_["k_N_mm"] * float((u[n2] - u[n1]) @ np.asarray(rec["axis"], float))
+    ipre = next((i for i, s in enumerate(steps) if s["kind"] == "preload"), None)
+    res_pre_err = None
+    if blist and ipre is not None and np.isfinite(forces[ipre]).all():
+        pre = np.array([rec["preload_N"] for rec, _ in blist])
+        res_pre_err = round(float(np.max(np.abs(forces[ipre] - pre) / np.maximum(pre, 1e-9))), 6)
     # gaskets
     graphs = {}
     for g in plan["gaskets"]:
@@ -780,8 +1013,14 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
             res.setdefault("warnings", []).append(
                 f"gasket {g['name']}: one edge only (nothing inside it to seal): lift-off is when all of it opens; "
                 "no leak pressure")
-    for s in range(nsteps):
-        rec = {"step": s + 1, "load": round(loads[s], 9), "bolts": {}, "gaskets": {}}
+    careas = {c["name"]: _node_areas(X, tets, c["slave_faces"]) for c in plan["contacts"]}
+    disp = disp_by_step(blocks, steps, N) if (assembly or plan.get("probes")) else {}
+    for s in solid:
+        st = steps[s]
+        rec = {"step": s + 1, "kind": st["kind"], "what": st["what"], "load": None if loads[s] is None else round(loads[s], 9),
+               "bolts": {}, "gaskets": {}}
+        if st["kind"] == "static":
+            rec["loads"] = {k: v for k, v in st["loads"].items()}
         i0 = 0
         for brec in plan["bolts"]:
             n = len(brec["bolts"])
@@ -790,12 +1029,12 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
             if np.isfinite(fv).any():
                 rec["bolts"][brec["name"]] = {"min_N": round(float(np.nanmin(fv)), 3), "max_N": round(float(np.nanmax(fv)), 3),
                                               "mean_N": round(float(np.nanmean(fv)), 3)}
-        pmap = cp.get(s + 1)
+        cmap = cb.get(s + 1)
         for g in plan["gaskets"]:
             adj, area, inner, outer = graphs[g["name"]]
-            if pmap is None:
+            if cmap is None:
                 continue
-            pv = {n: max(0.0, float(pmap.get(n, 0.0))) for n in area}
+            pv = {n: max(0.0, float(cmap.get(n, {}).get("cpress", 0.0))) for n in area}
             A = sum(area.values())
             touching = sum(a for n, a in area.items() if pv[n] > 0)
             force = sum(pv[n] * a for n, a in area.items())
@@ -804,7 +1043,8 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
             # largest stress (the joint lifts off when all of it opens; it cannot leak)
             ring = ring_stress(adj, pv, inner, outer) if outer else float(vals.max())
             seal = g["seal"]
-            thr = max(float(seal.get("stress", 0.0)), float(seal.get("m", 0.0)) * (loads[s] if unit == "MPa" else 0.0))
+            thr = max(float(seal.get("stress", 0.0)), float(seal.get("m", 0.0)) *
+                      (loads[s] if unit == "MPa" and loads[s] is not None else 0.0))
             if not outer:
                 thr = 0.0
             rec["gaskets"][g["name"]] = {"ring_MPa": None if math.isinf(ring) else round(ring, 6),
@@ -813,57 +1053,126 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
                                          "force_N": round(force, 3), "seal_MPa": round(thr, 6),
                                          "leak": bool(not math.isinf(ring) and ring < thr),
                                          "open": bool(not math.isinf(ring) and ring <= 1e-9)}
+        if plan["contacts"]:
+            rec["contacts"] = {c["name"]: contact_state(c, cmap, careas[c["name"]]) for c in plan["contacts"]}
+        if plan.get("probes") and (s + 1) in disp:
+            U = disp[s + 1]
+            rec["probes"] = {}
+            for pn, nodes in plan["probes"].items():
+                m = U[np.asarray(nodes) - 1].mean(axis=0)
+                rec["probes"][pn] = {"ux": round(float(m[0]), 9), "uy": round(float(m[1]), 9), "uz": round(float(m[2]), 9),
+                                     "u": round(float(np.linalg.norm(m)), 9)}
+        if assembly and (s + 1) in disp:   # each part's peak von Mises (nodal, from the displacements)
+            from .render import nodal_stress, von_mises
+            U = disp[s + 1]
+            rec["parts"] = {}
+            for p in parts:
+                sl = slice(p["n0"], p["n0"] + len(p["mesh"].nodes))
+                vm = von_mises(nodal_stress(p["mesh"], U[sl], {"material": p["material"]}, {}))
+                k = int(np.argmax(vm))
+                rec["parts"][p["name"]] = {"peak_von_mises_MPa": round(float(vm[k]), 4),
+                                           "at": np.round(p["mesh"].nodes[k], 3).tolist(),
+                                           "max_displacement_mm": round(float(np.linalg.norm(U[sl], axis=1).max()), 9)}
         res["steps"].append(rec)
+    # modal steps: CalculiX's eigenvalue tables in order, one per modal step; each with the state it started from
+    eig = dat.get("eigen") or []
+    tables, cur = [], []
+    for e in eig:
+        if e["mode"] == 1 and cur:
+            tables.append(cur)
+            cur = []
+        cur.append(e)
+    if cur:
+        tables.append(cur)
+    modal = [s for s in steps if s["kind"] == "modal"]
+    if modal:
+        res["modal"] = []
+        for j, s in enumerate(modal):
+            base = next((r for r in reversed(res["steps"]) if r["step"] < s["step"]), None)
+            fr = [round(float(e["hz"]), 6) for e in (tables[j] if j < len(tables) else [])][:s["modes"]]
+            res["modal"].append({"step": s["step"], "name": s.get("name"), "after_step": base["step"] if base else None,
+                                 "frequencies_Hz": fr,
+                                 "contacts": {k: {q: v[q] for q in ("closed_fraction", "stick_fraction", "force_N")}
+                                              for k, v in (base or {}).get("contacts", {}).items() if v}})
+        res["frequencies"] = res["modal"][0]["frequencies_Hz"]
+        if not res["frequencies"]:
+            res.setdefault("warnings", []).append("modal step: no frequencies in CalculiX's output")
     # bolts summary
     i0 = 0
     for brec in plan["bolts"]:
         n = len(brec["bolts"])
-        res["bolts"][brec["name"]] = {"size": brec["size"], "preload_N": round(brec["preload_N"], 3), "count": n,
+        res["bolts"][brec["name"]] = {"kind": brec.get("kind", "bolt"), "size": brec["size"],
+                                      "preload_N": round(brec["preload_N"], 3), "count": n,
                                       "stiffness_N_mm": round(brec["k_bolt_N_mm"], 3),
                                       "positions": [b_["B1"] for b_ in brec["bolts"]],
                                       "max_N": round(float(np.nanmax(forces[:, i0:i0 + n])), 3) if np.isfinite(forces[:, i0:i0 + n]).any() else None}
         i0 += n
-    # leak and lift-off loads, by gasket
+    # leak and lift-off loads, by gasket: over the preload and the sweep
     for g in plan["gaskets"]:
-        steps = [r for r in res["steps"] if g["name"] in r["gaskets"]]
-        if not steps or steps[0]["gaskets"][g["name"]]["ring_MPa"] is None:
+        gsteps = [r for r in res["steps"] if g["name"] in r["gaskets"] and r["kind"] in ("preload", "sweep")]
+        if sw and gsteps and gsteps[0]["gaskets"][g["name"]]["ring_MPa"] is not None:
+            xs = [r["load"] for r in gsteps]
+            ring = [r["gaskets"][g["name"]]["ring_MPa"] for r in gsteps]
+            seal = [r["gaskets"][g["name"]]["seal_MPa"] for r in gsteps]
+            leak = _crossing(xs, [a - b for a, b in zip(ring, seal)]) if any(seal) else None
+            lift = _crossing(xs, ring, floor=0.0)
+            top = xs[-1]
+            res["leak"][g["name"]] = (round(leak, 6) if leak is not None else {"above": top}) if any(seal) else None
+            res["lift_off"][g["name"]] = round(lift, 6) if lift is not None else {"above": top}
+        else:
             res["leak"][g["name"]] = res["lift_off"][g["name"]] = None
+        first = next((r for r in res["steps"] if g["name"] in r["gaskets"]), None)
+        if first is None:
             continue
-        xs = [r["load"] for r in steps]
-        ring = [r["gaskets"][g["name"]]["ring_MPa"] for r in steps]
-        seal = [r["gaskets"][g["name"]]["seal_MPa"] for r in steps]
-        leak = _crossing(xs, [a - b for a, b in zip(ring, seal)]) if any(seal) else None
-        lift = _crossing(xs, ring, floor=0.0)
-        top = xs[-1]
-        res["leak"][g["name"]] = (round(leak, 6) if leak is not None else {"above": top}) if any(seal) else None
-        res["lift_off"][g["name"]] = round(lift, 6) if lift is not None else {"above": top}
-        pre = steps[0]["gaskets"][g["name"]]
+        pre = first["gaskets"][g["name"]]
         res["gaskets"][g["name"]]["preload"] = {k: pre[k] for k in ("ring_MPa", "min_MPa", "max_MPa", "mean_MPa",
                                                                      "contact_fraction", "force_N")}
         if pre["ring_MPa"] is not None and pre["seal_MPa"] and pre["ring_MPa"] < pre["seal_MPa"]:
             res.setdefault("warnings", []).append(
                 f"gasket {g['name']}: already below its sealing stress at the preload (ring {pre['ring_MPa']:.4g} MPa "
                 f"< {pre['seal_MPa']:.4g} MPa): more preload, more bolts, or a narrower gasket")
-    res["bolt_preload_error"] = res_pre_err
-    # stabilisation springs: what they carry (k u at each spring node) against the preload
+    if not plan["gaskets"] and not sw:
+        res.pop("leak")
+        res.pop("lift_off")
+    if blist:
+        res["bolt_preload_error"] = res_pre_err
+    # contacts summary
+    if plan["contacts"]:
+        res["contacts"] = {}
+        for c in plan["contacts"]:
+            res["contacts"][c["name"]] = {"law": c["law"], "friction": c["friction_mu"], "area_mm2": round(c["area"], 4),
+                                          "clearance_mm": c.get("clearance_mm"),
+                                          "gap_mm": (c.get("gap") or {}).get("median_mm")}
+            gp = (c.get("gap") or {}).get("median_mm")
+            if gp is not None and gp > GAP_TOL and c.get("clearance_mm") is None:
+                res.setdefault("warnings", []).append(
+                    f"contact {c['name']}: its faces are {gp:.3g} mm apart (median) at the start"
+                    + (": a bonded contact ties them across the gap" if c["law"]["kind"] == "bonded" else
+                       ": they touch only once the parts move that far"))
+    # stabilisation springs: what they carry (k u at each spring node) against the preload, or the largest load
     stp = plan.get("stabilisation") or {}
     if stp.get("springs"):
         us = [b for b in dat["blocks"] if b["set"] == "N_STAB" and b["what"].startswith("displacements")]
         tot_pre = sum(rec["preload_N"] * len(rec["bolts"]) for rec in plan["bolts"])
         by_step = []
-        for blk in us[:nsteps]:
+        for blk in us[:len(solid)]:
             f = [stp["k_N_mm"] * float(np.linalg.norm(r[1:4])) for r in blk["rows"] if len(r) >= 4]
             by_step.append(round(float(np.sum(f)), 6))
         mx = max(by_step) if by_step else None
+        ref = tot_pre or max((sum(plan.get("load_mag", {}).get(n, 0.0) * abs(f) for n, f in s["loads"].items())
+                              for s in steps), default=0.0)
+        what = "the preload" if tot_pre else "the largest load"
         res["stabilisation"] = {"springs": stp["springs"], "k_N_mm": stp["k_N_mm"],
                                 "parts": {k: len(v) for k, v in stp["parts"].items()},
                                 "force_N_by_step": by_step, "max_force_N": mx,
-                                "fraction_of_preload": round(mx / tot_pre, 8) if mx is not None and tot_pre else None}
-        fr = res["stabilisation"]["fraction_of_preload"]
+                                "fraction_of_preload" if tot_pre else "fraction_of_load":
+                                    round(mx / ref, 8) if mx is not None and ref else None}
+        fr = res["stabilisation"].get("fraction_of_preload", res["stabilisation"].get("fraction_of_load"))
         if fr is not None and fr > STAB_WARN:
             res.setdefault("warnings", []).append(
-                f"the stabilisation springs carry {100 * fr:.3g} % of the preload ({mx:.4g} N): a part is not held "
-                f"by its bolts and gaskets alone ({', '.join(stp['parts'])}); check the gasket faces touch and the bolts' faces")
+                f"the stabilisation springs carry {100 * fr:.3g} % of {what} ({mx:.4g} N): a part is not held by its "
+                f"supports, connectors and contacts alone ({', '.join(stp['parts'])}); check the contact faces touch "
+                "and every part is held")
     for g in plan["gaskets"]:
         res["gaskets"][g["name"]]["gap_mm"] = (g.get("gap") or {}).get("median_mm")
         if gap_warning(g):
@@ -874,7 +1183,6 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
             res.setdefault("warnings", []).append(
                 f"gasket {g['name']}: the mean preload stress ({law['at_MPa']:.4g} MPa) is beyond its curve's last point: "
                 "the secant uses the curve's last segment extended; give the curve up to that stress")
-        # the secant reproduces the preload's mean stress; check what the gasket took against it
         pre_mean = res["gaskets"][g["name"]].get("preload", {}).get("mean_MPa")
         if law.get("kind") == "secant" and pre_mean and abs(pre_mean - law["at_MPa"]) > 0.2 * law["at_MPa"]:
             res.setdefault("warnings", []).append(
@@ -884,7 +1192,7 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
         res.setdefault("warnings", []).append(
             f"bolt forces at the preload differ from the preload by {100 * res_pre_err:.3g} %: check the bolt results")
     # checks: the gasket force balances the bolts at the preload (no other load across the joint then)
-    tot_b = sum(r["preload_N"] * r["count"] for r in res["bolts"].values())
+    tot_b = sum(r["preload_N"] * r["count"] for r in res["bolts"].values() if r.get("kind", "bolt") == "bolt")
     tot_g = sum(v.get("preload", {}).get("force_N", 0.0) for v in res["gaskets"].values())
     if tot_b > 0 and tot_g > 0:
         res["preload_balance_error"] = round(abs(tot_g - tot_b) / tot_b, 6)
@@ -911,39 +1219,57 @@ def save_state(folder: Path, study: dict, parts: list[dict], plan: dict, res: di
     merged = SimpleNamespace(nodes=X, tets=tets, surfaces=surfaces,
                              size=float(np.linalg.norm(X.max(axis=0) - X.min(axis=0))))
     blocks = frd_steps(frd_text)
-    nsteps = len(plan["steps"])
+    steps = plan["steps"]
+    nsteps = len(steps)
+    disp = disp_by_step(blocks, steps, N)
+    cbs = contact_pressure_by_step(blocks)
     U = np.zeros((nsteps, N, 3))
-    for b in blocks:
-        if b["name"].startswith("DISP") and b["step"] and 1 <= b["step"] <= nsteps:
-            for n, v in b["data"].items():
-                if 1 <= n <= N:
-                    U[b["step"] - 1, n - 1] = v[:3]
     cp = np.zeros((nsteps, N))
-    for s, pm in contact_pressure_by_step(blocks).items():
-        if s and 1 <= s <= nsteps:
-            for n, v in pm.items():
-                if 1 <= n <= N:
-                    cp[s - 1, n - 1] = max(0.0, v)
+    for i, s in enumerate(steps):   # a modal step shows the state it started from
+        if s["kind"] == "modal":
+            if i:
+                U[i], cp[i] = U[i - 1], cp[i - 1]
+            continue
+        if s["step"] in disp:
+            U[i] = disp[s["step"]]
+        for n, v in (cbs.get(s["step"]) or {}).items():
+            if 1 <= n <= N:
+                cp[i, n - 1] = max(0.0, v)
     S = np.zeros((nsteps, N, 6))
     for s in range(nsteps):
+        if s and steps[s]["kind"] == "modal":
+            S[s] = S[s - 1]
+            continue
         for p in parts:
             sl = slice(p["n0"], p["n0"] + len(p["mesh"].nodes))
             S[s, sl] = nodal_stress(p["mesh"], U[s, sl], {"material": p["material"]}, {})
     fields = {"U_steps": U.astype(np.float32), "S_steps": S.astype(np.float32), "cp_steps": cp.astype(np.float32)}
+    first_modal = next((s for s in steps if s["kind"] == "modal"), None)
+    if first_modal is not None:
+        shapes = mode_shapes(blocks, first_modal["step"], N)
+        if shapes:
+            fields["modes"] = np.array(shapes, np.float32)
     bcs = [{"name": n, "kind": plan["kinds"][n], "tags": plan.get("bc_tags", {}).get(n, [])} for n in plan["kinds"]]
     bcs += [{"name": g["name"], "kind": "gasket", "tags": g["tags"]} for g in plan["gaskets"]]
+    bcs += [{"name": c["name"], "kind": "contact", "tags": c["tags"]} for c in plan.get("contacts", [])]
     sw = res.get("swept", {})
-    meta = {"bcs": bcs, "joint": True,
-            "steps": [{"step": s["step"], "load": r["load"]} for s, r in zip(plan["steps"], res["steps"])],
+    by_step = {r["step"]: r for r in res["steps"]}
+    load_of = [by_step.get(s["step"], {}).get("load") for s in steps]
+    meta = {"bcs": bcs, "joint": True, "analysis": plan.get("analysis", "joint"),
+            "steps": [{"step": s["step"], "load": load_of[i], "kind": s["kind"], "what": s["what"]}
+                      for i, s in enumerate(steps)],
             "unit": sw.get("unit"), "swept": sw.get("bc"),
             "gaskets": {g["name"]: {"normal": g["normal"], "with_tags": g["with_tags"],
                                     "seal_MPa_steps": [max(float(g["seal"].get("stress", 0.0)), float(g["seal"].get("m", 0.0))
-                                                           * (r["load"] if sw.get("unit") == "MPa" else 0.0))
-                                                       for r in res["steps"]]}
+                                                           * (ld if sw.get("unit") == "MPa" and ld is not None else 0.0))
+                                                       for ld in load_of]}
                         for g in plan["gaskets"]},
+            "contacts": {c["name"]: {"normal": c["normal"], "with_tags": c["with_tags"]} for c in plan.get("contacts", [])},
             "bolts": [[b_["B1"], b_["B2"]] for rec in plan["bolts"] for b_ in rec["bolts"]],
             "parts": [{"name": p["name"], "tag_min": (i + 1) * TAG_STRIDE, "tag_max": (i + 2) * TAG_STRIDE - 1}
                       for i, p in enumerate(parts)]}
+    if res.get("frequencies"):
+        meta["mode_values"] = {"values": res["frequencies"], "unit": "Hz"}
     save(folder, merged, fields, study, meta)
 
 
@@ -961,11 +1287,12 @@ def _psel(sel, parts: set, where: str) -> list[str]:
 
 
 def validate(st: dict) -> tuple[list[str], list[str]]:
-    """Errors and warnings of a joint study."""
+    """Errors and warnings of a joint or assembly study."""
     errs, warns = [], []
+    asm = st.get("analysis") == "assembly"
     parts = st.get("parts")
     if not isinstance(parts, dict) or len(parts) < 2:
-        return ["parts: {name: {part, material, mesh, move}} with at least two parts (a joint is between parts)"], []
+        return ["parts: {name: {part, material, mesh, move}} with at least two parts"], []
     for pn, p in parts.items():
         w = f"parts.{pn}"
         if not re.fullmatch(r"[A-Za-z0-9_]+", pn):
@@ -1006,7 +1333,7 @@ def validate(st: dict) -> tuple[list[str], list[str]]:
         k = bc.get("kind") if isinstance(bc, dict) else None
         w = f"bc {i + 1} ({k})"
         if k not in SUPPORTS + LOADS:
-            errs.append(f"bc {i + 1}: in a joint, kind is one of {', '.join(SUPPORTS + LOADS)}")
+            errs.append(f"bc {i + 1}: in a{'n assembly' if asm else ' joint'}, kind is one of {', '.join(SUPPORTS + LOADS)}")
             continue
         bnames.append(bc_name(i, bc))
         if k != "gravity":
@@ -1024,7 +1351,11 @@ def validate(st: dict) -> tuple[list[str], list[str]]:
     if not nsup:
         errs.append("bcs: the assembly needs supports (fixed, slider or displacement) on at least one part")
     sw = st.get("sweep")
-    if not isinstance(sw, dict) or sw.get("bc") not in bnames:
+    if asm:
+        if "sweep" in st:
+            errs.append("sweep: in an assembly, a step {kind: sweep, bc, steps}")
+        errs += _validate_steps(st, bcs, bnames, parts)
+    elif not isinstance(sw, dict) or sw.get("bc") not in bnames:
         errs.append("sweep: {bc: the name of the pressure (or force) bc to step up, steps: n (10)}")
     else:
         bc = next(b for i, b in enumerate(bcs) if bc_name(i, b) == sw["bc"])
@@ -1034,8 +1365,8 @@ def validate(st: dict) -> tuple[list[str], list[str]]:
             errs.append("sweep.steps: a whole number from 1 to 60")
         if set(sw) - {"bc", "steps"}:
             errs.append(f"sweep: unknown keys {sorted(set(sw) - {'bc', 'steps'})}")
-    gaskets = st.get("gaskets", [])
-    if not isinstance(gaskets, list) or not gaskets:
+    gaskets = st.get("gaskets", [] if asm else None)
+    if not isinstance(gaskets, list) or (not gaskets and not asm):
         errs.append("gaskets: a list of {name, faces, with, curve | stiffness, seal, friction}")
         gaskets = []
     for i, g in enumerate(gaskets):
@@ -1075,8 +1406,8 @@ def validate(st: dict) -> tuple[list[str], list[str]]:
         extra = set(g) - {"name", "faces", "with", "curve", "stiffness", "seal", "friction", "inner_at"}
         if extra:
             errs.append(f"{w}: unknown keys {sorted(extra)}")
-    bolts = st.get("bolts", [])
-    if not isinstance(bolts, list) or not bolts:
+    bolts = st.get("bolts", [] if asm else None)
+    if not isinstance(bolts, list) or (not bolts and not asm):
         errs.append("bolts: a list of {name, size, preload | torque, at | pattern, head, nut | thread}")
         bolts = []
     for i, b in enumerate(bolts):
@@ -1127,11 +1458,161 @@ def validate(st: dict) -> tuple[list[str], list[str]]:
                           "washer_d", "hole_d", "material"}
         if extra:
             errs.append(f"{w}: unknown keys {sorted(extra)}")
+    if asm:
+        e, w2 = _validate_assembly(st, names)
+        errs += e
+        warns += w2
+        used = [x.get("name") for key in ("gaskets", "contacts", "bolts", "nuts", "probes")
+                for x in (st.get(key) or []) if isinstance(x, dict)]
+        dup = sorted({n for n in used if n and used.count(n) > 1})
+        if dup:
+            errs.append(f"names used twice among gaskets, contacts, bolts, nuts and probes: {dup}")
+        if not any(st.get(k) for k in ("contacts", "gaskets", "bolts", "nuts")):
+            errs.append("an assembly's parts meet only through contacts, gaskets, bolts or nuts: give at least one")
     if st.get("converge"):
-        errs.append("converge: not available for joint studies yet")
-    extra = set(st) - JOINT_KEYS
+        errs.append(f"converge: not available for {'assembly' if asm else 'joint'} studies yet")
+    extra = set(st) - (ASSEMBLY_KEYS if asm else JOINT_KEYS)
     if extra:
         warns.append(f"unknown study keys ignored: {sorted(extra)}")
+    return errs, warns
+
+
+def _word(v) -> bool:
+    return isinstance(v, str) and bool(re.fullmatch(r"[A-Za-z0-9_]+", v))
+
+
+def _validate_steps(st: dict, bcs: list, bnames: list, parts: dict) -> list[str]:
+    errs = []
+    steps = st.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return ["steps: a list, e.g. [{kind: preload}, {kind: static, loads: [side]}, {kind: modal, modes: 6}]"]
+    kinds = {bc_name(i, b): b.get("kind") for i, b in enumerate(bcs) if isinstance(b, dict)}
+    loads = [n for n in bnames if kinds.get(n) in LOADS]
+    sweeps = 0
+    for i, s in enumerate(steps):
+        w = f"steps[{i}]"
+        if not isinstance(s, dict) or s.get("kind") not in STEP_KINDS:
+            errs.append(f"{w}: {{kind: {' | '.join(STEP_KINDS)}, ...}}")
+            continue
+        k = s["kind"]
+        allowed = {"preload": {"kind"}, "static": {"kind", "loads", "scale", "name"},
+                   "sweep": {"kind", "bc", "steps"}, "modal": {"kind", "modes", "name"}}[k]
+        if set(s) - allowed:
+            errs.append(f"{w} ({k}): unknown keys {sorted(set(s) - allowed)} (allowed: {', '.join(sorted(allowed))})")
+        if "name" in s and not _word(s["name"]):
+            errs.append(f"{w}.name: a word")
+        if k == "preload":
+            if i:
+                errs.append(f"{w}: the preload is the first step")
+            if not (st.get("bolts") or st.get("nuts")):
+                errs.append(f"{w}: a preload step needs bolts or nuts")
+        elif k == "static":
+            bad = [n for n in (s.get("loads") or []) if n not in loads]
+            if not isinstance(s.get("loads", []), list) or bad:
+                errs.append(f"{w}.loads: names of load bcs ({', '.join(loads) or 'none'})" + (f"; not {bad}" if bad else ""))
+            if "scale" in s and not _num(s["scale"]):
+                errs.append(f"{w}.scale: a number (the loads' factor, 1)")
+        elif k == "sweep":
+            sweeps += 1
+            if kinds.get(s.get("bc")) not in ("pressure", "force"):
+                errs.append(f"{w}.bc: the name of a pressure or force bc to step up")
+            n = s.get("steps", 10)
+            if not _num(n) or int(n) != n or not 1 <= n <= 60:
+                errs.append(f"{w}.steps: a whole number from 1 to 60")
+        elif k == "modal":
+            if i == 0 or not any(q.get("kind") != "modal" for q in steps[:i] if isinstance(q, dict)):
+                errs.append(f"{w}: a modal step follows a static (or preload) step: its frequencies are those of that state")
+            n = s.get("modes", 6)
+            if not _num(n) or int(n) != n or not 1 <= n <= 100:
+                errs.append(f"{w}.modes: a whole number from 1 to 100")
+            for pn, p in parts.items():
+                try:
+                    if not _num(material_of({"material": (p or {}).get("material", "steel")}).get("density")):
+                        errs.append(f"{w}: part {pn}'s material needs a density (kg/m3) for frequencies")
+                except Exception:  # noqa: BLE001
+                    pass
+    if sweeps > 1:
+        errs.append("steps: at most one sweep")
+    return errs
+
+
+def _validate_assembly(st: dict, names: set) -> tuple[list[str], list[str]]:
+    """Errors and warnings of an assembly's contacts, nuts and probes."""
+    errs, warns = [], []
+    contacts = st.get("contacts", [])
+    if not isinstance(contacts, list):
+        errs.append("contacts: a list of {name, faces, with, law, friction, clearance}")
+        contacts = []
+    for i, c in enumerate(contacts):
+        w = f"contact {i + 1}"
+        if not isinstance(c, dict):
+            errs.append(f"{w}: an object")
+            continue
+        if not _word(c.get("name")):
+            errs.append(f"{w}: 'name' (a word)")
+        for key in ("faces", "with"):
+            if key not in c:
+                errs.append(f"{w}: needs '{key}' (the {'slave' if key == 'faces' else 'master'} side's faces)")
+            else:
+                errs += _psel(c[key], names, f"{w} {key}")
+        law = c.get("law", "hard")
+        if not (law in CONTACT_LAWS or (isinstance(law, dict) and set(law) == {"stiffness"} and _num(law["stiffness"])
+                                        and law["stiffness"] > 0)):
+            errs.append(f"{w}.law: hard (a stiff penalty), bonded (tied) or {{stiffness: MPa/mm}}")
+        if "friction" in c:
+            if not _num(c["friction"]) or not 0 <= c["friction"] <= 1:
+                errs.append(f"{w}.friction: 0 to 1 (0.2; 0: frictionless)")
+            elif law == "bonded":
+                warns.append(f"{w}: a bonded contact has no friction (it is tied)")
+        if "clearance" in c and not _num(c["clearance"]):
+            errs.append(f"{w}.clearance: mm, > 0 a gap, < 0 an interference (a press fit)")
+        if law == "bonded" and _num(c.get("clearance")) and c["clearance"] != 0:
+            errs.append(f"{w}: a bonded contact takes no clearance")
+        extra = set(c) - {"name", "faces", "with", "law", "friction", "clearance"}
+        if extra:
+            errs.append(f"{w}: unknown keys {sorted(extra)}")
+    nuts = st.get("nuts", [])
+    if not isinstance(nuts, list):
+        errs.append("nuts: a list of {name, size, preload | torque, at, bears_on, thread {part, depth}}")
+        nuts = []
+    for i, n in enumerate(nuts):
+        w = f"nuts {i + 1}"
+        if not isinstance(n, dict):
+            errs.append(f"{w}: an object")
+            continue
+        if not _word(n.get("name")):
+            errs.append(f"{w}: 'name' (a word)")
+        if n.get("size") not in BOLTS:
+            errs.append(f"{w}.size: one of {', '.join(BOLTS)} (the shaft's thread)")
+        if ("preload" in n) == ("torque" in n):
+            errs.append(f"{w}: give 'preload' (N: the axial clamp force) or 'torque' (N m, with k: the nut factor, 0.2)")
+        for key in ("preload", "torque", "k", "washer_d", "hole_d"):
+            if key in n and (not _num(n[key]) or n[key] <= 0):
+                errs.append(f"{w}.{key}: a positive number")
+        if not (isinstance(n.get("at"), list) and n["at"] and all(_point(q) for q in n["at"])):
+            errs.append(f"{w}.at: [[x, y, z]] a point on the shaft's axis")
+        if "axis" in n and not (_point(n["axis"]) and any(n["axis"])):
+            errs.append(f"{w}.axis: [x, y, z] from the face it bears on towards its thread")
+        if "bears_on" not in n:
+            errs.append(f"{w}: needs 'bears_on' (the face the nut presses, e.g. {{part: impeller, nz: 1}})")
+        else:
+            errs += _psel(n["bears_on"], names, f"{w} bears_on")
+        th = n.get("thread")
+        if not (isinstance(th, dict) and th.get("part") in names and _num(th.get("depth")) and th["depth"] > 0):
+            errs.append(f"{w}.thread: {{part: the shaft, depth: the nut's engaged length mm}}")
+        extra = set(n) - {"name", "size", "preload", "torque", "k", "at", "axis", "bears_on", "thread", "washer_d",
+                          "hole_d", "material"}
+        if extra:
+            errs.append(f"{w}: unknown keys {sorted(extra)}")
+    probes = st.get("probes", [])
+    if not isinstance(probes, list):
+        errs.append("probes: a list of {name, faces}")
+        probes = []
+    for i, pr in enumerate(probes):
+        if not isinstance(pr, dict) or not _word(pr.get("name")) or "faces" not in pr or set(pr) - {"name", "faces"}:
+            errs.append(f"probe {i + 1}: {{name, faces (part-qualified)}}")
+        else:
+            errs += _psel(pr["faces"], names, f"probe {i + 1} faces")
     return errs, warns
 
 
@@ -1255,7 +1736,8 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
     watch = Watch(inp, plan)
     stopped = None
     try:
-        run_ccx(inp, timeout, monitor=watch)
+        # a modal step: single-threaded, as modal studies (CalculiX's threaded eigenvalue step once gave a wrong mode)
+        run_ccx(inp, timeout, serial=any(s["kind"] == "modal" for s in plan["steps"]), monitor=watch)
     except (Stopped, subprocess.TimeoutExpired) as exc:
         sta = inp.with_suffix(".sta")
         done = completed_steps(sta.read_text(errors="replace")) if sta.is_file() else 0
@@ -1279,7 +1761,7 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
     minfo = {"nodes": n_nodes, "elements": sum(len(p["mesh"].tets) for p in parts), "order": parts[0]["mesh"].order,
              "parts": {p["name"]: {k: v for k, v in p["info"].items() if k in ("nodes", "elements", "size", "mesh_notes",
                                                                               "straightened_elements")} for p in parts}}
-    _record_timing({"analysis": "joint"}, solver, minfo, t1 - t0, t2 - t1)
+    _record_timing({"analysis": study.get("analysis", "joint")}, solver, minfo, t1 - t0, t2 - t1)
     res["selection"] = plan["selection"]
     res["mesh"] = minfo
     res["seconds"] = {"mesh": round(t1 - t0, 3), "solve": round(t2 - t1, 3), "total": round(time.perf_counter() - t0, 3)}

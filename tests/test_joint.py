@@ -376,11 +376,11 @@ def test_joint_image_validation():
     def errs(images):
         return " | ".join(validate_study(dict(st, images=images))["errors"])
     assert errs([{"field": "gasket_stress", "step": 3}]) == ""
-    assert "step: 1 (the preload) to 9" in errs([{"field": "displacement", "step": 10}])
+    assert "step: 1 to 9" in errs([{"field": "displacement", "step": 10}])
     assert "drawn on a gasket" in errs([{"field": "gasket_stress", "surface": "side"}])
     assert "not a field of this joint study" in errs([{"field": "temperature"}])
     assert "for modal and buckling" in errs([{"mode": 1}])
-    assert "step: for joint studies" in " | ".join(
+    assert "step: for joint and assembly studies" in " | ".join(
         validate_study(dict(cases()["cantilever"], images=[{"field": "von_mises", "step": 1}]))["errors"])
 
 

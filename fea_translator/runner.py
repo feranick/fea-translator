@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.03.1
+Version: 2026.11.04.1
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -713,7 +713,7 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     fine = size_factor != 1.0
     PEAK.update(rss_mb=0.0, threads=0)
     CRASHES.clear()
-    if study.get("analysis") == "joint":   # an assembly: parts, contact, bolts (joint.py)
+    if study.get("analysis") in ("joint", "assembly"):   # several parts: contacts, gaskets, bolts, nuts (joint.py)
         from .joint import solve as solve_joint
         return solve_joint(name, study, folder, solver, timeout, progress)
     check_cancel()

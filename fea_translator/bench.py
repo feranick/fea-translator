@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.11.02.6
+Version: 2026.11.04.1
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -183,16 +183,20 @@ def cases(solver: str = "ccx") -> dict:
                        "expect": [{"quantity": "max_von_mises_nodal", "value": kt * s_net, "tol": 0.05}]},
     }
     out.update(_joint_cases())
+    out.update(_assembly_cases())
     # plate_hole: the box is the quarter x in [-100, 100], y in [-25, 25]; the hole is centred on its
     # -X/-Y corner, so the two symmetry planes pass through the hole centre; the peak is at (-100, -20).
     return out
 
 
 NEEDS = {"euler_column": {"ccx"}, "plate_hole": {"ccx", "gmsh"}, "lame_ring": {"gmsh"}, "coax_capacitor": {"gmsh"},
-         "joint_pull": {"ccx"}, "joint_cover": {"ccx", "gmsh"}, "joint_two_bolt": {"ccx"}}
+         "joint_pull": {"ccx"}, "joint_cover": {"ccx", "gmsh"}, "joint_two_bolt": {"ccx"},
+         "assembly_clamp": {"ccx", "gmsh"}, "assembly_press_fit": {"ccx", "gmsh"},
+         "assembly_bonded_beam": {"ccx", "gmsh"}, "assembly_clamped_beam": {"ccx", "gmsh"}}
 # benchmarks that take minutes each with CalculiX (measured on mochi, 2026.11.02): the test suite skips them unless
 # FEAT_SLOW_TESTS=1; run_benchmarks and `feat bench` run them as any other
-SLOW = {"joint_pull": 15, "joint_cover": 15, "joint_two_bolt": 3}
+SLOW = {"joint_pull": 15, "joint_cover": 15, "joint_two_bolt": 3, "assembly_clamp": 10, "assembly_press_fit": 5,
+        "assembly_bonded_beam": 5, "assembly_clamped_beam": 10}   # assembly_*: estimates until measured
 
 
 def _joint_cases() -> dict:
@@ -287,3 +291,66 @@ def run(solver: str = "ccx", names=None, folder: Path | None = None) -> dict:
         r = run_study(name, st, folder / name, solver=solver)
         out[name] = {k: r.get(k) for k in ("ok", "passed", "checks", "error", "seconds", "mesh") if k in r}
     return out
+
+
+def _assembly_cases() -> dict:
+    """Assemblies (analysis "assembly"; CalculiX only): a nut clamping a stack on a meshed shaft (the clamp force
+    through every contact equals the preload), a press fit against Lame's thick cylinders, and a cantilever in two
+    pieces, bonded and clamped with friction, against Euler-Bernoulli (tip deflection, first bending frequency)."""
+    cyl = lambda r, h: {"goal": {"features": [{"kind": "base_cyl", "params": {"r": r, "h": h}}]}}   # noqa: E731
+    ring = lambda ri, ro, h: {"goal": {"features": [{"kind": "base_ring", "params": {"ri": ri, "ro": ro, "h": h}}]}}  # noqa: E731
+    # assembly_clamp: shaft (shoulder r 25 to z 20, then r 15 to z 130), sleeve ri 15 ro 22 on z 20-60, hub ri 15
+    # ro 35 on z 60-80, an M30 nut at 40 kN on the hub's top face gripping the shaft over 15 mm
+    shaft = {"goal": {"features": [{"kind": "base_cyl", "params": {"r": 25, "h": 20}},
+                                   {"kind": "boss_cyl", "params": {"r": 15, "x": 0, "y": 0, "h": 110}}]}}
+    P = 40000.0
+    clamp = {"analysis": "assembly", "mesh": {"size": 5},
+             "parts": {"shaft": {"part": shaft}, "sleeve": {"part": ring(15, 22, 40), "move": [0, 0, 20]},
+                       "hub": {"part": ring(15, 35, 20), "move": [0, 0, 60]}},
+             "bcs": [{"kind": "fixed", "name": "base", "faces": {"part": "shaft", "nz": -1}}],
+             "contacts": [{"name": "hub_sleeve", "faces": {"part": "hub", "nz": -1}, "with": {"part": "sleeve", "nz": 1}},
+                          {"name": "sleeve_shoulder", "faces": {"part": "sleeve", "nz": -1},
+                           "with": {"part": "shaft", "nz": 1, "at": [20, 0, 20]}}],
+             "nuts": [{"name": "nut", "size": "M30", "preload": P, "at": [[0, 0, 80]], "bears_on": {"part": "hub", "nz": 1},
+                       "thread": {"part": "shaft", "depth": 15}}],
+             "steps": [{"kind": "preload"}], "run": {"timeout_s": 1800},
+             "expect": [{"quantity": "steps.0.contacts.hub_sleeve.force_N", "value": P, "tol": 0.03},
+                        {"quantity": "steps.0.contacts.sleeve_shoulder.force_N", "value": P, "tol": 0.03},
+                        {"quantity": "bolts.nut.max_N", "value": P, "tol": 0.01}]}
+    # assembly_press_fit: a ring ri 20 ro 40 on a solid shaft r 20, both 30 long, radial interference 0.02 mm; plane
+    # stress, same material: p = E d (c^2 - b^2) / (2 b c^2)
+    E, d, b_, c_ = 210000.0, 0.02, 20.0, 40.0
+    press = {"analysis": "assembly", "mesh": {"size": 3},
+             "parts": {"shaft": {"part": cyl(20, 30)}, "ring": {"part": ring(20, 40, 30)}},
+             "bcs": [{"kind": "slider", "name": "shaft_base", "faces": {"part": "shaft", "nz": -1}},
+                     {"kind": "slider", "name": "ring_base", "faces": {"part": "ring", "nz": -1}}],
+             "contacts": [{"name": "fit", "faces": {"part": "ring", "cyl_r": 20, "side": "inner"},
+                           "with": {"part": "shaft", "cyl_r": 20}, "friction": 0.0, "clearance": -d}],
+             "steps": [{"kind": "static"}], "run": {"timeout_s": 1800},
+             "expect": [{"quantity": "steps.0.contacts.fit.mean_pressure_MPa",
+                         "value": E * d * (c_ ** 2 - b_ ** 2) / (2 * b_ * c_ ** 2), "tol": 0.10}]}
+    # a cantilever r 10, 300 long, in two pieces of 150 (lower fixed at z 0); 100 N sideways at the tip
+    r, Lb, F = 10.0, 300.0, 100.0
+    I = math.pi * r ** 4 / 4
+    A = math.pi * r ** 2
+    tip = F * Lb ** 3 / (3 * E * I)
+    f1 = 1.875104 ** 2 / (2 * math.pi) * math.sqrt(E * 1e6 * I * 1e-12 / (7850 * A * 1e-6 * (Lb * 1e-3) ** 4))
+
+    def beam(contact, extra_bcs=()):
+        return {"analysis": "assembly", "mesh": {"size": 4},
+                "parts": {"lower": {"part": cyl(r, 150)}, "upper": {"part": cyl(r, 150), "move": [0, 0, 150]}},
+                "bcs": [{"kind": "fixed", "name": "root", "faces": {"part": "lower", "nz": -1}},
+                        {"kind": "force", "name": "side", "faces": {"part": "upper", "nz": 1}, "fx": F}, *extra_bcs],
+                "contacts": [dict(contact, name="joint", faces={"part": "upper", "nz": -1}, **{"with": {"part": "lower", "nz": 1}})],
+                "probes": [{"name": "tip", "faces": {"part": "upper", "nz": 1}}],
+                "steps": [{"kind": "static", "loads": ["side"]}, {"kind": "modal", "modes": 4}], "run": {"timeout_s": 1800},
+                "expect": [{"quantity": "steps.0.probes.tip.ux", "value": tip, "tol": 0.05},
+                           {"quantity": "frequencies.0", "value": f1, "tol": 0.03}]}
+    bonded = beam({"law": "bonded"})
+    # the same beam with a frictional contact held closed by 50 MPa on the tip face (the bending stress at the joint,
+    # 19 MPa, stays below it; the friction 0.3 x 15.7 kN far above the 100 N shear): it must act as the bonded one
+    clamped = beam({"law": "hard", "friction": 0.3},
+                   [{"kind": "pressure", "name": "clamp", "faces": {"part": "upper", "nz": 1}, "p": 50.0}])
+    clamped["expect"].append({"quantity": "steps.0.contacts.joint.closed_fraction", "value": 1.0, "tol": 0.01})
+    return {"assembly_clamp": clamp, "assembly_press_fit": press, "assembly_bonded_beam": bonded,
+            "assembly_clamped_beam": clamped}

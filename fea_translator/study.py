@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.11.02.8
+Version: 2026.11.04.1
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -17,7 +17,7 @@ The deck uses mm, N, s, t (tonne), mW: conversions are in `to_deck_units`.
 """
 from __future__ import annotations
 
-ANALYSES = ("static", "modal", "buckling", "thermal", "electric", "electrostatic", "joule", "joint")
+ANALYSES = ("static", "modal", "buckling", "thermal", "electric", "electrostatic", "joule", "joint", "assembly")
 MECH = ("static", "modal", "buckling", "thermal", "joule")      # analyses that take mechanical bcs (thermal, joule: with stress)
 EPS0 = 8.8541878128e-15  # vacuum permittivity, F/mm
 
@@ -141,11 +141,17 @@ EXAMPLE = {"bracket_static": {
 
 JOINT_DOC = ("analysis joint: parts {name: {part, material, move, mesh}} for part; selectors take part. gaskets [{name, "
              "faces, with, curve [[closure mm, MPa]] (its secant at the preload) | stiffness MPa/mm, seal {stress, m}, "
-             "friction}]. bolts [{name, "
-             "size M3-M36, preload N | torque N m, at [[x,y,z]] | pattern {center, pcd, n, start_deg}, head, nut | "
-             "thread {part, depth}}]. sweep {bc, steps}: that pressure or force rises in steps. Results: leak, "
-             "lift_off per gasket ({above} if not reached), steps[]. images: also field gasket_stress (on a gasket), "
-             "step (1 = preload). README: Joint studies.")
+             "friction}]. bolts [{name, size M3-M36, preload N | torque N m, at [[x,y,z]] | pattern {center, pcd, n, "
+             "start_deg}, head, nut | thread {part, depth}}]. sweep {bc, steps}: that pressure or force rises in steps. "
+             "Results: leak, lift_off per gasket ({above} if not reached), steps[]. images: also field gasket_stress (on "
+             "a gasket), step (1 = preload). README: Joint studies.")
+ASSEMBLY_DOC = ("analysis assembly: parts, bcs, gaskets, bolts as joint, and contacts [{name, faces, with, law hard | "
+                "bonded | {stiffness}, friction 0.2, clearance mm (< 0: interference)}], nuts [{name, size, preload | "
+                "torque, at [[x,y,z]], bears_on, thread {part, depth}}] (a nut on a meshed shaft), probes [{name, faces}], "
+                "steps [{kind: preload} (with bolts or nuts, first), {kind: static, loads: [bc names], scale}, {kind: "
+                "sweep, bc, steps}, {kind: modal, modes}]. Loads no step names act in every step. Results: steps[] "
+                "(contacts: force, pressure, closed_fraction, stick_fraction, opening, slip; probes; parts: peak von "
+                "Mises), modal[] (frequencies_Hz, after_step), frequencies. README: Assembly studies.")
 FIELD_NAMES = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal", "safety_factor", "temperature",
                "heat_flux", "potential", "current_density", "e_field")
 
@@ -176,7 +182,7 @@ def study_format() -> dict:
                            "stress_band": "mm: *_off_bc peaks leave out material this close to supports and loads (default: 2 element sizes, "
                                           "the same on the converge mesh); widen it if peak_von_mises_off_bc does not converge"},
             "material_keys": MATERIAL_KEYS, "materials": MATERIALS, "bc_kinds": bcs, "selectors": SELECTOR_DOC,
-            "example": EXAMPLE, "joint": JOINT_DOC}
+            "example": EXAMPLE, "joint": JOINT_DOC, "assembly": ASSEMBLY_DOC}
 
 
 # ---- units -------------------------------------------------------------------------------
@@ -328,7 +334,7 @@ def mesh_errors(mesh, where: str = "mesh", an: str | None = None) -> tuple[list[
         errors.append(f"{where}: 'curvature' is elements per full circle on curved faces, 0 (off) to 100 (default 12)")
     if mesh.get("order", 2) not in (1, 2):
         errors.append(f"{where}: 'order' is 1 or 2")
-    if mesh.get("order", 2) == 1 and an in ("static", "modal", "buckling", "joint"):
+    if mesh.get("order", 2) == 1 and an in ("static", "modal", "buckling", "joint", "assembly"):
         warnings.append(f"{where}: 4-node tetrahedra are much too stiff in bending; use order 2")
     for j, rf in enumerate(mesh.get("refine", []) if isinstance(mesh.get("refine", []), list) else [None]):
         if not isinstance(rf, dict) or not _point(rf.get("at")) or not _num(rf.get("r")) or not _num(rf.get("size")) \
@@ -341,7 +347,7 @@ def validate_study(st: dict) -> dict:
     errors, warnings = [], []
     if not isinstance(st, dict):
         return {"ok": False, "errors": ["a study must be an object"], "warnings": []}
-    if st.get("analysis") == "joint":   # an assembly of parts with contact and bolts (joint.py)
+    if st.get("analysis") in ("joint", "assembly"):   # several parts: contacts, gaskets, bolts, nuts (joint.py)
         from .joint import validate as validate_joint
         errors, warnings = validate_joint(st)
         errors += _run_errors(st)
