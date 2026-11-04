@@ -256,6 +256,21 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 `feat-mcp --http 8767 [--host 0.0.0.0]` serves streamable HTTP at `/mcp` (no authentication: trusted networks only). With both servers, an agent can design a part with `b3dt` and analyse the same goal with `feat`.
 
+## Planned work
+
+- **Interference fits in assembly studies** (a contact's negative `clearance`, e.g. a press-fitted ring or a shrink-fitted hub). Refused by validation since 2026.11.04.7. The deck code is in place (`*CLEARANCE` with a negative value, ramped over the first step in at most 10 % increments), and so is the benchmark, `assembly_press_fit` in `bench.pending_cases()`: a ring ri 20 / ro 40 on a solid shaft r 20, 10 thick, 0.02 mm radial interference, against Lame's 78.75 MPa contact pressure (10 %). What was seen on mochi (CalculiX 2.21, face-to-face penalty contact, 10-node tetrahedra):
+  - frictionless: the ring drifted off the shaft (contact elements 213k down to 13 within one increment);
+  - with friction 0.2 and 25 % increments: converged to 71 % of the interference, then diverged at the next increment;
+  - with 10 % increments: did not settle at about 75 %, even after a cutback.
+
+  Options to try, one at a time against the benchmark:
+  - a softer penalty for interference pairs (E / h instead of 10 E / h: much easier to converge, about 5 % low on the pressure unless corrected);
+  - a shrink fit instead of a clearance (a temperature difference on the outer part, ramped over the step, `*TEMPERATURE` with expansion);
+  - CalculiX's mortar contact (`TYPE=MORTAR`), if it supports 10-node tetrahedra in the installed version;
+  - the overlap modelled in the geometry (the CAD's bore smaller than the shaft).
+
+  Done when `assembly_press_fit` passes with `FEAT_SLOW_TESTS=1`; then move it back into `cases()` and lift the validation error.
+
 ## Files
 
 | Path | What |
