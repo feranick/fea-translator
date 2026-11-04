@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.04.6
+Version: 2026.11.04.7
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -1690,8 +1690,9 @@ def _validate_assembly(st: dict, names: set) -> tuple[list[str], list[str]]:
                 errs.append(f"{w}.friction: 0 to 1 (0.2; 0: frictionless)")
             elif law == "bonded":
                 warns.append(f"{w}: a bonded contact has no friction (it is tied)")
-        if "clearance" in c and not _num(c["clearance"]):
-            errs.append(f"{w}.clearance: mm, > 0 a gap, < 0 an interference (a press fit)")
+        if "clearance" in c and (not _num(c["clearance"]) or c["clearance"] < 0):
+            errs.append(f"{w}.clearance: mm, >= 0 (an initial gap); an interference (< 0, a press fit) is not available "
+                        "yet: it did not converge in CalculiX's face-to-face contact")
         if law == "bonded" and _num(c.get("clearance")) and c["clearance"] != 0:
             errs.append(f"{w}: a bonded contact takes no clearance")
         extra = set(c) - {"name", "faces", "with", "law", "friction", "clearance"}

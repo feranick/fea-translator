@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.11.04.1
+Version: 2026.11.04.7
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -146,7 +146,7 @@ JOINT_DOC = ("analysis joint: parts {name: {part, material, move, mesh}} for par
              "Results: leak, lift_off per gasket ({above} if not reached), steps[]. images: also field gasket_stress (on "
              "a gasket), step (1 = preload). README: Joint studies.")
 ASSEMBLY_DOC = ("analysis assembly: parts, bcs, gaskets, bolts as joint, and contacts [{name, faces, with, law hard | "
-                "bonded | {stiffness}, friction 0.2, clearance mm (< 0: interference)}], nuts [{name, size, preload | "
+                "bonded | {stiffness}, friction 0.2, clearance mm (a gap)}], nuts [{name, size, preload | "
                 "torque, at [[x,y,z]], bears_on, thread {part, depth}}] (a nut on a meshed shaft), probes [{name, faces}], "
                 "steps [{kind: preload} (with bolts or nuts, first), {kind: static, loads: [bc names], scale}, {kind: "
                 "sweep, bc, steps}, {kind: modal, modes} (closed pairs tied)]. Loads no step names act in every step. Results: steps[] "

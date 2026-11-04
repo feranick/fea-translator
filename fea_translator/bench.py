@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.11.04.6
+Version: 2026.11.04.7
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -183,7 +183,7 @@ def cases(solver: str = "ccx") -> dict:
                        "expect": [{"quantity": "max_von_mises_nodal", "value": kt * s_net, "tol": 0.05}]},
     }
     out.update(_joint_cases())
-    out.update(_assembly_cases())
+    out.update({k: v for k, v in _assembly_cases().items() if k not in PENDING})
     # plate_hole: the box is the quarter x in [-100, 100], y in [-25, 25]; the hole is centred on its
     # -X/-Y corner, so the two symmetry planes pass through the hole centre; the peak is at (-100, -20).
     return out
@@ -195,6 +195,15 @@ NEEDS = {"euler_column": {"ccx"}, "plate_hole": {"ccx", "gmsh"}, "lame_ring": {"
          "assembly_bonded_beam": {"ccx", "gmsh"}, "assembly_clamped_beam": {"ccx", "gmsh"}}
 # benchmarks that take minutes each with CalculiX (measured on mochi, 2026.11.02): the test suite skips them unless
 # FEAT_SLOW_TESTS=1; run_benchmarks and `feat bench` run them as any other
+# benchmarks of features not released yet: kept, not run (interference fits did not converge in CalculiX's face-to-face
+# contact on mochi, 2026.11.04: to be solved separately; validation refuses a negative clearance meanwhile)
+PENDING = ("assembly_press_fit",)
+
+
+def pending_cases() -> dict:
+    return {k: v for k, v in _assembly_cases().items() if k in PENDING}
+
+
 SLOW = {"joint_pull": 15, "joint_cover": 15, "joint_two_bolt": 3, "assembly_clamp": 10, "assembly_press_fit": 30,
         "assembly_bonded_beam": 5, "assembly_clamped_beam": 10}   # assembly_*: estimates until measured
 

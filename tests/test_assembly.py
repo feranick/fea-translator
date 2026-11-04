@@ -1,7 +1,7 @@
 """Assemblies (analysis "assembly", joint.py): steps and their loads, contacts (hard, penalty, bonded, clearance), nuts
 on a meshed shaft, probes, part stresses, modal steps on the loaded state, validation, pictures. Offline: the CalculiX
 runs are the assembly_* benchmarks (test_fea.test_benchmark_calculix, FEAT_SLOW_TESTS=1).
-Version: 2026.11.04.4
+Version: 2026.11.04.7
 """
 import copy
 import math
@@ -78,9 +78,9 @@ def test_bonded_clearance_and_held_by_bonding(tmp_path):
     assert "PRESSURE-OVERCLOSURE=TIED\n" in text and "*FRICTION\n1., " in text   # TIED needs a stick slope
     assert plan["stabilisation"]["springs"] == 0          # tied to the fixed base: held
     st2 = _boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
-                            "law": {"stiffness": 1000}, "friction": 0.0, "clearance": -0.01}])
+                            "law": {"stiffness": 1000}, "friction": 0.0, "clearance": 0.01}])
     text2, plan2 = joint.write("p", st2, joint.mesh_parts(st2, tmp_path / "b"))
-    assert "*CLEARANCE, MASTER=CM_C, SLAVE=CS_C, VALUE=-0.01" in text2 and "*FRICTION" not in text2
+    assert "*CLEARANCE, MASTER=CM_C, SLAVE=CS_C, VALUE=0.01" in text2 and "*FRICTION" not in text2
     assert plan2["contacts"][0]["law"] == {"kind": "penalty", "stiffness_MPa_mm": 1000.0}
 
 
@@ -198,8 +198,12 @@ def test_assembly_validation():
     no_rho = _boxes()
     no_rho["parts"]["top"]["material"] = {"E": 70000, "nu": 0.3}
     assert "needs a density" in errs(no_rho)
-    for name in ("assembly_clamp", "assembly_press_fit", "assembly_bonded_beam", "assembly_clamped_beam"):
+    for name in ("assembly_clamp", "assembly_bonded_beam", "assembly_clamped_beam"):
         assert validate_study(cases()[name])["ok"], name
+    from fea_translator.bench import pending_cases
+    assert "assembly_press_fit" not in cases() and "not available yet" in errs(pending_cases()["assembly_press_fit"])
+    assert errs(_boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
+                                  "clearance": 0.05}])) == ""
 
 
 def test_a_nut_on_a_meshed_shaft(tmp_path):
