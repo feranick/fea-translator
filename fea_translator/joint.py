@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.04.5
+Version: 2026.11.04.6
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -761,7 +761,11 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
         first = s["ccx_step"] == 1
         # the first step from a small increment (the contact is found at a twentieth of the load); later steps add a
         # part of the load in one increment (CalculiX cuts it back if contact needs it)
-        L += ["*STEP, INC=1000", "*STATIC", "0.05, 1., 1e-05, 0.25" if first else "1., 1., 1e-08, 1."]
+        # an interference (a contact's negative clearance) is ramped over the first step: in at most 10 % per increment
+        # (the press fit's 25 % increments diverged and took many cutbacks: mochi 2026.11.04)
+        fit = any(float(c.get("clearance_mm") or 0.0) < 0 for c in plan["contacts"])
+        L += ["*STEP, INC=1000", "*STATIC",
+              (f"0.05, 1., 1e-05, {0.1 if fit else 0.25}" if first else "1., 1., 1e-08, 1.")]
         if first:
             L += ["*BOUNDARY"] + bnd if bnd else []
         elif pret:
@@ -1928,7 +1932,10 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
     except (Stopped, subprocess.TimeoutExpired) as exc:
         sta = inp.with_suffix(".sta")
         done = completed_steps(sta.read_text(errors="replace")) if sta.is_file() else 0
-        why = str(exc) if isinstance(exc, Stopped) else f"CalculiX ran past the time limit ({timeout:g} s) in {_what(done + 1, plan)}"
+        n_ccx = max((s.get("ccx_step") or 0 for s in plan["steps"]), default=0)
+        why = str(exc) if isinstance(exc, Stopped) else (
+            f"CalculiX ran past the time limit ({timeout:g} s) in {_what(done + 1, plan)}" if done < n_ccx else
+            f"CalculiX ran past the time limit ({timeout:g} s) after its last step, while writing its results")
         if done < 1 or not inp.with_suffix(".dat").is_file():   # not even the first step: nothing to report
             gaps = [w for w in (gap_warning(g) for g in plan["gaskets"]) if w]
             raise SolverError(why + ". " + (" ".join(gaps) + ". " if gaps else "")

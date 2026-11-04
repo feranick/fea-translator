@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.11.04.3
+Version: 2026.11.04.6
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -195,7 +195,7 @@ NEEDS = {"euler_column": {"ccx"}, "plate_hole": {"ccx", "gmsh"}, "lame_ring": {"
          "assembly_bonded_beam": {"ccx", "gmsh"}, "assembly_clamped_beam": {"ccx", "gmsh"}}
 # benchmarks that take minutes each with CalculiX (measured on mochi, 2026.11.02): the test suite skips them unless
 # FEAT_SLOW_TESTS=1; run_benchmarks and `feat bench` run them as any other
-SLOW = {"joint_pull": 15, "joint_cover": 15, "joint_two_bolt": 3, "assembly_clamp": 10, "assembly_press_fit": 5,
+SLOW = {"joint_pull": 15, "joint_cover": 15, "joint_two_bolt": 3, "assembly_clamp": 10, "assembly_press_fit": 30,
         "assembly_bonded_beam": 5, "assembly_clamped_beam": 10}   # assembly_*: estimates until measured
 
 
@@ -320,7 +320,7 @@ def _assembly_cases() -> dict:
     # assembly_press_fit: a ring ri 20 ro 40 on a solid shaft r 20, both 10 thick, radial interference 0.02 mm; plane
     # stress, same material: p = E d (c^2 - b^2) / (2 b c^2)
     E, d, b_, c_ = 210000.0, 0.02, 20.0, 40.0
-    press = {"analysis": "assembly", "mesh": {"size": 3},     # thin (10 mm): plane stress
+    press = {"analysis": "assembly", "mesh": {"size": 4},     # thin (10 mm): plane stress
              "parts": {"shaft": {"part": cyl(20, 10)}, "ring": {"part": ring(20, 40, 10)}},
              "bcs": [{"kind": "slider", "name": "shaft_base", "faces": {"part": "shaft", "nz": -1}},
                      {"kind": "slider", "name": "ring_base", "faces": {"part": "ring", "nz": -1}}],
@@ -328,7 +328,7 @@ def _assembly_cases() -> dict:
                            "with": {"part": "shaft", "cyl_r": 20}, "clearance": -d}],   # friction 0.2: holds the
              # parts sideways (frictionless, the ring drifted off the shaft: mochi 2026.11.04) and, the fit being
              # symmetric, does not change the pressure
-             "steps": [{"kind": "static"}], "run": {"timeout_s": 1800},
+             "steps": [{"kind": "static"}], "run": {"timeout_s": 3600},
              "expect": [{"quantity": "steps.0.contacts.fit.mean_pressure_MPa",
                          "value": E * d * (c_ ** 2 - b_ ** 2) / (2 * b_ * c_ ** 2), "tol": 0.10}]}
     # a cantilever r 10, 300 long, in two pieces of 150 (lower fixed at z 0); 100 N sideways at the tip
