@@ -269,6 +269,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
   - CalculiX's mortar contact (`TYPE=MORTAR`), if it supports 10-node tetrahedra in the installed version;
   - the overlap modelled in the geometry (the CAD's bore smaller than the shaft).
 
+  `tools/interference_matrix.py` runs a small version of the benchmark (mesh size 6) in variants that change one thing each (penalty 10, 1 and 0.1 E/h; friction 0; the shaft held fully; slave and master swapped; the interference in the geometry instead of `*CLEARANCE`; node-to-surface contact; half the interference; increments of 2 %; mesh size 4) and tabulates how far each converged, how fast, and its pressure against Lame's.
+
   Done when `assembly_press_fit` passes with `FEAT_SLOW_TESTS=1`; then move it back into `cases()` and lift the validation error.
 
 ## Files
@@ -295,6 +297,7 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
+| Package, `tools/interference_matrix.py` (new) | 2026.11.04.9 (the press fit's experiment: one change per variant, to find why interference fits do not converge) |
 | Package, `runner.py`, `study.py`, `mesher.py`, `meshdata.py` | 2026.11.04.8 (an S50 casing (1.7 M nodes, 0.06 mm elements at a 0.25 mm fillet, iterative solver, equilibrium 6e-5) 'disagreed' in 23k-36k elements by up to 1,198 MPa: not the solver (its stresses come from the same displacements) but the check: 7 digits of 1.7 mm displacements are worth that much stress in its smallest and straightened elements, and the recomputed stresses then replaced CalculiX's. Each element's difference is now compared with what the rounding can do there (`elements_within_rounding`), so only real disagreements count, with `worst_at`; `stress_probes: [{name, at, r}]` give the peak and mean von Mises within a sphere, also without the straightened elements (the mesh remembers them)) |
 | Package, `joint.py`, `bench.py` | 2026.11.04.7 (the assembly analysis released without interference fits: `assembly_clamp`, `assembly_bonded_beam` and `assembly_clamped_beam` pass on mochi; the press fit still did not converge (its contact does not settle at 75 % of the interference, after a cutback), so a negative clearance is refused for now and `assembly_press_fit` is kept aside in `bench.pending_cases()`) |
 | Package, `joint.py`, `bench.py`, `tests/test_fea.py` | 2026.11.04.6 (mochi with .5: the bonded and the clamped beam pass (tip deflection, frequency); the clamp's contact forces pass; its nut's force at the preload was 0.29 % off, within CalculiX's 0.5 % force tolerance with contact (the test now allows that); the press fit finished its step but not its output within 30 min: an interference is now ramped in at most 10 % increments, the benchmark at mesh size 4 and 60 min; a run cut off after its last step says so) |
