@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.11.04.7
+Version: 2026.11.05.2
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -13,6 +13,7 @@ Tools (all JSON):
   bench_status      collects a run_benchmarks request
   get_file          a written file as base64 (for callers on another machine)
   jobs              recent requests with SLURM jobs (also from other conversations) and the queue
+  extend            more time for a request's running studies (CalculiX's limit and the SLURM job's)
   cancel            stops a request's studies
   render_images     new pictures of a finished study from its saved state (no solving; in a worker)
   get_image         a PNG written by run_studies or render_images, as an image
@@ -85,7 +86,8 @@ static steps with their loads, a sweep, and modal steps on the preloaded state (
 Long studies run as SLURM jobs on the machine (when FEAT_EXECUTOR=slurm): run_studies returns them pending
 with job ids. They do not depend on this conversation. Report the expected finish time and stop; do not poll.
 Later, study_status(request) collects them; jobs() lists recent and active runs (also those started in other
-conversations); cancel(request) stops them. A study's "run": {timeout_s, mem, procs, queue} overrides the
+conversations); cancel(request) stops them; extend(request, hours) gives running ones more time (when
+study_status warns that CalculiX will not finish within its limit: its 'calculix' progress says where it is). A study's "run": {timeout_s, mem, procs, queue} overrides the
 machine's defaults for that study, within the caps in study_format's status.
 Pictures: "images": true (or views: a field on the deformed part, mode shapes, the setup view showing the faces each
 bc took, section cuts) writes PNGs (results images.<name>.path); get_image shows each; render_images draws other
@@ -323,6 +325,15 @@ def render_images(study_folder: str, images: list | bool = True, wait_s: float =
     still drawing, state 'running' (call again with the same arguments). Then get_image each path."""
     return api.in_worker("rendering", "render_images", {"study_folder": study_folder, "images": images},
                          min(max(float(wait_s), 0.0), 50.0))
+
+
+@server.tool()
+@_tool
+def extend(request: str, hours: float, names: list[str] | None = None) -> dict:
+    """More time for a request's running studies (or the named ones): each CalculiX run's time limit moves back by
+    `hours` within seconds, and its SLURM job's limit is raised by as much (SLURM may refuse: the answer says so,
+    and an admin can raise it). Use it when study_status warns that CalculiX will not finish in time."""
+    return api.extend(request, hours, names)
 
 
 @server.tool()

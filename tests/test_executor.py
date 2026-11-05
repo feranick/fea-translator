@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.11.01.2
+Version: 2026.11.05.2
 """
 import json
 import os
@@ -49,8 +49,12 @@ def test_routing_and_job_script(slurm, monkeypatch):
     assert "-m fea_translator.cli run-study" in s and f"--output={req / 'a' / 'job.log'}" in s
     assert "--cpus-per-task=3" in executor.job_script(req, "a", {"analysis": "static", "procs": 3})
     assert "--cpus-per-task=1" in executor.job_script(req, "a", {"analysis": "buckling", "procs": 8})
-    # time limit: every solve's timeout + 10 min (converge doubles the solves)
-    assert executor.time_limit_min({"analysis": "static", "converge": True}) == 2 * 15 + 10
+    # time limit: every solve's timeout + meshing (10 min a mesh at least) + 10 min (converge doubles both)
+    assert executor.time_limit_min({"analysis": "static", "converge": True}) == 2 * 15 + 2 * 10 + 10
+    # an assembly's modal steps: a run of a quarter of the timeout each (at least 10 min)
+    asm = {"analysis": "assembly", "bcs": [], "steps": [{"kind": "static"}, {"kind": "modal"}, {"kind": "modal"}],
+           "run": {"timeout_s": 7200}}
+    assert executor.time_limit_min(asm) == 120 + 2 * 30 + 10 + 10
     st = api.tool_status()["executor"]
     assert st["kind"] == "slurm" and st["sbatch"].endswith("sbatch") and st["min_minutes"] == 1 and st["procs"] == 6
 
@@ -259,11 +263,11 @@ def test_per_study_run_settings(slurm, monkeypatch):
     r = api.run({"big": _bar(queue=True, run=run), "sib": _bar(queue=True)}, "ref", wait=0)
     req = Path(r["request"])
     s, args = _job(req, "big")
-    assert "#SBATCH --time=510" in s and "#SBATCH --mem=12G" in s     # ceil(30000 / 60) + 10
+    assert "#SBATCH --time=520" in s and "#SBATCH --mem=12G" in s     # ceil(30000 / 60) + 10 (meshing) + 10
     assert "--nice=100" in args and not any(a.startswith("--mem") for a in args)
     assert json.loads((req / "big" / "job.json").read_text())["run"] == run
     s, args = _job(req, "sib")
-    assert "#SBATCH --time=25" in s and "#SBATCH --mem" not in s      # FEAT_TIMEOUT 900; the args' --mem
+    assert "#SBATCH --time=35" in s and "#SBATCH --mem" not in s      # FEAT_TIMEOUT 900 + meshing + 10; the args' --mem
     assert "--nice=100" in args and "--mem=64G" in args
     res = api.status(str(req), wait=120)
     assert res["done"], res

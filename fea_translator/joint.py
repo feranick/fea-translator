@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.05.1
+Version: 2026.11.05.2
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -1929,7 +1929,8 @@ def modal_run(name: str, study: dict, parts: list[dict], plan: dict, res: dict, 
         text, _ = write(f"{name}_modal{step['step']}", study, parts, modal={"modes": step["modes"], "ties": set(tied), "tol": tol})
         inp = folder / f"{name}_modal{step['step']}.inp"
         inp.write_text(text)
-        run_ccx(inp, timeout, serial=True)
+        from .executor import modal_timeout_s
+        run_ccx(inp, modal_timeout_s(timeout), serial=True)
         out["eigen"] = results.parse_dat(inp.with_suffix(".dat").read_text(errors="replace")).get("eigen") or []
         out["frd"] = inp.with_suffix(".frd").read_text(errors="replace") if inp.with_suffix(".frd").is_file() else None
     except (SolverError, OSError, MeshError) as exc:
@@ -1955,7 +1956,7 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
     n_nodes = sum(len(p["mesh"].nodes) for p in parts)
     t1 = time.perf_counter()
     if progress:
-        progress.stage("solve", nodes=n_nodes)
+        progress.stage("solve", nodes=n_nodes, ccx_steps=sum(1 for q in deck_steps(study) if q["kind"] != "modal"))
     text, plan = write(name, study, parts)
     inp = Path(folder) / f"{name}.inp"
     inp.write_text(text)

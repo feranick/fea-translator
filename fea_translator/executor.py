@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.04.1
+Version: 2026.11.05.2
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (1): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments, split as a shell
@@ -166,15 +166,46 @@ def sbatch_args(study: dict) -> list[str]:
 
 
 def solves_of(study: dict) -> int:
-    """CalculiX runs of a study (each has its timeout_s): joule 2, +1 with stress, x2 with converge."""
+    """CalculiX runs of a study with the full timeout_s each: joule 2, +1 with stress, x2 with converge (an
+    assembly's modal runs: modal_runs_of)."""
     n = {"joule": 2}.get(study.get("analysis"), 1) + (1 if study.get("stress") else 0)
     return n * (2 if study.get("converge") else 1)
 
 
+MODAL_FRACTION = 0.25      # an assembly's modal step: a linear frequency run, a quarter of timeout_s (at least 10 min)
+
+
+def modal_timeout_s(timeout: float) -> float:
+    return max(600.0, MODAL_FRACTION * float(timeout))
+
+
+def modal_runs_of(study: dict) -> int:
+    """An assembly's (or joint's) modal steps: each a separate CalculiX run (joint.modal_run)."""
+    if study.get("analysis") not in ("assembly", "joint"):
+        return 0
+    try:
+        from .joint import deck_steps
+        return sum(1 for s in deck_steps(study) if s["kind"] == "modal")
+    except Exception:  # noqa: BLE001 (an invalid study: no modal runs counted)
+        return 0
+
+
+MESH_MARGIN_MIN = 10       # meshing before the first solve: at least 10 min in the job's time limit ...
+MESH_NODES_PER_S = 3000    # ... or the expected nodes at 3000 per second (an S50 casing: 1.7 M nodes in 171 s)
+
+
+def mesh_margin_min(study: dict) -> int:
+    n = estimate_nodes(study) or 0
+    return int(math.ceil(max(MESH_MARGIN_MIN * 60, n / MESH_NODES_PER_S) / 60)) * (2 if study.get("converge") else 1)
+
+
 def time_limit_min(study: dict | None = None) -> int:
-    """The job's time limit: every solve's timeout plus 10 minutes, so the translator's own timeout
-    (which writes a clean result) fires before SLURM's."""
-    return int(math.ceil(solves_of(study or {}) * timeout_s(study) / 60)) + 10
+    """The job's time limit: every CalculiX run's timeout (the solves, an assembly's modal runs), the meshing,
+    and 10 minutes, so the translator's own timeout (which writes a clean result) fires before SLURM's.
+    (A job's meshing came out of a 10-minute margin before 2026.11.05.2, and modal runs were not counted.)"""
+    st = study or {}
+    t = solves_of(st) * timeout_s(study) + modal_runs_of(st) * modal_timeout_s(timeout_s(study))
+    return int(math.ceil(t / 60)) + mesh_margin_min(st) + 10
 
 
 def status_key() -> dict:
@@ -816,6 +847,15 @@ def queue_summary() -> dict:
         except ValueError:
             pass
     return out
+
+
+def extend_job(job_id: str, minutes: int) -> str | None:
+    """Raises a SLURM job's time limit by `minutes` (scontrol update TimeLimit=+N); None, or why not (raising a
+    limit usually needs an operator or admin)."""
+    p = _run(["scontrol", "update", f"JobId={job_id}", f"TimeLimit=+{int(minutes)}"])
+    if p is None:
+        return "scontrol not found"
+    return None if p.returncode == 0 else ((p.stderr or p.stdout).strip()[:300] or f"exit {p.returncode}")
 
 
 def scancel(ids: list[str]) -> str | None:

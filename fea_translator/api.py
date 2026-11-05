@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.04.1
+Version: 2026.11.05.2
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import multiprocessing as mp
 import os
 import time
@@ -384,6 +385,60 @@ def _nodes_hint(study: dict) -> int | None:
     return executor.estimate_nodes(study)
 
 
+def ccx_progress(d: Path, p: dict | None, now: float | None = None) -> dict | None:
+    """Where a running CalculiX run is, from its own files: step k of n (n from progress.json's ccx_steps), increment,
+    attempt, step time (from the .sta), iterations and seconds per iteration (the .cvg), and the time left: the
+    elapsed solve time scaled by the share of the steps still to do. (Job 419, an S50 sleeve: the stage estimate
+    said 63 min while CalculiX was at 17.5 % of its first of two steps after 10.5 h, 15 min per iteration.)"""
+    from .joint import read_cvg, read_sta
+    now = now or time.time()
+    stas = sorted(Path(d).glob("*.sta"), key=lambda f: f.stat().st_mtime)
+    if not stas:
+        return None
+    sta = stas[-1]
+    try:
+        text = sta.read_text(errors="replace")
+        cvg_f = sta.with_suffix(".cvg")
+        cvg = cvg_f.read_text(errors="replace") if cvg_f.is_file() else ""
+    except OSError:
+        return None
+    modal = "_modal" in sta.stem
+    n = 1 if modal else int((p or {}).get("ccx_steps") or 1)
+    step, inc, att, stime, done_steps = 1, 0, 1, 0.0, 0
+    for line in text.splitlines():
+        tk = line.split()
+        if len(tk) >= 7 and tk[0].isdigit() and tk[1].isdigit():
+            try:
+                s_, i_, t_ = int(tk[0]), int(tk[1]), float(tk[5])
+            except ValueError:
+                continue
+            if tk[2].endswith("U"):
+                step, inc, att = s_, i_, int(tk[2].rstrip("U")) + 1
+                continue
+            step, inc, att, stime = s_, i_ + 1, 1, t_
+            if abs(t_ - 1.0) < 1e-6:
+                done_steps = max(done_steps, s_)
+    rows = read_cvg(cvg)
+    if rows:   # the .cvg is ahead of the .sta: the increment and attempt being iterated now
+        step, inc, att = rows[-1][0], rows[-1][1], rows[-1][2]
+        if step > done_steps and abs(stime - 1.0) < 1e-6:
+            stime = 0.0
+    start = (p or {}).get("stage_started") or sta.stat().st_ctime
+    elapsed = max(now - float(start), 1.0)
+    frac = (min(done_steps, n) + (0.0 if step <= done_steps else min(stime, 1.0))) / max(n, 1)
+    out = {"file": sta.name, "step": step, "of_steps": n, "increment": inc, "attempt": att,
+           "step_time": round(stime, 6), "fraction_done": round(frac, 4), "iterations": len(rows),
+           "s_per_iteration": round(elapsed / len(rows), 1) if rows else None, "solve_elapsed_min": round(elapsed / 60, 1)}
+    if rows:
+        cur = [r for r in rows if r[:3] == rows[-1][:3]]
+        out["iterations_this_attempt"] = len(cur)
+    if frac >= 0.01:
+        out["eta_min"] = round(elapsed * (1 - frac) / frac / 60, 1)
+    else:
+        out["note"] = "too early to tell from CalculiX's progress (under 1 % of its steps)"
+    return out
+
+
 def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
     """Where a running study is: step k of n (mesh, solve; with converge: true also the finer mesh),
     seconds per step, and minutes left: expected (from this machine's past solves) and at most (the
@@ -426,12 +481,26 @@ def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
     worst = max(worst, 0)
     if exp is not None:
         exp = min(exp, worst)   # the time limits bound it: a slower run stops at its timeout
+    try:   # time added with extend(request)
+        worst += float(json.loads((d / "extended.json").read_text()).get("total_s", 0.0))
+    except (OSError, ValueError):
+        pass
     out = {"stage": stage, "iteration": step, "max_iterations": steps,
            "s_per_iteration": round(sum(done) / len(done), 1) if done else None,
            "elapsed_min": round((now - p.get("started", now)) / 60, 1), "nodes": nodes,
            "eta_min": None if exp is None else round(exp / 60, 1), "eta_min_max": round(worst / 60, 1)}
     if rt is None:
         out["note"] = "no finished solves on this machine yet: eta_min is unknown until one finishes"
+    if stage.startswith("solve"):   # CalculiX's own progress beats the size-based estimate once it has some
+        cx = ccx_progress(d, p, now)
+        if cx:
+            out["calculix"] = cx
+            if cx.get("eta_min") is not None:
+                out["eta_min"] = cx["eta_min"]
+                out["eta_from"] = "calculix progress"
+                if cx["eta_min"] > out["eta_min_max"]:
+                    out["warning"] = (f"at this pace CalculiX needs about {cx['eta_min']:.0f} min more, past its time "
+                                      f"limit ({out['eta_min_max']:.0f} min left): extend(request) or cancel")
     return out
 
 
@@ -641,6 +710,61 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
             studies[n] = rec
         out.append({"request": str(d), "started": _clock(meta.get("started", d.stat().st_mtime)), "studies": studies})
     return {"translator": __version__, "executor": executor.kind(), "requests": out, **executor.queue_summary()}
+
+
+def extend(request: str, hours: float, names: list[str] | None = None) -> dict:
+    """More time for a request's running studies (or the named ones): each one's CalculiX run moves its deadline
+    back by `hours` within seconds (an 'extend' file in its folder, which the run consumes), and its SLURM job's
+    time limit is raised by as much (scontrol; SLURM may refuse a user's raise: then an admin has to). Within
+    FEAT_MAX_TIMEOUT when set (the study's run.timeout_s plus what was added)."""
+    folder = Path(request).expanduser()
+    try:
+        meta = json.loads((folder / "request.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"error": f"no request {folder}"}
+    if not (isinstance(hours, (int, float)) and hours > 0):
+        return {"error": "hours: a number > 0"}
+    want = list(names) if names else list(meta.get("names", []))
+    unknown = [n for n in want if n not in meta.get("names", [])]
+    if unknown:
+        return {"error": f"no studies {unknown} in this request ({meta.get('names', [])})"}
+    studies = json.loads((folder / "studies.json").read_text())
+    cap = executor.caps().get("timeout_s")
+    out = {"request": str(folder), "translator": __version__, "studies": {}}
+    for n in want:
+        d = folder / n
+        rec = {}
+        if (d / f"{n}.json").is_file():
+            out["studies"][n] = {"state": "finished: nothing to extend"}
+            continue
+        secs = float(hours) * 3600
+        if cap:
+            try:
+                had = float(json.loads((d / "extended.json").read_text()).get("total_s", 0.0))
+            except (OSError, ValueError):
+                had = 0.0
+            room = float(cap) - executor.timeout_s(studies.get(n)) - had
+            if room <= 0:
+                out["studies"][n] = {"error": f"at FEAT_MAX_TIMEOUT ({cap:g} s) already"}
+                continue
+            if secs > room:
+                secs, rec["capped"] = room, f"to FEAT_MAX_TIMEOUT ({cap:g} s)"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "extend").write_text(str(secs))
+        rec["added_s"] = round(secs, 1)
+        if n in meta.get("slurm", []):
+            try:
+                jid = json.loads((d / "job.json").read_text())["job_id"]
+                err = executor.extend_job(jid, int(math.ceil(secs / 60)))
+                rec["slurm_job"] = jid
+                rec["slurm_time_limit"] = "raised" if err is None else (
+                    f"not raised ({err}): ask an admin to run scontrol update JobId={jid} "
+                    f"TimeLimit=+{int(math.ceil(secs / 60))}, or the job ends at its old limit")
+            except (OSError, json.JSONDecodeError, KeyError):
+                rec["slurm_time_limit"] = "no job.json: not raised"
+        rec["note"] = "the running CalculiX run takes it within about 5 s (extended.json records it)"
+        out["studies"][n] = rec
+    return out
 
 
 def cancel(request: str, names: list[str] | None = None) -> dict:

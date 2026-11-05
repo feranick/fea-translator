@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.04.8
+Version: 2026.11.05.2
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -113,6 +113,28 @@ class Stopped(SolverError):
     """A run stopped by its monitor (it could not converge): the reason."""
 
 
+EXTENDED = {"s": 0.0}   # seconds added to the running study's CalculiX time limit (extend files), this process
+
+
+def take_extension(folder: Path | None) -> float:
+    """Seconds asked for in <study folder>/extend (api.extend writes it), consumed: the file is renamed to
+    extend.applied.<time>, and the total so far is kept in extended.json (progress reads it)."""
+    if folder is None:
+        return 0.0
+    f = Path(folder) / "extend"
+    try:
+        secs = float(f.read_text().strip())
+        f.rename(f.with_name(f"extend.applied.{int(time.time())}"))
+    except (OSError, ValueError):
+        return 0.0
+    EXTENDED["s"] += secs
+    try:
+        (Path(folder) / "extended.json").write_text(json.dumps({"total_s": EXTENDED["s"], "at": time.time()}))
+    except OSError:
+        pass
+    return secs
+
+
 MONITOR_EVERY = 5.0       # s between two looks of a run's monitor at its .sta/.cvg files
 
 
@@ -139,9 +161,13 @@ def _wait_rss(p: subprocess.Popen, timeout: float, monitor=None) -> int:
         if time.time() > t_end:
             _kill_group(p)
             raise subprocess.TimeoutExpired(p.args, timeout)
-        if monitor is not None and time.time() > t_mon:
+        if time.time() > t_mon:     # every MONITOR_EVERY s: an extension of the time limit, the run's monitor
             t_mon = time.time() + MONITOR_EVERY
-            why = monitor()
+            add = take_extension(CANCEL["file"].parent if CANCEL.get("file") else None)
+            if add:                   # extend(request): a later deadline for this CalculiX run
+                t_end += add
+                timeout += add
+            why = monitor() if monitor is not None else None
             if why:
                 _kill_group(p)
                 raise Stopped(why)
@@ -956,6 +982,7 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
     folder.mkdir(parents=True, exist_ok=True)
     prog = Progress(folder, study, solver, timeout)
     CANCEL["file"] = folder / "cancel"
+    EXTENDED["s"] = 0.0
     try:
         if cancel_requested():
             raise Cancelled("cancelled with cancel(request) before it started")
@@ -1061,6 +1088,8 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
     res["translator"] = __version__
     res["solver"] = solver
     res["execution"] = {**(res.get("execution") or {}), "limits": limits(study, timeout)}
+    if EXTENDED["s"]:
+        res["execution"]["extended_s"] = round(EXTENDED["s"], 1)
     tmp = folder / f".{name}.json.tmp"   # atomic: study_status never reads half a file
     tmp.write_text(json.dumps(res, indent=1))
     tmp.replace(folder / f"{name}.json")
