@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.04.10
+Version: 2026.11.05.1
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -456,8 +456,23 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
     an = study.get("analysis", "joint")
     L = [f"** {name}: written by fea-translator {__version__} ({an}: parts in contact, bolt pretension)",
          "** units: mm, N, s, t (tonne); stresses MPa", "*NODE, NSET=NALL"]
+    # an interference fit (a contact's negative clearance): its slave face's nodes moved by the interference along
+    # their outward normals, into the master, so the parts overlap; node-to-surface contact then resolves it.
+    # CalculiX's face-to-face contact with an interference on curved quadratic faces settled on states with the
+    # interference not enforced (closed 0-19 %, pressures near 0) or did not converge, whether made with *CLEARANCE
+    # or in the geometry; node-to-surface took it in 8 increments, 1.4 % off Lame (tools/interference_matrix.py,
+    # mochi 2026.11.05)
+    Xw = all_nodes(parts).copy()
+    tets_all = np.concatenate([p["mesh"].tets + p["n0"] for p in parts])
+    moved = {}
+    for c in study.get("contacts", []) or []:
+        if float(c.get("clearance", 0.0) or 0.0) < 0:
+            nn, nrm = face_node_normals(Xw, tets_all, _gfaces(select(parts, c["faces"])))
+            Xw[nn] += abs(float(c["clearance"])) * nrm
+            moved[c["name"]] = len(nn)
     for p in parts:
-        L += [f"{p['n0'] + i + 1}, {_g(x)}, {_g(y)}, {_g(z)}" for i, (x, y, z) in enumerate(p["mesh"].nodes)]
+        L += [f"{p['n0'] + i + 1}, {_g(x)}, {_g(y)}, {_g(z)}"
+              for i, (x, y, z) in enumerate(Xw[p["n0"]:p["n0"] + len(p["mesh"].nodes)])]
     n_next = sum(len(p["mesh"].nodes) for p in parts) + 1
     e_next = sum(len(p["mesh"].tets) for p in parts) + 1
     for p in parts:
@@ -643,8 +658,9 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
             else:
                 L += ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR", _g(K)] + (
                     friction_lines(K, {"friction": mu}, stick) if mu > 0 else [])
-            L += [f"*CONTACT PAIR, INTERACTION=CI_{cn}, TYPE=SURFACE TO SURFACE", f"CS_{cn}, CM_{cn}"]
-            if "clearance" in c:
+            fit = float(c.get("clearance", 0.0) or 0.0) < 0
+            L += [f"*CONTACT PAIR, INTERACTION=CI_{cn}, TYPE={'NODE' if fit else 'SURFACE'} TO SURFACE", f"CS_{cn}, CM_{cn}"]
+            if "clearance" in c and not fit:
                 L += [f"*CLEARANCE, MASTER=CM_{cn}, SLAVE=CS_{cn}, VALUE={_g(float(c['clearance']))}"]
         nrm = sum((p["mesh"].groups[tg_].normal * p["mesh"].groups[tg_].area[:, None]).sum(axis=0)
                   for p, tgs in slave for tg_ in tgs)
@@ -652,6 +668,8 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
                                  "with_tags": gtags(parts, master), "normal": _unit(nrm).tolist(), "law": law,
                                  "friction_mu": mu, "friction": fr, "interaction": f"CI_{cn}",
                                  "clearance_mm": c.get("clearance"),
+                                 "contact_type": "node to surface" if c["name"] in moved else "surface to surface",
+                                 "interference_nodes_moved": moved.get(c["name"]),
                                  "gap": face_gap(X, _gnodes(slave), _gnodes(master), _unit(nrm)),
                                  "area": sum(p["mesh"].area_of(tg) for p, tg in slave)})
         plan["selection"][f"contact {c['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in slave for t in tg]
@@ -761,11 +779,7 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
         first = s["ccx_step"] == 1
         # the first step from a small increment (the contact is found at a twentieth of the load); later steps add a
         # part of the load in one increment (CalculiX cuts it back if contact needs it)
-        # an interference (a contact's negative clearance) is ramped over the first step: in at most 10 % per increment
-        # (the press fit's 25 % increments diverged and took many cutbacks: mochi 2026.11.04)
-        fit = any(float(c.get("clearance_mm") or 0.0) < 0 for c in plan["contacts"])
-        L += ["*STEP, INC=1000", "*STATIC",
-              (f"0.05, 1., 1e-05, {0.1 if fit else 0.25}" if first else "1., 1., 1e-08, 1.")]
+        L += ["*STEP, INC=1000", "*STATIC", "0.05, 1., 1e-05, 0.25" if first else "1., 1., 1e-08, 1."]
         if first:
             L += ["*BOUNDARY"] + bnd if bnd else []
         elif pret:
@@ -1287,7 +1301,7 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
         res["contacts"] = {}
         for c in plan["contacts"]:
             res["contacts"][c["name"]] = {"law": c["law"], "friction": c["friction_mu"], "area_mm2": round(c["area"], 4),
-                                          "clearance_mm": c.get("clearance_mm"),
+                                          "clearance_mm": c.get("clearance_mm"), "contact_type": c.get("contact_type"),
                                           "gap_mm": (c.get("gap") or {}).get("median_mm")}
             gp = (c.get("gap") or {}).get("median_mm")
             if gp is not None and gp > GAP_TOL and c.get("clearance_mm") is None:
@@ -1711,9 +1725,8 @@ def _validate_assembly(st: dict, names: set) -> tuple[list[str], list[str]]:
                 errs.append(f"{w}.friction: 0 to 1 (0.2; 0: frictionless)")
             elif law == "bonded":
                 warns.append(f"{w}: a bonded contact has no friction (it is tied)")
-        if "clearance" in c and (not _num(c["clearance"]) or c["clearance"] < 0):
-            errs.append(f"{w}.clearance: mm, >= 0 (an initial gap); an interference (< 0, a press fit) is not available "
-                        "yet: it did not converge in CalculiX's face-to-face contact")
+        if "clearance" in c and not _num(c["clearance"]):
+            errs.append(f"{w}.clearance: mm, > 0 an initial gap, < 0 an interference (a press fit)")
         if law == "bonded" and _num(c.get("clearance")) and c["clearance"] != 0:
             errs.append(f"{w}: a bonded contact takes no clearance")
         extra = set(c) - {"name", "faces", "with", "law", "friction", "clearance"}

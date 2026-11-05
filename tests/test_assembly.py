@@ -1,7 +1,7 @@
 """Assemblies (analysis "assembly", joint.py): steps and their loads, contacts (hard, penalty, bonded, clearance), nuts
 on a meshed shaft, probes, part stresses, modal steps on the loaded state, validation, pictures. Offline: the CalculiX
 runs are the assembly_* benchmarks (test_fea.test_benchmark_calculix, FEAT_SLOW_TESTS=1).
-Version: 2026.11.04.7
+Version: 2026.11.05.1
 """
 import copy
 import math
@@ -198,10 +198,8 @@ def test_assembly_validation():
     no_rho = _boxes()
     no_rho["parts"]["top"]["material"] = {"E": 70000, "nu": 0.3}
     assert "needs a density" in errs(no_rho)
-    for name in ("assembly_clamp", "assembly_bonded_beam", "assembly_clamped_beam"):
+    for name in ("assembly_clamp", "assembly_press_fit", "assembly_bonded_beam", "assembly_clamped_beam"):
         assert validate_study(cases()[name])["ok"], name
-    from fea_translator.bench import pending_cases
-    assert "assembly_press_fit" not in cases() and "not available yet" in errs(pending_cases()["assembly_press_fit"])
     assert errs(_boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
                                   "clearance": 0.05}])) == ""
 
@@ -274,3 +272,24 @@ def test_face_node_normals_point_outward():
     assert np.allclose(m.nodes[nodes, 2], 20) and np.allclose(N, [0, 0, 1])
     nodes2, N2 = joint.face_node_normals(m.nodes, m.tets, m.faces_of(m.select({"nx": -1})))
     assert np.allclose(N2, [-1, 0, 0])
+
+
+def test_an_interference_fit_overlaps_the_parts(tmp_path):
+    """A negative clearance: the slave face's nodes moved by it along their outward normals (into the master),
+    node-to-surface contact, no *CLEARANCE (face-to-face contact did not enforce interference fits in CalculiX:
+    tools/interference_matrix.py, mochi 2026.11.05)."""
+    st = _boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
+                           "clearance": -0.01}])
+    assert validate_study(st)["ok"]
+    parts = joint.mesh_parts(st, tmp_path)
+    text, plan = joint.write("fit", st, parts)
+    assert "TYPE=NODE TO SURFACE" in text and "*CLEARANCE" not in text
+    c = plan["contacts"][0]
+    assert c["contact_type"] == "node to surface" and c["interference_nodes_moved"] > 0
+    lines = text.splitlines()
+    i = lines.index("*NODE, NSET=NALL")
+    X = np.array([[float(v) for v in ln.split(",")[1:]] for ln in lines[i + 1:i + 1 + sum(len(p["mesh"].nodes) for p in parts)]])
+    top = parts[1]
+    Z = X[top["n0"]:top["n0"] + len(top["mesh"].nodes), 2]
+    bottom = np.isclose(top["mesh"].nodes[:, 2], 20)
+    assert np.allclose(Z[bottom], 20 - 0.01) and np.allclose(Z[~bottom], top["mesh"].nodes[~bottom, 2])

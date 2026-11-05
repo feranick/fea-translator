@@ -80,7 +80,7 @@ Bolted joints: analysis "joint" takes an assembly (parts), gaskets (contact with
 sealing stress), pretensioned bolts, and a pressure or force raised in steps; results give the leak and
 lift-off value per gasket and the bolt forces per step.
 Assemblies: analysis "assembly" takes parts with contacts between them (hard, penalty or bonded, friction,
-a clearance), gaskets, bolts and nuts (a nut clamping parts on a meshed shaft), and steps: preload,
+clearance or interference), gaskets, bolts and nuts (a nut clamping parts on a meshed shaft), and steps: preload,
 static steps with their loads, a sweep, and modal steps on the preloaded state (frequencies with contact).
 Long studies run as SLURM jobs on the machine (when FEAT_EXECUTOR=slurm): run_studies returns them pending
 with job ids. They do not depend on this conversation. Report the expected finish time and stop; do not poll.
