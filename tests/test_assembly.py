@@ -264,3 +264,13 @@ def test_contact_force_from_element_forces():
     lo, hi = m.nodes.min(axis=0) + 1e-9, m.nodes.max(axis=0) - 1e-9
     inner = np.nonzero(np.all((m.nodes > lo) & (m.nodes < hi), axis=1))[0]
     assert len(inner) and np.abs(f[inner]).max() < 1e-6 * szz * 1200     # interior nodes: in balance
+
+
+def test_face_node_normals_point_outward():
+    from fea_translator.meshdata import box_mesh
+    m = box_mesh(40, 30, 20, 4, 3, 2, order=2, origin=[0, 0, 0])
+    tags = m.select({"nz": 1})
+    nodes, N = joint.face_node_normals(m.nodes, m.tets, m.faces_of(tags))
+    assert np.allclose(m.nodes[nodes, 2], 20) and np.allclose(N, [0, 0, 1])
+    nodes2, N2 = joint.face_node_normals(m.nodes, m.tets, m.faces_of(m.select({"nx": -1})))
+    assert np.allclose(N2, [-1, 0, 0])

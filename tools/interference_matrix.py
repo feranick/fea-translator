@@ -3,9 +3,9 @@ assembly_press_fit benchmark: a ring ri 20 / ro 40 on a solid shaft r 20, 10 thi
 Lame's plane-stress contact pressure 78.75 MPa) run in variants that each change one thing: the penalty, friction,
 supports, slave and master, how the interference is made (clearance or geometry), contact type, the size of the
 interference, the increments, the mesh. Each run is cut off by the convergence watch or a time limit.
-Version: 2026.11.04.9
+Version: 2026.11.04.10
 
-    python tools/interference_matrix.py [--out DIR] [--timeout S] [--only base,k1,...] [--size 6]
+    python tools/interference_matrix.py [--out DIR] [--timeout S] [--only base,k1,...] [--size 6] [--reevaluate]
 
 Run from a feat checkout with CalculiX and Gmsh (e.g. in tmux on mochi). Writes DIR/<variant>/ (deck, .sta, .cvg,
 .dat, .frd), DIR/results.jsonl (one line per variant) and prints a table at the end.
@@ -151,17 +151,50 @@ def run(name: str, spec, out: Path, timeout: float) -> dict:
     return rec
 
 
+def reevaluate(name: str, spec, out: Path) -> dict:
+    """A finished variant's results again from its .dat and .frd, with this checkout's evaluation (no CalculiX):
+    the mesh is made again (Gmsh gives the same one) into a scratch folder."""
+    import tempfile
+    question, st, edits, expected = spec
+    d = out / name
+    rec = {"variant": name, "expected_MPa": round(expected, 4)}
+    if not (d / f"{name}.dat").is_file() or not (d / f"{name}.frd").is_file():
+        return dict(rec, status="no results")
+    parts = joint.mesh_parts(st, Path(tempfile.mkdtemp()))
+    text, plan = joint.write(name, st, parts)
+    for a, b in edits:
+        text = text.replace(a, b)
+    if text.splitlines()[1:] != (d / f"{name}.inp").read_text().splitlines()[1:]:
+        return dict(rec, status="the mesh came out different: not comparable")
+    res = joint.evaluate(st, parts, plan, (d / f"{name}.dat").read_text(errors="replace"),
+                         (d / f"{name}.frd").read_text(errors="replace"))
+    if not res["steps"]:
+        return dict(rec, status="no step finished")
+    c = (res["steps"][-1].get("contacts") or {}).get("fit") or {}
+    rec.update(status="re-evaluated", step=res["steps"][-1]["step"], **{k: c.get(k) for k in (
+        "mean_pressure_MPa", "mean_pressure_cpress_MPa", "force_N", "shear_N", "closed_fraction", "max_pressure_MPa",
+        "force_from")})
+    if c.get("mean_pressure_MPa"):
+        rec["pressure_error"] = round(c["mean_pressure_MPa"] / expected - 1, 4)
+    return rec
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default=str(Path.home() / "interference_matrix"))
     ap.add_argument("--timeout", type=float, default=900.0, help="seconds per variant (900)")
     ap.add_argument("--size", type=float, default=6.0, help="mesh size of the variants (6; size4 is always 4)")
     ap.add_argument("--only", default="", help="comma-separated variant names")
+    ap.add_argument("--reevaluate", action="store_true", help="no runs: the finished variants' pressures again")
     a = ap.parse_args(argv)
     out = Path(a.out).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     vs = variants(a.size)
     names = [n for n in (a.only.split(",") if a.only else vs) if n]
+    if a.reevaluate:
+        for n in names:
+            print(json.dumps(reevaluate(n, vs[n], out)), flush=True)
+        return 0
     log = out / "results.jsonl"
     recs = []
     for n in names:

@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.04.7
+Version: 2026.11.04.10
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -941,6 +941,25 @@ def disp_by_step(blocks: list[dict], steps: list[dict], N: int) -> dict[int, np.
     return out
 
 
+def face_node_normals(X: np.ndarray, tets: np.ndarray, faces) -> tuple[np.ndarray, np.ndarray]:
+    """The nodes (0-based, sorted) of element faces [(element, face 1..4)] and each one's outward unit normal: the
+    area-weighted mean of its faces' normals (on a cylinder, the radial direction at the node)."""
+    acc: dict = {}
+    for e, s in faces:
+        el = tets[e]
+        c = [int(el[i]) for i in FACES[s - 1]]
+        nn = np.cross(X[c[1]] - X[c[0]], X[c[2]] - X[c[0]])          # twice the face's area, along its normal
+        if nn @ (X[c].mean(axis=0) - X[el[:4]].mean(axis=0)) < 0:     # outward: away from the element
+            nn = -nn
+        ids = c + ([int(el[EDGE_MID[frozenset((FACES[s - 1][i], FACES[s - 1][(i + 1) % 3]))]]) for i in range(3)]
+                   if len(el) == 10 else [])
+        for q in ids:
+            acc[q] = acc.get(q, 0.0) + nn
+    nodes = np.array(sorted(acc), int)
+    N = np.array([acc[q] for q in nodes], float).reshape(-1, 3)
+    return nodes, N / np.maximum(np.linalg.norm(N, axis=1), 1e-300)[:, None]
+
+
 def nodal_internal_forces(mesh, U: np.ndarray, material: dict) -> np.ndarray:
     """The element forces at each node (N, 3): f_a = sum over elements of the integral of sigma . grad N_a, from the
     displacements (CalculiX's element formulation: 4 Gauss points for 10-node tetrahedra). At nodes with no load
@@ -1107,11 +1126,9 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
     # the slave faces' nodes of each contact (0-based, merged) and their part, for the contact forces
     snodes = {}
     for c in plan["contacts"]:
-        nodes = np.unique(np.concatenate([tets[e][list(FACES[s - 1]) + ([EDGE_MID[frozenset((FACES[s - 1][i], FACES[s - 1][(i + 1) % 3]))]
-                                                                          for i in range(3)] if tets.shape[1] == 10 else [])]
-                                          for e, s in c["slave_faces"]])) if c["slave_faces"] else np.zeros(0, int)
+        nodes, nrm = face_node_normals(X, tets, c["slave_faces"]) if c["slave_faces"] else (np.zeros(0, int), np.zeros((0, 3)))
         part = next((p for p in parts if p["n0"] <= (nodes[0] if len(nodes) else -1) < p["n0"] + len(p["mesh"].nodes)), None)
-        snodes[c["name"]] = (nodes, part)
+        snodes[c["name"]] = (nodes, part, nrm)
     disp = disp_by_step(blocks, steps, N) if (assembly or plan.get("probes")) else {}
     fint: dict = {}
     # probes: from CalculiX's printout of their nodes (as the bolt ends), the .frd's displacements otherwise
@@ -1165,21 +1182,25 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
                 cs = contact_state(c, cmap, careas[c["name"]])
                 if cs is not None:
                     cs["pressure_force_N"] = cs["force_N"]
-                    nodes, part = snodes[c["name"]]
-                    n = np.asarray(c["normal"], float)
-                    flat = part is not None and len(nodes) and ccx in disp and float(np.linalg.norm(n)) > 0.9
-                    if flat:   # the element forces at the slave face's nodes balance the contact force on it exactly
-                        # (summing a stiff penalty's nodal pressures was up to 2x off; CalculiX's section force,
-                        # from extrapolated stresses, 7 %: assembly_clamp, mochi 2026.11.04)
+                    nodes, part, nrm = snodes[c["name"]]
+                    if part is not None and len(nodes) and ccx in disp:
+                        # the element forces at the slave face's nodes balance the contact forces on them exactly; each
+                        # node's normal part is its contact pressure force (summing a stiff penalty's nodal pressures was
+                        # up to 2x off; CalculiX's section force 7 %: assembly_clamp; on a press fit 0.74 and 378 MPa
+                        # against 78.75: mochi 2026.11.04)
                         sl = slice(part["n0"], part["n0"] + len(part["mesh"].nodes))
                         key = (ccx, part["name"])
                         if key not in fint:
                             fint[key] = nodal_internal_forces(part["mesh"], disp[ccx][sl], part["material"])
-                        F = fint[key][nodes - part["n0"]].sum(axis=0)
-                        cs["force_N"] = round(float(-(F @ n)), 3)        # compression positive
-                        cs["shear_N"] = round(float(np.linalg.norm(F - (F @ n) * n)), 3)
+                        f = fint[key][nodes - part["n0"]]
+                        fn = -np.einsum("ij,ij->i", f, nrm)                          # compression positive
+                        ft = f + fn[:, None] * nrm
+                        cs["mean_pressure_cpress_MPa"] = cs["mean_pressure_MPa"]
+                        cs["force_N"] = round(float(fn.sum()), 3)
+                        cs["mean_pressure_MPa"] = round(float(fn.sum()) / max(c["area"], 1e-300), 6)
+                        cs["shear_N"] = round(float(np.linalg.norm(ft.sum(axis=0))), 3)
                         cs["force_from"] = "element forces"
-                    else:      # a curved face (a press fit): the nodal pressures' integral
+                    else:
                         cs["force_from"] = "pressures"
                 rec["contacts"][c["name"]] = cs
         if plan.get("probes") and (ccx in disp or any(s in pb for pb in pblocks.values())):
