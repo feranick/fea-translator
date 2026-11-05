@@ -1,5 +1,5 @@
 """mesher.py — the part as a tetrahedral mesh: Gmsh from a STEP file (or a build123d-translator goal).
-Version: 2026.11.04.8
+Version: 2026.11.05.4
 
     mesh_part(study, workdir) -> (Mesh, info)
 
@@ -34,6 +34,7 @@ def part_step(study: dict, workdir: Path) -> Path:
     except ImportError as exc:
         raise MeshError("part is a goal but build123d-translator is not installed (pip install -e ../build123d-translator)") from exc
     solid, _ = T.build(part["goal"])
+    Path(workdir).mkdir(parents=True, exist_ok=True)   # OCCT does not make the folder: 'Failed to write STEP file'
     base = Path(workdir) / "part"
     return Path(T.export(solid, base, ("step",))["step"])
 
@@ -233,6 +234,7 @@ def mesh_part(study: dict, workdir: Path, size_factor: float = 1.0) -> tuple[Mes
         org = part.get("origin", [-lx / 2, -ly / 2, 0.0])
         mesh = box_mesh(lx, ly, lz, *div, order=order, origin=org)
         return mesh, {"size": h, "nodes": len(mesh.nodes), "elements": len(mesh.tets), "order": order, "divisions": div}
+    Path(workdir).mkdir(parents=True, exist_ok=True)   # mesh.msh (and a goal's part.step) go there
     step = part_step(study, workdir)
     mesh, info = mesh_step(step, m.get("size"), order, m.get("refine", []), Path(workdir) / "mesh.msh", size_factor,
                            m.get("min_size"), int(m.get("curvature", CURVATURE)))
