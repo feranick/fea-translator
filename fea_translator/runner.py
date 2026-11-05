@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.05.2
+Version: 2026.11.05.3
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -51,12 +51,100 @@ def find_ccx() -> str | None:
     return None
 
 
-PEAK = {"rss_mb": 0.0, "threads": 0}   # this process's CalculiX runs: largest resident memory, threads
+PEAK = {"rss_mb": 0.0, "threads": 0, "last_rss_mb": 0.0}   # this process's CalculiX runs: largest resident memory,
+# threads; the last run's peak
 # eigenvalue analyses run single-threaded: CalculiX's threaded eigenvalue step returned wrong buckling factors
 # under load on mochi, and on a 4-thread setup machine crashed in it (modal) and then returned 946 Hz for the
 # second of two equal bending modes at 835.5 Hz (cantilever_modal); single-threaded it is repeatable
 EIGEN = ("modal", "buckling")
 CRASHES: list[dict] = []   # threaded CalculiX runs that died without an error and were rerun single-threaded
+RESTART_FILE = "ccx_restart.json"   # in the study folder: a threaded run that died and was restarted on one thread
+
+
+def _cgroup_dirs() -> list[Path]:
+    """This process's memory cgroups, its own first and then each parent (cgroup v2, or v1's memory hierarchy);
+    [] where there are none (macOS). A SLURM job's CalculiX runs in the same cgroup as feat."""
+    try:
+        lines = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        parts = ln.split(":", 2)
+        if len(parts) != 3:
+            continue
+        hid, ctrl, rel = parts
+        if hid == "0" and ctrl == "":
+            root = Path("/sys/fs/cgroup")
+        elif "memory" in ctrl.split(","):
+            root = Path("/sys/fs/cgroup/memory")
+        else:
+            continue
+        d = root / rel.strip().lstrip("/")
+        while True:
+            out.append(d)
+            if d == root or d.parent == d:
+                break
+            d = d.parent
+    return out
+
+
+def oom_kills() -> dict:
+    """{cgroup: processes killed by the out-of-memory killer so far} (v2 memory.events, v1 memory.oom_control)."""
+    out = {}
+    for d in _cgroup_dirs():
+        for f in ("memory.events", "memory.oom_control"):
+            try:
+                for ln in (d / f).read_text().splitlines():
+                    k, _, v = ln.partition(" ")
+                    if k == "oom_kill":
+                        out[str(d / f)] = int(v)
+            except (OSError, ValueError):
+                pass
+    return out
+
+
+def memory_limit_mb() -> float | None:
+    """The memory this process (and CalculiX) may use: the SLURM job's (SLURM_MEM_PER_NODE, MB), else its cgroup's
+    memory.max (v2) or memory.limit_in_bytes (v1); None: no limit known."""
+    v = os.environ.get("SLURM_MEM_PER_NODE")
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    for d in _cgroup_dirs():
+        for f in ("memory.max", "memory.limit_in_bytes"):
+            try:
+                t = (d / f).read_text().strip()
+            except OSError:
+                continue
+            if t.isdigit() and int(t) < 2 ** 60:
+                return int(t) / 2 ** 20
+    return None
+
+
+def crash_message(rec: dict) -> str:
+    """'killed at 33.4 GB of 32.0 GB with 6 threads; rerunning on 1 thread (about 2x slower by feat's thread model)',
+    or the crash: what happened to a threaded CalculiX run, with the numbers that tell whether more memory is the fix."""
+    slower = f"about {rec['threads'] ** 0.4:.1f}x slower by feat's thread model"
+    if rec.get("out_of_memory"):
+        of = f" of {rec['limit_mb'] / 1024:.1f} GB" if rec.get("limit_mb") else ""
+        return (f"out of memory: killed at {rec.get('peak_rss_mb', 0) / 1024:.1f} GB{of} with {rec['threads']} threads "
+                f"after {rec.get('run_s', 0) / 60:.0f} min; rerunning on 1 thread ({slower}, about half the memory)")
+    return (f"crashed ({rec.get('crash')}, no error message) with {rec['threads']} threads after "
+            f"{rec.get('run_s', 0) / 60:.0f} min; rerunning on 1 thread ({slower})")
+
+
+def out_of_memory(code: int, before: dict, after: dict, rss_mb: float, limit_mb: float | None) -> bool:
+    """Was a CalculiX run that ended with `code` killed for memory? Its cgroup counted an OOM kill meanwhile, or
+    (no cgroup counters) SIGKILL with its peak resident memory at 90 % of the limit or more. (carbonio, 2026.11.05:
+    an S50 sleeve assembly with 6 threads was killed at 33.4 GB in a 32 GB job and was taken for a crash.)"""
+    if code == 0:
+        return False
+    if any(after.get(k, 0) > n for k, n in before.items()) or any(k not in before and n > 0 for k, n in after.items()):
+        return True
+    return code == -9 and bool(limit_mb) and rss_mb >= 0.9 * limit_mb
 
 
 def _exit_text(code: int) -> str:
@@ -154,6 +242,7 @@ def _wait_rss(p: subprocess.Popen, timeout: float, monitor=None) -> int:
             # ru_maxrss: kilobytes on Linux, bytes on macOS
             mb = ru.ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024)
             PEAK["rss_mb"] = max(PEAK["rss_mb"], mb)
+            PEAK["last_rss_mb"] = mb
             return p.returncode
         if cancel_requested():
             _kill_group(p)
@@ -199,6 +288,9 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None) -> st
     for k in ("OPENBLAS_NUM_THREADS", "GOTO_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
         env[k] = "1"
     log_path = inp.parent / f"{inp.stem}.log"
+    oom0 = oom_kills()
+    PEAK["last_rss_mb"] = 0.0
+    t_run = time.time()
     with open(log_path, "w") as fh:
         p = subprocess.Popen([exe, "-i", inp.stem], cwd=inp.parent, stdout=fh, stderr=subprocess.STDOUT, env=env,
                              start_new_session=True)   # its own process group: a cancel or timeout ends all of it
@@ -220,15 +312,38 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None) -> st
                 more.append(nx.strip())
             errs.append(" ".join([ln.strip()] + more))
     threads = int(env.get("OMP_NUM_THREADS", "1"))
+    limit = memory_limit_mb()
+    oom = out_of_memory(code, oom0, oom_kills(), PEAK["last_rss_mb"], limit)
     if not errs and (code != 0 or not inp.with_suffix(".dat").is_file()) and threads > 1:
-        # it died with no error of its own (a crash in the threaded solver: the eigenvalue step on a
-        # 4-thread setup machine): once more single-threaded, as for solves that do not balance
-        CRASHES.append({"solve": inp.stem, "crash": _exit_text(code), "threads": threads, "after_rerun": "ok"})
+        # it died with no error of its own: out of memory (threads multiply the direct solver's memory), or a crash in
+        # the threaded solver (the eigenvalue step on a 4-thread setup machine): once more single-threaded, as for
+        # solves that do not balance; said at once in the study's progress, and its log kept
+        run_s = time.time() - t_run
+        try:   # its Newton iterations (the restart overwrites the .cvg): its pace, to compare with the restart's
+            from .joint import read_cvg
+            its = len(read_cvg(inp.with_suffix(".cvg").read_text(errors="replace")))
+        except (OSError, ImportError):
+            its = 0
+        rec = {"solve": inp.stem, "crash": _exit_text(code), "threads": threads, "after_rerun": "ok",
+               "out_of_memory": oom, "peak_rss_mb": round(PEAK["last_rss_mb"], 1),
+               "limit_mb": None if limit is None else round(limit, 1), "run_s": round(run_s, 1),
+               "iterations": its, "s_per_iteration": round(run_s / its, 1) if its else None}
+        rec["message"] = crash_message(rec)
+        CRASHES.append(rec)
+        try:
+            log_path.replace(log_path.with_name(f"{inp.stem}.threaded.log"))
+            (inp.parent / RESTART_FILE).write_text(json.dumps(dict(rec, at=time.time())))
+        except OSError:
+            pass
         try:
             return run_ccx(inp, timeout, serial=True, monitor=monitor)
         except SolverError as exc:
-            CRASHES[-1]["after_rerun"] = str(exc)[:300]
+            rec["after_rerun"] = str(exc)[:300]
             raise
+    if oom:
+        lim = f" (the job's limit is {limit / 1024:.1f} GB)" if limit else ""
+        raise SolverError(f"CalculiX ran out of memory with {threads} thread(s): killed at "
+                          f"{PEAK['last_rss_mb'] / 1024:.1f} GB{lim}. Ask for more memory (run.mem) or use a coarser mesh")
     if errs or code != 0 or not inp.with_suffix(".dat").is_file():
         why = "; ".join(errs[:5]) if errs else f"{_exit_text(code)}, no error message; the log ends: {log[-800:]}"
         raise SolverError("CalculiX failed: " + why)
@@ -981,6 +1096,10 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     prog = Progress(folder, study, solver, timeout)
+    try:
+        (folder / RESTART_FILE).unlink()   # an earlier run's restart is not this one's
+    except OSError:
+        pass
     CANCEL["file"] = folder / "cancel"
     EXTENDED["s"] = 0.0
     try:
@@ -1025,8 +1144,11 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
                         "design on stress.peak_von_mises_off_bc / stress.safety_factor_off_bc")
         warn += res.pop("_selection_warnings", [])
         for rr in res.get("solver_crashes", []):
-            warn.append(f"CalculiX's {rr['threads']}-thread solve of {rr['solve']} crashed ({rr['crash']}, no error message); "
-                        "it was rerun single-threaded" + ("" if rr["after_rerun"] == "ok" else f" and failed again: {rr['after_rerun']}"))
+            again = "" if rr["after_rerun"] == "ok" else f"; the rerun failed too: {rr['after_rerun']}"
+            msg = rr.get("message") or crash_message(rr)
+            warn.append(f"CalculiX's solve of {rr['solve']}: {msg}{again}"
+                        + ("; for the threads, give the study more memory (run.mem; see memory.estimate_gb)"
+                           if rr.get("out_of_memory") else ""))
         for rr in res.get("solver_reruns", []):
             ok_ = rr["after_rerun"] <= rr["balance_error"] / 100 or rr["after_rerun"] < 1e-5
             warn.append(f"CalculiX's multithreaded solve of {rr['solve']} did not balance (error {rr['balance_error']:.2g}); "
@@ -1090,6 +1212,14 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
     res["execution"] = {**(res.get("execution") or {}), "limits": limits(study, timeout)}
     if EXTENDED["s"]:
         res["execution"]["extended_s"] = round(EXTENDED["s"], 1)
+    lost = sum(float(c.get("run_s") or 0) for c in res.get("solver_crashes", []) or [])
+    if lost:   # time of runs that died and were rerun: inside seconds.solve, not the pace of the run that finished
+        res["execution"]["killed_runs_s"] = round(lost, 1)
+    try:   # what the job had, what feat estimates: what to ask for next time
+        from . import executor
+        res["execution"]["memory"] = executor.memory_plan(study)
+    except Exception:  # noqa: BLE001 (advice only)
+        pass
     tmp = folder / f".{name}.json.tmp"   # atomic: study_status never reads half a file
     tmp.write_text(json.dumps(res, indent=1))
     tmp.replace(folder / f"{name}.json")

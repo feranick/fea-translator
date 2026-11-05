@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.05.2
+Version: 2026.11.05.3
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -1956,7 +1956,8 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
     n_nodes = sum(len(p["mesh"].nodes) for p in parts)
     t1 = time.perf_counter()
     if progress:
-        progress.stage("solve", nodes=n_nodes, ccx_steps=sum(1 for q in deck_steps(study) if q["kind"] != "modal"))
+        progress.stage("solve", nodes=n_nodes, ccx_steps=sum(1 for q in deck_steps(study) if q["kind"] != "modal"),
+                       modal_runs=sum(1 for q in deck_steps(study) if q["kind"] == "modal"))
     text, plan = write(name, study, parts)
     inp = Path(folder) / f"{name}.inp"
     inp.write_text(text)
@@ -2014,6 +2015,12 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
                     if inp.with_suffix(s).is_file()}
     res["deck"] = {"steps": len(plan["steps"]), "bolts": sum(len(b["bolts"]) for b in plan["bolts"]),
                    "gaskets": len(plan["gaskets"])}
+    from .runner import CRASHES, PEAK
+    if CRASHES:   # a threaded run that died (out of memory, a crash) and was rerun single-threaded
+        res["solver_crashes"] = list(CRASHES)
+    if PEAK["rss_mb"]:
+        res["seconds"]["ccx_peak_rss_mb"] = round(PEAK["rss_mb"], 1)
+        res["seconds"]["ccx_threads"] = PEAK["threads"]
     try:   # the state for pictures (images, render_images): the results stand without it
         frd = inp.with_suffix(".frd")
         save_state(Path(folder), study, parts, plan, res, frd.read_text(errors="replace") if frd.is_file() else "",

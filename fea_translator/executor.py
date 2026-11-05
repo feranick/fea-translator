@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.05.2
+Version: 2026.11.05.3
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (1): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments, split as a shell
@@ -538,10 +538,9 @@ def method_of(study: dict, nodes: int) -> str:
     return equation_solver(study, nodes)
 
 
-def procs_for(study: dict) -> int:
-    """CalculiX threads (CPUs) for a study: 1 for modal and buckling (repeatable eigenvalues); 1 when every solve
-    uses the iterative solver (single-threaded in CalculiX); else the study's procs or FEAT_PROCS (1),
-    capped at a thread per NODES_PER_THREAD nodes of its largest direct-solver mesh."""
+def _threads_by_size(study: dict) -> int:
+    """Threads before the memory check: 1 for modal and buckling, 1 when every solve uses the iterative solver, else
+    the study's procs capped at a thread per NODES_PER_THREAD nodes of its largest direct-solver mesh."""
     if study.get("analysis") in ("modal", "buckling"):
         return 1
     procs = min(procs_of(study), node_cores())
@@ -552,6 +551,95 @@ def procs_for(study: dict) -> int:
     if not direct:
         return 1
     return max(1, min(procs, int(math.ceil(max(direct) / NODES_PER_THREAD))))
+
+
+def node_mem_gb() -> float | None:
+    """This node's memory for jobs (SLURM's RealMemory, MB), in GB; None when SLURM does not say."""
+    me = this_node(cluster_nodes())
+    try:
+        return float(me["RealMemory"]) / 1024 if me and me.get("RealMemory") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def given_mem_gb(study: dict) -> tuple[float | None, str]:
+    """(GB, where from) of the memory a study's CalculiX run gets when that is fixed: run.mem, a size in FEAT_SLURM_MEM
+    or FEAT_SLURM_ARGS's --mem; with FEAT_SLURM_MEM=auto, what the machine allows (FEAT_MAX_MEM, the node's
+    memory); (None, ...) when nothing limits it."""
+    r = run_of(study).get("mem")
+    if r:
+        mb = mem_mb(str(r).strip())
+        return (mb / 1024 if mb else None), f"run.mem {str(r).strip()}"
+    a = opt_value(slurm_args(), ("--mem",))   # (a --mem-per-cpu grows with the CPUs: not a fixed amount)
+    if a:
+        mb = mem_mb(a)
+        if mb:
+            return mb / 1024, f"FEAT_SLURM_ARGS --mem={a}"
+    v = os.environ.get("FEAT_SLURM_MEM", "auto").strip()
+    if v and v.lower() not in ("auto", "none"):
+        mb = mem_mb(v)
+        if mb:
+            return mb / 1024, f"FEAT_SLURM_MEM={v}"
+    lims = [(mem_mb(caps()["mem"]) / 1024, f"FEAT_MAX_MEM={caps()['mem']}")] if mem_mb(caps().get("mem", "")) else []
+    nm = node_mem_gb()
+    if nm:
+        lims.append((nm, "this node's memory"))
+    return min(lims) if lims else (None, "")
+
+
+def mem_need_gb(study: dict, threads: int) -> float | None:
+    """GB CalculiX needs for a study with `threads` threads (mem_gb on its largest mesh); None: size unknown."""
+    nodes = estimate_nodes(study)
+    if nodes is None:
+        return None
+    return max(mem_gb(n, method_of(study, n), threads) for n in _meshes(study, nodes))
+
+
+def procs_for(study: dict) -> int:
+    """CalculiX threads (CPUs) for a study: _threads_by_size, then 1 when the memory it gets (given_mem_gb) is below
+    what those threads need but one thread fits better: threads multiply the direct solver's memory, and a run that
+    runs out of memory is restarted on one thread anyway after the time it lost (carbonio, 2026.11.05: 6 threads in
+    32 GB, killed after 53 min, while 5 CPUs were held for nothing). The SLURM job then asks for one CPU."""
+    t = _threads_by_size(study)
+    if t <= 1:
+        return t
+    have, _ = given_mem_gb(study)
+    need = mem_need_gb(study, t)
+    if have is not None and need is not None and need > have:
+        return 1
+    return t
+
+
+def memory_plan(study: dict) -> dict:
+    """What a study gets and what feat estimates: {given_gb, given_from, threads_asked, threads, estimate_gb: {threads:
+    GB}, note}; the note when the memory is below the estimate for the threads asked (and the way out)."""
+    asked = _threads_by_size(study)
+    t = procs_for(study)
+    have, src = given_mem_gb(study)
+    est = {n: mem_need_gb(study, n) for n in sorted({asked, 1})}
+    out = {"given_gb": None if have is None else round(have, 1), "given_from": src or None, "threads_asked": asked,
+           "threads": t, "estimate_gb": {str(k): (None if v is None else round(v, 1)) for k, v in est.items()}}
+    note = memory_note(have, src, asked, t, est)
+    if note:
+        out["note"] = note
+    return out
+
+
+def memory_note(have, src, asked, t, est) -> str | None:
+    """'run.mem 32G is below the 62 GB estimate for 6 threads: give 62G, or 1 thread fits in 32G (it runs on 1)'."""
+    if have is None:
+        return None
+    one, many = est.get(1), est.get(asked)
+    if asked > 1 and t == 1 and many is not None:
+        fits = (f"1 thread fits in {have:.0f} GB" if one is not None and one <= have else
+                f"even 1 thread needs about {one:.0f} GB")
+        return (f"{src} is below the {many:.0f} GB estimate for {asked} threads: give {math.ceil(many)}G for the "
+                f"threads, or {fits} (feat runs it on 1 thread and asks SLURM for 1 CPU)")
+    need = est.get(t)
+    if need is not None and need > have:
+        return (f"{src} is below the {need:.0f} GB estimate for {t} thread(s): CalculiX may run out of memory; "
+                f"give {math.ceil(need)}G or use a coarser mesh")
+    return None
 
 
 def mem_gb(nodes: int, method: str, threads: int) -> float:
@@ -668,6 +756,10 @@ def submit(request: Path, name: str, study: dict) -> dict:
     info = {"executor": "slurm", "job_id": job_id, "submitted": round(time.time(), 1), "procs": procs_for(study),
             "time_min": time_limit_min(study), "mem": mem_for(study), "nodelist": node_pin()[1], "nodes_estimate": n,
             "equation_solver": method_of(study, n) if n else None, "run": run_of(study), "command": cmd}
+    try:
+        info["memory"] = memory_plan(study)
+    except Exception:  # noqa: BLE001 (advice only)
+        pass
     (d / "job.json").write_text(json.dumps(info))
     return info
 

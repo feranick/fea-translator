@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.05.2
+Version: 2026.11.05.3
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -90,6 +90,10 @@ def validate(studies: dict) -> dict:
         if v.get("ok"):
             try:
                 v["estimate"] = estimate(studies[name])
+                mp = executor.memory_plan(studies[name])   # beside the estimate (its keys are the router's contract)
+                v["memory"] = mp
+                if mp.get("note"):
+                    v.setdefault("warnings", []).append(mp["note"])
             except Exception:  # noqa: BLE001 (an estimate is advice; validation stands without it)
                 pass
     return out
@@ -385,12 +389,89 @@ def _nodes_hint(study: dict) -> int | None:
     return executor.estimate_nodes(study)
 
 
+GROWTH = 1.5   # CalculiX's default increment growth after an increment that converged quickly (*CONTROLS D_B)
+
+
+def static_increments(inp_text: str) -> list[dict]:
+    """Each *STATIC step of a deck, in order: {initial, period, min, max, fixed} (fixed: DIRECT, no growth)."""
+    out, lines = [], inp_text.splitlines()
+    for i, ln in enumerate(lines):
+        u = ln.strip().upper()
+        if not u.startswith("*STATIC"):
+            continue
+        vals = []
+        for nx in lines[i + 1:i + 4]:
+            t = nx.strip()
+            if not t or t.startswith("**"):
+                continue
+            if not t.startswith("*"):
+                try:
+                    vals = [float(x) for x in t.split(",") if x.strip()]
+                except ValueError:
+                    vals = []
+            break
+        ini, per = (vals + [1.0, 1.0])[:2] if vals else (1.0, 1.0)
+        out.append({"initial": ini, "period": per, "min": vals[2] if len(vals) > 2 else 0.0,
+                    "max": vals[3] if len(vals) > 3 else per, "fixed": "DIRECT" in u})
+    return out
+
+
+def increments_left(t: float, dt: float, st: dict, converged_in_step: int) -> int:
+    """Increments CalculiX needs to finish a step from step time t, the next increment being dt: it grows by GROWTH
+    after each converged increment but the first of a step, up to the step's maximum and to what is left."""
+    n, k, per = 0, converged_in_step, st["period"]
+    while t < per * (1 - 1e-9) and n < 100000:
+        dt = max(min(dt, st["max"], per - t), 1e-12)
+        t += dt
+        n += 1
+        k += 1
+        if k >= 2 and not st["fixed"]:
+            dt *= GROWTH
+    return n
+
+
+def _iterations_left(sta_text: str, deck: list[dict], step: int, cur_iters: int) -> tuple[int, int] | None:
+    """(Newton iterations, increments) still to come, from the converged increments so far (their mean iterations)
+    and the increments the deck's *STATIC lines leave; None without a converged increment or a deck."""
+    incs = _sta_rows(sta_text)   # (step, step time, increment size, iterations, converged)
+    ok = [r for r in incs if r[4]]
+    if not ok or not deck or step > len(deck):
+        return None
+    # the mean iterations per increment, without the run's first increment once there are others: there the contact
+    # state settles from the initial guess (carbonio job 5797: 16 iterations, 185,742 -> 25,901 contact elements)
+    base = ok[1:] if len(ok) > 1 else ok
+    per_inc = sum(r[3] for r in base) / len(base)
+    mine = [r for r in ok if r[0] == step]
+    st = deck[step - 1]
+    if mine and mine[-1][1] >= st["period"] * (1 - 1e-9):   # this step is done: the next one
+        step, mine = step + 1, []
+        if step > len(deck):
+            return 0, 0
+        st = deck[step - 1]
+    t = mine[-1][1] if mine else 0.0
+    last = incs[-1] if incs else None
+    if last and not last[4] and last[0] == step:   # a cutback: CalculiX retries with a quarter of the increment
+        dt = last[2] * 0.25
+    elif mine:
+        dt = mine[-1][2] * (GROWTH if len(mine) >= 2 and not st["fixed"] else 1.0)
+    else:
+        dt = st["initial"]
+    n = increments_left(t, dt, st, len(mine))
+    n += sum(increments_left(0.0, q["initial"], q, 0) for q in deck[step:])
+    return max(int(round(n * per_inc)) - cur_iters, 0), n
+
+
 def ccx_progress(d: Path, p: dict | None, now: float | None = None) -> dict | None:
     """Where a running CalculiX run is, from its own files: step k of n (n from progress.json's ccx_steps), increment,
     attempt, step time (from the .sta), iterations and seconds per iteration (the .cvg), and the time left: the
-    elapsed solve time scaled by the share of the steps still to do. (Job 419, an S50 sleeve: the stage estimate
-    said 63 min while CalculiX was at 17.5 % of its first of two steps after 10.5 h, 15 min per iteration.)"""
-    from .joint import read_cvg, read_sta
+    iterations still to come (the increments the deck's *STATIC lines leave, growing as CalculiX grows them, times the
+    mean iterations per increment so far) at the seconds per iteration so far; without a deck, the elapsed time scaled
+    by the share of the steps still to do. (Job 419, an S50 sleeve: the stage estimate said 63 min while CalculiX was
+    at 17.5 % of its first of two steps after 10.5 h; carbonio job 5797: the step-time share said 160 h for about 11 h,
+    since the increments grow 1.5x up to the step's maximum.) A threaded run restarted on one thread (RESTART_FILE)
+    is timed from its restart."""
+    from .joint import read_cvg
+    from .runner import RESTART_FILE
     now = now or time.time()
     stas = sorted(Path(d).glob("*.sta"), key=lambda f: f.stat().st_mtime)
     if not stas:
@@ -424,18 +505,70 @@ def ccx_progress(d: Path, p: dict | None, now: float | None = None) -> dict | No
         if step > done_steps and abs(stime - 1.0) < 1e-6:
             stime = 0.0
     start = (p or {}).get("stage_started") or sta.stat().st_ctime
+    restart = None
+    try:
+        restart = json.loads((Path(d) / RESTART_FILE).read_text())
+        if restart.get("solve") == sta.stem and float(restart.get("at", 0)) > float(start):
+            start = float(restart["at"])
+    except (OSError, ValueError, TypeError):
+        restart = None
     elapsed = max(now - float(start), 1.0)
     frac = (min(done_steps, n) + (0.0 if step <= done_steps else min(stime, 1.0))) / max(n, 1)
     out = {"file": sta.name, "step": step, "of_steps": n, "increment": inc, "attempt": att,
            "step_time": round(stime, 6), "fraction_done": round(frac, 4), "iterations": len(rows),
            "s_per_iteration": round(elapsed / len(rows), 1) if rows else None, "solve_elapsed_min": round(elapsed / 60, 1)}
+    if restart:
+        out["timed_from"] = "the single-threaded restart"
+    cur = [r for r in rows if r[:3] == rows[-1][:3]] if rows else []
     if rows:
-        cur = [r for r in rows if r[:3] == rows[-1][:3]]
         out["iterations_this_attempt"] = len(cur)
-    if frac >= 0.01:
-        out["eta_min"] = round(elapsed * (1 - frac) / frac / 60, 1)
+    left = None
+    if rows and not modal:
+        try:
+            deck = static_increments(sta.with_suffix(".inp").read_text(errors="replace"))
+        except OSError:
+            deck = []
+        left = _iterations_left(text, deck, step, len(cur))
+    # the modal runs after the main run (assembly modal steps: a linear frequency run each, single-threaded): about
+    # MODAL_ITERATIONS iterations of the main run each, with a wide range
+    modal_left = 0 if modal else int((p or {}).get("modal_runs") or 0)
+    spi = elapsed / len(rows) if rows else None
+    if left is not None:
+        its_left, incs_left = left
+        m = sum(1 for r in _sta_rows(text) if r[4])           # converged increments: how much the mean is worth
+        u = 0.5 / max(m, 1) ** 0.5
+        mid = its_left * spi + modal_left * MODAL_ITERATIONS[1] * spi
+        lo = its_left * spi * (1 - u) + modal_left * MODAL_ITERATIONS[0] * spi
+        hi = its_left * spi * (1 + 2 * u) + modal_left * MODAL_ITERATIONS[2] * spi
+        out.update(iterations_left_est=its_left, increments_left_est=incs_left, eta_min=round(mid / 60, 1),
+                   eta_min_low=round(lo / 60, 1), eta_min_high=round(hi / 60, 1),
+                   eta_basis=f"{incs_left} increments left (growing as CalculiX grows them) x the mean iterations per "
+                             f"increment of {m} so far" + (f", then {modal_left} modal run(s)" if modal_left else ""))
+        done_its = len(rows)
+        out["fraction_done"] = round(done_its / max(done_its + its_left + modal_left * MODAL_ITERATIONS[1], 1), 4)
+        out["fraction_of_step_time"] = round(frac, 4)
+    elif frac >= 0.01:
+        mid = elapsed * (1 - frac) / frac
+        out.update(eta_min=round(mid / 60, 1), eta_min_low=round(mid * 0.3 / 60, 1), eta_min_high=round(mid / 60, 1),
+                   eta_basis="share of the step time done (no deck to count increments: an upper estimate)")
     else:
         out["note"] = "too early to tell from CalculiX's progress (under 1 % of its steps)"
+    return out
+
+
+MODAL_ITERATIONS = (1, 3, 10)   # a modal run's time in iterations of the main run: low, expected, high
+
+
+def _sta_rows(text: str) -> list[tuple]:
+    """(step, step time, increment size, iterations, converged) of each increment line of a .sta file."""
+    out = []
+    for line in text.splitlines():
+        tk = line.split()
+        if len(tk) >= 7 and tk[0].isdigit() and tk[1].isdigit():
+            try:
+                out.append((int(tk[0]), float(tk[5]), float(tk[6]), int(tk[3]), not tk[2].endswith("U")))
+            except ValueError:
+                continue
     return out
 
 
@@ -491,16 +624,43 @@ def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
            "eta_min": None if exp is None else round(exp / 60, 1), "eta_min_max": round(worst / 60, 1)}
     if rt is None:
         out["note"] = "no finished solves on this machine yet: eta_min is unknown until one finishes"
+    restart = None
+    if stage.startswith("solve"):   # a threaded CalculiX run that died and was restarted on one thread
+        from .runner import RESTART_FILE
+        try:
+            restart = json.loads((d / RESTART_FILE).read_text())
+        except (OSError, ValueError):
+            restart = None
+    if restart:
+        from .runner import crash_message
+        out["restarted"] = {k: restart.get(k) for k in ("solve", "threads", "crash", "out_of_memory", "peak_rss_mb",
+                                                       "limit_mb", "run_s", "s_per_iteration")}
+        out["restarted"]["at"] = _clock(float(restart.get("at", now)), now)
+        out["warning"] = (f"CalculiX {restart.get('message') or crash_message(restart)}, at {out['restarted']['at']}; "
+                          "the time left counts from the restart"
+                          + ("; for the threads next time, give the study more memory (run.mem)"
+                             if restart.get("out_of_memory") else ""))
+        # the restart has its own time limit: what is left of it, not of the first run
+        out["eta_min_max"] = round(max(out["eta_min_max"] * 60 + (float(restart.get("at", now)) - p.get("stage_started", now)),
+                                       0) / 60, 1)
     if stage.startswith("solve"):   # CalculiX's own progress beats the size-based estimate once it has some
         cx = ccx_progress(d, p, now)
         if cx:
             out["calculix"] = cx
+            if restart and restart.get("s_per_iteration") and cx.get("s_per_iteration"):
+                out["restarted"]["slower_than_before"] = round(cx["s_per_iteration"] / restart["s_per_iteration"], 2)
             if cx.get("eta_min") is not None:
                 out["eta_min"] = cx["eta_min"]
                 out["eta_from"] = "calculix progress"
-                if cx["eta_min"] > out["eta_min_max"]:
-                    out["warning"] = (f"at this pace CalculiX needs about {cx['eta_min']:.0f} min more, past its time "
-                                      f"limit ({out['eta_min_max']:.0f} min left): extend(request) or cancel")
+                lo, hi = cx.get("eta_min_low", cx["eta_min"]), cx.get("eta_min_high", cx["eta_min"])
+                out["eta_min_range"] = [lo, hi]
+                if lo > out["eta_min_max"]:   # even the low end of the range is past the limit
+                    w = (f"at this pace CalculiX needs {lo:.0f}-{hi:.0f} min more, past its time "
+                         f"limit ({out['eta_min_max']:.0f} min left): extend(request) or cancel")
+                    out["warning"] = f"{out['warning']}. {w}" if out.get("warning") else w
+                elif hi > out["eta_min_max"]:
+                    out["note"] = (f"CalculiX needs {lo:.0f}-{hi:.0f} min more and has {out['eta_min_max']:.0f} min "
+                                   "left: it may run past its limit; the range narrows as increments converge")
     return out
 
 

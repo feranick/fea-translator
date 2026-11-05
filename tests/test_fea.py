@@ -1,6 +1,6 @@
 """Tests: mesh handling, deck writing, result parsing and validation (pure Python); the benchmark
 studies with the reference solver (box parts); with Gmsh and CalculiX installed, every benchmark.
-Version: 2026.11.04.6
+Version: 2026.11.05.3
 """
 import os
 import shutil
@@ -520,7 +520,9 @@ def test_a_crashed_threaded_calculix_run_is_rerun_single_threaded(tmp_path, monk
     inp.write_text("*HEADING\n")
     runner.CRASHES.clear()
     runner.run_ccx(inp, 30)
-    assert runner.CRASHES == [{"solve": "m", "crash": "signal 11 (SIGSEGV)", "threads": 4, "after_rerun": "ok"}]
+    assert len(runner.CRASHES) == 1 and {k: runner.CRASHES[0][k] for k in ("solve", "crash", "threads", "after_rerun")} \
+        == {"solve": "m", "crash": "signal 11 (SIGSEGV)", "threads": 4, "after_rerun": "ok"}
+    assert not runner.CRASHES[0]["out_of_memory"] and runner.CRASHES[0]["message"].startswith("crashed (signal 11")
     (tmp_path / "m.dat").unlink()
     monkeypatch.setenv("ALWAYS_CRASH", "1")
     with pytest.raises(runner.SolverError) as e:

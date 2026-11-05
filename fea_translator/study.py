@@ -173,7 +173,9 @@ def study_format() -> dict:
                            "queue": "true: always a SLURM job; false: always local (with FEAT_EXECUTOR=slurm; "
                                     "otherwise studies estimated at FEAT_SLURM_MIN_MINUTES (1) or more go to SLURM)",
                            "run": "{timeout_s, mem ('12G'), procs, queue}: this study's solver time limit, SLURM memory, "
-                                  "threads and queue, overriding the machine's defaults within the caps in status",
+                                  "threads and queue, overriding the machine's defaults within the caps in status; "
+                                  "threads multiply the direct solver's memory: with a mem below feat's estimate for "
+                                  "the threads (validation's memory.estimate_gb) the study runs on 1 thread",
                            "mesh": "{size, order (1|2), refine: [{at, r, size}]}", "bcs": "list of boundary conditions",
                            "probes": "[{name, faces}]: mean and largest displacement (or temperature) there",
                            "stress_probes": "[{name, at, r}]: peak and mean von Mises within a sphere (a local peak)",
