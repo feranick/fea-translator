@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.05.3
+Version: 2026.11.07.1
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -1965,7 +1965,7 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
     watch = Watch(inp, plan)
     stopped = None
     try:
-        run_ccx(inp, timeout, monitor=watch)
+        run_ccx(inp, timeout, monitor=watch, nodes=n_nodes, method="direct")
     except (Stopped, subprocess.TimeoutExpired) as exc:
         sta = inp.with_suffix(".sta")
         done = completed_steps(sta.read_text(errors="replace")) if sta.is_file() else 0
@@ -2015,9 +2015,11 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
                     if inp.with_suffix(s).is_file()}
     res["deck"] = {"steps": len(plan["steps"]), "bolts": sum(len(b["bolts"]) for b in plan["bolts"]),
                    "gaskets": len(plan["gaskets"])}
-    from .runner import CRASHES, PEAK
+    from .runner import CRASHES, MEMORY_NOTES, PEAK
     if CRASHES:   # a threaded run that died (out of memory, a crash) and was rerun single-threaded
         res["solver_crashes"] = list(CRASHES)
+    if MEMORY_NOTES:   # threads cut to 1 for the meshed size, or a run that may not fit the job's memory
+        res["memory_notes"] = list(MEMORY_NOTES)
     if PEAK["rss_mb"]:
         res["seconds"]["ccx_peak_rss_mb"] = round(PEAK["rss_mb"], 1)
         res["seconds"]["ccx_threads"] = PEAK["threads"]

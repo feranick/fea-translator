@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.11.05.2
+Version: 2026.11.07.1
 """
 import json
 import os
@@ -133,7 +133,7 @@ def test_failure_states_from_sacct(slurm, monkeypatch, acct, state):
     r = _ended(slurm, sacct_state=acct, monkeypatch=monkeypatch)
     assert r["state"] == state, r
     if state == "out_of_memory":
-        assert "--mem" in r["why"]
+        assert "run.mem" in r["why"]
     if acct.startswith("CANCELLED"):
         assert "1000" in r["why"]
 

@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.05.3
+Version: 2026.11.07.1
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -59,6 +59,45 @@ PEAK = {"rss_mb": 0.0, "threads": 0, "last_rss_mb": 0.0}   # this process's Calc
 EIGEN = ("modal", "buckling")
 CRASHES: list[dict] = []   # threaded CalculiX runs that died without an error and were rerun single-threaded
 RESTART_FILE = "ccx_restart.json"   # in the study folder: a threaded run that died and was restarted on one thread
+MEMORY_FILE = "ccx_memory.json"     # in the study folder: the threads chosen for the meshed size and the job's memory
+MEMORY_NOTES: list[dict] = []       # this study's: threads cut to 1 for memory, or a run that may not fit
+RAW_ESTIMATE = {"nodes": None}      # the running study's node estimate before meshing (uncalibrated), for timing.jsonl
+
+
+def _own_rss_gb() -> float:
+    """This process's resident memory (GB): it shares the job's memory with CalculiX."""
+    try:
+        for ln in Path("/proc/self/status").read_text().splitlines():
+            if ln.startswith("VmRSS:"):
+                return int(ln.split()[1]) / 2 ** 20
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def threads_for_memory(nodes: int, method: str, threads: int, limit_mb: float | None) -> tuple[int, dict | None]:
+    """(threads, note) for a CalculiX run on the meshed `nodes`, from feat's memory model (executor.mem_gb) and the
+    memory the job has (less this process's own): 1 thread when the threads asked for would not fit; a note when even
+    that may not fit. The size estimate before meshing can be far off (carbonio job 5807, an S50 sleeve assembly:
+    107,171 nodes estimated, 424,303 meshed; 6 threads in 30 GB were killed after 7 min), the meshed count is not."""
+    if not limit_mb or nodes <= 0:
+        return threads, None
+    from .executor import ask_gb, mem_gb
+    avail = limit_mb / 1024 - _own_rss_gb() - 0.5
+    need = {t: mem_gb(nodes, method, t) for t in sorted({threads, 1})}
+    note = {"nodes": nodes, "threads_asked": threads, "limit_gb": round(limit_mb / 1024, 1),
+            "available_gb": round(avail, 1), "estimate_gb": {str(k): round(v, 1) for k, v in need.items()}}
+    use = threads
+    if threads > 1 and need[threads] > avail:
+        use = 1
+        note["message"] = (f"the meshed {nodes:,} nodes need about {need[threads]:.0f} GB with {threads} threads and "
+                           f"{need[1]:.0f} GB with 1; the job has {limit_mb / 1024:.0f} GB: CalculiX runs on 1 thread")
+    if need[1] > avail and use == 1:
+        note["message"] = (note.get("message", f"the meshed {nodes:,} nodes need about {need[1]:.0f} GB with 1 thread; "
+                                               f"the job has {limit_mb / 1024:.0f} GB")
+                           + f"; it may run out of memory: ask for {ask_gb(need[1])}G (run.mem)")
+    note["threads"] = use
+    return use, (note if "message" in note else None)
 
 
 def _cgroup_dirs() -> list[Path]:
@@ -263,9 +302,11 @@ def _wait_rss(p: subprocess.Popen, timeout: float, monitor=None) -> int:
         time.sleep(0.2)
 
 
-def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None) -> str:
+def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None, nodes: int | None = None,
+            method: str = "direct") -> str:
     """Runs ccx on the deck. serial: one thread (modal, buckling: the eigenvalues then do not depend on the
-    machine's load; with several threads, 1 in 4 concurrent runs of euler_column returned a wrong factor)."""
+    machine's load; with several threads, 1 in 4 concurrent runs of euler_column returned a wrong factor).
+    nodes (the meshed count) and method: the threads are cut to 1 when they would not fit the job's memory."""
     exe = find_ccx()
     if not exe:
         raise SolverError("CalculiX (ccx) not found: install it or set FEAT_CCX to its path (or use solver 'ref')")
@@ -282,6 +323,17 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None) -> st
     env["CCX_NPROC_STIFFNESS"] = "1"
     if serial:
         env["OMP_NUM_THREADS"] = env["CCX_NPROC_EQUATION_SOLVER"] = "1"
+    elif nodes:
+        t, note = threads_for_memory(nodes, method, int(env.get("OMP_NUM_THREADS") or 1), memory_limit_mb())
+        if note:
+            note["solve"] = inp.stem
+            MEMORY_NOTES.append(note)
+            try:   # said at once in the study's progress
+                (inp.parent / MEMORY_FILE).write_text(json.dumps(dict(note, at=time.time())))
+            except OSError:
+                pass
+        if t == 1:
+            env["OMP_NUM_THREADS"] = env["CCX_NPROC_EQUATION_SOLVER"] = "1"
     # CalculiX is OpenMP-parallel and its eigenvalue solver (ARPACK) calls BLAS inside it; a threaded
     # OpenBLAS called that way can return wrong results (OpenBLAS's own warning), most often when several
     # jobs run at once: the pump test got a buckling factor of 10.07 for 674.7. One BLAS thread per job.
@@ -294,6 +346,11 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None) -> st
     with open(log_path, "w") as fh:
         p = subprocess.Popen([exe, "-i", inp.stem], cwd=inp.parent, stdout=fh, stderr=subprocess.STDOUT, env=env,
                              start_new_session=True)   # its own process group: a cancel or timeout ends all of it
+        try:   # out of memory, the kernel kills CalculiX first, not feat (which then reports it and restarts)
+            with open(f"/proc/{p.pid}/oom_score_adj", "w") as fh_adj:
+                fh_adj.write("1000")
+        except OSError:
+            pass
         workers.track(p)   # a worker whose server dies takes its CalculiX run with it
         try:
             code = _wait_rss(p, timeout, monitor)    # waits with wait4, which also gives the child's peak memory
@@ -831,6 +888,22 @@ def stats_path() -> Path:
     return Path(os.environ.get("FEAT_OUT", "~/feat_runs")).expanduser() / "timing.jsonl"
 
 
+def _raw_estimate(folder: Path, study: dict) -> int | None:
+    """The study's node estimate before meshing, uncalibrated: its SLURM job's (job.json), else computed (the part
+    volumes are cached); None when unknown. timing.jsonl keeps it next to the meshed count (executor.node_factor)."""
+    try:
+        v = json.loads((Path(folder) / "job.json").read_text()).get("nodes_estimate_raw")
+        if v:
+            return int(v)
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        from .executor import estimate_nodes_raw
+        return estimate_nodes_raw(study)
+    except Exception:  # noqa: BLE001 (a record, not a result)
+        return None
+
+
 def _record_timing(study: dict, solver: str, minfo: dict, mesh_s: float, solve_s: float) -> None:
     try:
         p = stats_path()
@@ -839,7 +912,8 @@ def _record_timing(study: dict, solver: str, minfo: dict, mesh_s: float, solve_s
                "order": int(minfo.get("order", 2)), "mesh_s": round(mesh_s, 3), "solve_s": round(solve_s, 3),
                "t": round(time.time(), 1), "threads": PEAK["threads"] or None,
                "equation_solver": minfo.get("equation_solver"),
-               "rss_mb": round(PEAK["rss_mb"], 1) if PEAK["rss_mb"] else None}
+               "rss_mb": round(PEAK["rss_mb"], 1) if PEAK["rss_mb"] else None,
+               "nodes_estimate_raw": RAW_ESTIMATE["nodes"] if minfo.get("size_nominal") is None else None}
         with p.open("a") as fh:
             fh.write(json.dumps(rec) + "\n")
     except OSError:
@@ -901,7 +975,8 @@ def _solve(name: str, study: dict, mesh: Mesh, folder: Path, solver: str, timeou
         from . import refsolver
         refsolver.run(inp)
     else:
-        run_ccx(inp, timeout, serial=serial or study["analysis"] in EIGEN)
+        run_ccx(inp, timeout, serial=serial or study["analysis"] in EIGEN, nodes=len(mesh.nodes),
+                method=deck.equation_solver(study, len(mesh.nodes)))
     plan["equation_solver"] = deck.equation_solver(study, len(mesh.nodes))
     dat = results.parse_dat(inp.with_suffix(".dat").read_text())
     frd_path = inp.with_suffix(".frd")
@@ -930,6 +1005,7 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
     fine = size_factor != 1.0
     PEAK.update(rss_mb=0.0, threads=0)
     CRASHES.clear()
+    MEMORY_NOTES.clear()
     if study.get("analysis") in ("joint", "assembly"):   # several parts: contacts, gaskets, bolts, nuts (joint.py)
         from .joint import solve as solve_joint
         return solve_joint(name, study, folder, solver, timeout, progress)
@@ -1003,6 +1079,8 @@ def solve_once(name: str, study: dict, folder: Path, solver: str, timeout: float
         res["solver_reruns"] = reruns
     if CRASHES:
         res["solver_crashes"] = list(CRASHES)
+    if MEMORY_NOTES:
+        res["memory_notes"] = list(MEMORY_NOTES)
     t2 = time.perf_counter()
     minfo["equation_solver"] = deck.equation_solver(study, len(mesh.nodes))
     _record_timing(study, solver, minfo, t1 - t0, t2 - t1)
@@ -1096,10 +1174,12 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     prog = Progress(folder, study, solver, timeout)
-    try:
-        (folder / RESTART_FILE).unlink()   # an earlier run's restart is not this one's
-    except OSError:
-        pass
+    for f in (RESTART_FILE, MEMORY_FILE):   # an earlier run's are not this one's
+        try:
+            (folder / f).unlink()
+        except OSError:
+            pass
+    RAW_ESTIMATE["nodes"] = _raw_estimate(folder, study)
     CANCEL["file"] = folder / "cancel"
     EXTENDED["s"] = 0.0
     try:
@@ -1149,6 +1229,8 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
             warn.append(f"CalculiX's solve of {rr['solve']}: {msg}{again}"
                         + ("; for the threads, give the study more memory (run.mem; see memory.estimate_gb)"
                            if rr.get("out_of_memory") else ""))
+        for mn in res.get("memory_notes", []):
+            warn.append(f"CalculiX's solve of {mn['solve']}: {mn['message']}")
         for rr in res.get("solver_reruns", []):
             ok_ = rr["after_rerun"] <= rr["balance_error"] / 100 or rr["after_rerun"] < 1e-5
             warn.append(f"CalculiX's multithreaded solve of {rr['solve']} did not balance (error {rr['balance_error']:.2g}); "

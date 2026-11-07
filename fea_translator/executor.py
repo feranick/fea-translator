@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.05.3
+Version: 2026.11.07.1
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (1): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments, split as a shell
@@ -498,12 +498,54 @@ def _volume_of(part: dict) -> tuple[float, float, float] | None:
     return out
 
 
+_FACTORS: dict = {"key": None, "f": {}}
+
+
+def node_factor(analysis: str | None) -> float:
+    """How many more nodes this machine's meshes of an analysis had than estimated (the median of meshed /
+    raw estimate in timing.jsonl, its last 500 records); 1 without records, never below 1 (the estimate stays an
+    upper one where it was). carbonio job 5807: an S50 sleeve assembly estimated at 107,171 nodes had 424,303 (curved
+    faces, small features, fine parts), so its memory came out 6x low."""
+    from statistics import median
+    if not analysis:
+        return 1.0
+    try:
+        from .runner import stats_path
+        f = stats_path()
+        key = (str(f), f.stat().st_mtime)
+    except (OSError, ImportError):
+        return 1.0
+    if _FACTORS["key"] != key:
+        ratios: dict = {}
+        try:
+            for line in f.read_text().splitlines()[-500:]:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("nodes_estimate_raw") and r.get("nodes"):
+                    ratios.setdefault(r.get("analysis"), []).append(r["nodes"] / r["nodes_estimate_raw"])
+        except OSError:
+            pass
+        _FACTORS.update(key=key, f={a: min(max(median(v), 1.0), 20.0) for a, v in ratios.items()})
+    return _FACTORS["f"].get(analysis, 1.0)
+
+
 def estimate_nodes(study: dict) -> int | None:
-    """Nodes of a study's (first) mesh before meshing: exact for box parts, else an upper estimate from the
+    """Nodes of a study's (first) mesh before meshing: estimate_nodes_raw, times what this machine's meshes of the
+    same analysis had more (node_factor); exact for box parts (no factor)."""
+    n = estimate_nodes_raw(study)
+    if n is None or nodes_hint(study) is not None:
+        return n
+    return int(n * node_factor(study.get("analysis")))
+
+
+def estimate_nodes_raw(study: dict) -> int | None:
+    """Nodes of a study's (first) mesh before meshing: exact for box parts, else an estimate from the
     part's volume and the element size (plus the refinement spheres); None if it cannot be told."""
     jp = _joint_parts(study)
     if jp is not None:
-        return _sum(estimate_nodes(p) for p in jp)
+        return _sum(estimate_nodes_raw(p) for p in jp)
     n = nodes_hint(study)
     if n is not None:
         return n
@@ -617,12 +659,28 @@ def memory_plan(study: dict) -> dict:
     t = procs_for(study)
     have, src = given_mem_gb(study)
     est = {n: mem_need_gb(study, n) for n in sorted({asked, 1})}
+    n, raw = estimate_nodes(study), estimate_nodes_raw(study)
+    if nodes_hint(study) is not None:
+        basis = "an exact box mesh"
+    elif raw:
+        basis = (f"nodes estimated before meshing: {raw:,} from the volumes and element sizes"
+                 + (f", x{n / raw:.2f} from this machine's meshes of {study.get('analysis')}" if n and n > raw else
+                    " (meshes with curved faces and small features can have several times more)")
+                 + "; CalculiX's run checks the threads again on the meshed count")
+    else:
+        basis = None
     out = {"given_gb": None if have is None else round(have, 1), "given_from": src or None, "threads_asked": asked,
-           "threads": t, "estimate_gb": {str(k): (None if v is None else round(v, 1)) for k, v in est.items()}}
+           "threads": t, "estimate_gb": {str(k): (None if v is None else round(v, 1)) for k, v in est.items()},
+           "nodes_estimate": n, "estimate_basis": basis}
     note = memory_note(have, src, asked, t, est)
     if note:
         out["note"] = note
     return out
+
+
+def ask_gb(need: float) -> int:
+    """The memory to ask for (GB) when CalculiX needs `need`: 1 GB more for feat itself, which shares the job."""
+    return int(math.ceil(need + 1))
 
 
 def memory_note(have, src, asked, t, est) -> str | None:
@@ -633,12 +691,12 @@ def memory_note(have, src, asked, t, est) -> str | None:
     if asked > 1 and t == 1 and many is not None:
         fits = (f"1 thread fits in {have:.0f} GB" if one is not None and one <= have else
                 f"even 1 thread needs about {one:.0f} GB")
-        return (f"{src} is below the {many:.0f} GB estimate for {asked} threads: give {math.ceil(many)}G for the "
+        return (f"{src} is below the {many:.0f} GB estimate for {asked} threads: give {ask_gb(many)}G for the "
                 f"threads, or {fits} (feat runs it on 1 thread and asks SLURM for 1 CPU)")
     need = est.get(t)
     if need is not None and need > have:
         return (f"{src} is below the {need:.0f} GB estimate for {t} thread(s): CalculiX may run out of memory; "
-                f"give {math.ceil(need)}G or use a coarser mesh")
+                f"give {ask_gb(need)}G or use a coarser mesh")
     return None
 
 
@@ -755,6 +813,7 @@ def submit(request: Path, name: str, study: dict) -> dict:
     n = estimate_nodes(study)
     info = {"executor": "slurm", "job_id": job_id, "submitted": round(time.time(), 1), "procs": procs_for(study),
             "time_min": time_limit_min(study), "mem": mem_for(study), "nodelist": node_pin()[1], "nodes_estimate": n,
+            "nodes_estimate_raw": estimate_nodes_raw(study),
             "equation_solver": method_of(study, n) if n else None, "run": run_of(study), "command": cmd}
     try:
         info["memory"] = memory_plan(study)
@@ -861,6 +920,28 @@ def _tail(path: Path, n: int = 30) -> str:
         return ""
 
 
+def oom_advice(folder: Path) -> str:
+    """Why and what to ask for when SLURM killed a study's job for memory (the whole batch step, feat with it: no
+    result): the job's memory and threads (job.json), feat's estimate for the meshed nodes (progress.json)."""
+    try:
+        job = json.loads((folder / "job.json").read_text())
+    except (OSError, ValueError):
+        job = {}
+    try:
+        nodes = int(json.loads((folder / "progress.json").read_text()).get("nodes") or 0)
+    except (OSError, ValueError, TypeError):
+        nodes = 0
+    t, mem = int(job.get("procs") or 1), job.get("mem")
+    head = "SLURM killed the job for memory" + (f" ({mem} with {t} thread{'s' if t > 1 else ''})" if mem else "")
+    if not nodes:
+        return head + ", before meshing finished: give the study more memory (run.mem) or coarsen the mesh"
+    many, one = mem_gb(nodes, "direct", t), mem_gb(nodes, "direct", 1)
+    ask = (f"run.mem {ask_gb(many)}G for {t} threads, or run.procs 1 with run.mem {ask_gb(one)}G" if t > 1 else
+           f"run.mem {ask_gb(one)}G")
+    return (f"{head}; for the meshed {nodes:,} nodes feat estimates about {many:.0f} GB with {t} thread(s)"
+            + (f" and {one:.0f} GB with 1" if t > 1 else "") + f": {ask} (or a coarser mesh)")
+
+
 def ended_state(acct: str | None, log: Path) -> tuple[str, str]:
     """(state, why) of a job that left the queue without writing a result."""
     a = (acct or "").upper()
@@ -868,8 +949,8 @@ def ended_state(acct: str | None, log: Path) -> tuple[str, str]:
     if a.startswith("TIMEOUT") or (not a and "DUE TO TIME LIMIT" in tail):
         return "timed_out", ("SLURM's time limit stopped it before feat's own timeout: raise FEAT_TIMEOUT "
                              "(it also sets the job's limit) or coarsen the mesh / drop converge")
-    if a.startswith("OUT_OF_MEMORY") or (not a and ("oom-kill" in tail.lower() or "out of memory" in tail.lower())):
-        return "out_of_memory", "add --mem=... to FEAT_SLURM_ARGS, or coarsen the mesh"
+    if a.startswith("OUT_OF_MEMORY") or re.search(r"oom[-_ ]kill|out of memory", tail, re.I):
+        return "out_of_memory", oom_advice(Path(log).parent)
     if a.startswith("CANCELLED") or (not a and "CANCELLED" in tail):
         who = acct.split("by", 1)[1].strip() if acct and "by" in acct else None
         return "cancelled", "cancelled" + (f" by {who}" if who else "") + " (scancel or cancel())"

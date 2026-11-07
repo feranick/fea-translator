@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.05.3
+Version: 2026.11.07.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -643,6 +643,14 @@ def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
         # the restart has its own time limit: what is left of it, not of the first run
         out["eta_min_max"] = round(max(out["eta_min_max"] * 60 + (float(restart.get("at", now)) - p.get("stage_started", now)),
                                        0) / 60, 1)
+    if stage.startswith("solve"):   # threads cut to 1 for the meshed size, or a run that may not fit its memory
+        from .runner import MEMORY_FILE
+        try:
+            mn = json.loads((d / MEMORY_FILE).read_text())
+            out["memory"] = {k: mn.get(k) for k in ("nodes", "threads_asked", "threads", "limit_gb", "estimate_gb")}
+            out["warning"] = f"{out['warning']}. {mn['message']}" if out.get("warning") else mn["message"]
+        except (OSError, ValueError, KeyError):
+            pass
     if stage.startswith("solve"):   # CalculiX's own progress beats the size-based estimate once it has some
         cx = ccx_progress(d, p, now)
         if cx:

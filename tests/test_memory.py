@@ -2,7 +2,7 @@
 carbonio job 5797 (an S50 sleeve assembly, 2026.11.05): 6 threads in a 32 GB job were killed at 33.4 GB after 53 min
 (feat's estimate was 62 GB for 6 threads, 31 GB for 1); feat took it for a crash and restarted it on 1 thread without
 saying so, and the step-time share then said 160 h for about 11 h.
-Version: 2026.11.05.3
+Version: 2026.11.07.1
 """
 import json
 import time
@@ -97,7 +97,7 @@ def test_threads_sized_to_memory(machine, tmp_path):
     assert executor.procs_for(small) == 1                         # 12 GB: 1 thread from the start, 1 CPU from SLURM
     assert "--cpus-per-task=1" in executor.job_script(tmp_path, "x", small)
     note = executor.memory_plan(small)["note"]
-    assert note.startswith(f"run.mem 12G is below the {many:.0f} GB estimate for 6 threads: give {int(-(-many // 1))}G")
+    assert note.startswith(f"run.mem 12G is below the {many:.0f} GB estimate for 6 threads: give {executor.ask_gb(many)}G")
     assert "1 thread fits in 12 GB" in note
     assert executor.procs_for(dict(BOX, run={"mem": "32G"})) == 6
     tiny = executor.memory_plan(dict(BOX, run={"mem": "8G"}))
@@ -174,3 +174,62 @@ def test_time_left_job_419_with_its_deck(tmp_path):
 def test_crash_message():
     m = runner.crash_message({"threads": 2, "crash": "signal 11 (SIGSEGV)", "run_s": 600})
     assert m.startswith("crashed (signal 11 (SIGSEGV), no error message) with 2 threads after 10 min; rerunning on 1")
+
+
+# ---- 2026.11.06.1: carbonio job 5807 (run.procs 6, run.mem 30G): 107,171 nodes estimated, 424,303 meshed; SLURM
+# killed the whole batch step 7 min in ('2 oom_kill events in StepId=5807.batch'): no restart, no result
+
+def test_threads_from_the_meshed_count(monkeypatch):
+    monkeypatch.setattr(runner, "_own_rss_gb", lambda: 0.0)
+    t, note = runner.threads_for_memory(424303, "direct", 6, 30 * 1024.0)
+    assert t == 1 and note["estimate_gb"] == {"1": 31.6, "6": 62.2} and note["threads"] == 1
+    assert note["message"].startswith("the meshed 424,303 nodes need about 62 GB with 6 threads and 32 GB with 1; "
+                                      "the job has 30 GB: CalculiX runs on 1 thread; it may run out of memory: ask for 33G")
+    assert runner.threads_for_memory(424303, "direct", 6, 64 * 1024.0) == (6, None)
+    assert runner.threads_for_memory(424303, "direct", 6, None) == (6, None)
+
+
+def test_run_ccx_cuts_threads_for_the_meshed_size(tmp_path, monkeypatch):
+    exe = tmp_path / "fake_ccx"
+    exe.write_text('#!/bin/sh\necho "$OMP_NUM_THREADS $CCX_NPROC_EQUATION_SOLVER" > $2.dat\n')
+    exe.chmod(0o755)
+    monkeypatch.setenv("FEAT_CCX", str(exe))
+    monkeypatch.setenv("OMP_NUM_THREADS", "6")
+    monkeypatch.setenv("CCX_NPROC_EQUATION_SOLVER", "6")
+    monkeypatch.setattr(runner, "memory_limit_mb", lambda: 30 * 1024.0)
+    monkeypatch.setattr(runner, "_own_rss_gb", lambda: 0.0)
+    runner.MEMORY_NOTES.clear()
+    inp = tmp_path / "a.inp"
+    inp.write_text("")
+    runner.run_ccx(inp, 20, nodes=424303)
+    assert (tmp_path / "a.dat").read_text().split() == ["1", "1"]
+    assert runner.MEMORY_NOTES[-1]["solve"] == "a" and json.loads((tmp_path / runner.MEMORY_FILE).read_text())["threads"] == 1
+    runner.run_ccx(inp, 20, nodes=20000)                       # a small mesh keeps its threads
+    assert (tmp_path / "a.dat").read_text().split() == ["6", "6"]
+
+
+def test_slurm_oom_of_the_batch_step(tmp_path):
+    d = tmp_path / "s"
+    d.mkdir()
+    (d / "job.json").write_text(json.dumps({"procs": 6, "mem": "30G"}))
+    (d / "progress.json").write_text(json.dumps({"stage": "solve", "nodes": 424303}))
+    (d / "job.log").write_text("[2026-11-06T12:49:50.382] error: Detected 2 oom_kill events in StepId=5807.batch. "
+                               "Some of the step tasks have been OOM Killed.\n")
+    state, why = executor.ended_state(None, d / "job.log")
+    assert state == "out_of_memory"
+    assert why == ("SLURM killed the job for memory (30G with 6 threads); for the meshed 424,303 nodes feat estimates "
+                   "about 62 GB with 6 thread(s) and 32 GB with 1: run.mem 64G for 6 threads, or run.procs 1 with "
+                   "run.mem 33G (or a coarser mesh)")
+
+
+def test_node_estimate_calibrated_by_this_machines_meshes(tmp_path, monkeypatch):
+    monkeypatch.setenv("FEAT_OUT", str(tmp_path))
+    monkeypatch.setattr(executor, "estimate_nodes_raw", lambda st: 107171)
+    monkeypatch.setattr(executor, "nodes_hint", lambda st: None)
+    st = {"analysis": "assembly"}
+    assert executor.estimate_nodes(st) == 107171                     # no records: as estimated
+    recs = [{"analysis": "assembly", "nodes": 424303, "nodes_estimate_raw": 107171},
+            {"analysis": "static", "nodes": 1000, "nodes_estimate_raw": 4000}]   # a smaller mesh never lowers it
+    (tmp_path / "timing.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
+    assert executor.estimate_nodes(st) == pytest.approx(424303, abs=2)
+    assert executor.estimate_nodes({"analysis": "static"}) == 107171
