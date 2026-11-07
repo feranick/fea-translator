@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.11.07.1
+Version: 2026.11.07.2
 """
 import json
 import os
@@ -299,7 +299,8 @@ def test_run_settings_validation_and_caps(slurm, monkeypatch):
     assert "disagrees with queue" in errs(queue=False, run={"queue": True})
     assert "run.timeout_s" in errs(run={"timeout_s": -1}) and "run: an object" in errs(run=5)
     st = api.study_format()["status"]["executor"]
-    assert st["caps"] == {"timeout_s": 3600.0, "mem": "32G", "procs": 8} and st["timeout_s"] == 900.0
+    assert st["caps"] == {"timeout_s": 3600.0, "mem": "32G", "procs": 8, "mem_from": "FEAT_MAX_MEM", "mem_mb": 32768} \
+        and st["timeout_s"] == 900.0
 
 
 def test_run_by_hand_and_local_pool_record_limits(slurm, monkeypatch, tmp_path):

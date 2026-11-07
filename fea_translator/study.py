@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.11.04.8
+Version: 2026.11.07.2
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -276,7 +276,8 @@ RUN_KEYS = ("timeout_s", "mem", "procs", "queue")
 
 def _run_errors(st: dict) -> list[str]:
     """The study's "run" settings (docs/EXECUTION.md, 'Per-study run settings') and the machine's caps
-    FEAT_MAX_TIMEOUT, FEAT_MAX_MEM, FEAT_MAX_PROCS (unset: no limit; FEAT_MAX_PROCS bounds the top-level procs too)."""
+    FEAT_MAX_TIMEOUT, FEAT_MAX_MEM, FEAT_MAX_PROCS (unset: no limit; FEAT_MAX_PROCS bounds the top-level procs too),
+    and with SLURM the memory of a node (executor.caps)."""
     from . import executor
 
     errs, cap = [], executor.caps()
@@ -300,7 +301,9 @@ def _run_errors(st: dict) -> list[str]:
         if not mb:
             errs.append(f"run.mem: {r['mem']!r} is not a SLURM memory size such as '500M' or '12G'")
         elif "mem" in cap and executor.mem_mb(cap["mem"]) and mb > executor.mem_mb(cap["mem"]):
-            errs.append(f"run.mem: {r['mem']} is above FEAT_MAX_MEM={cap['mem']}")
+            errs.append(f"run.mem: {r['mem']} is above {cap['mem']}, the most on this machine "
+                        f"({cap.get('mem_from', 'FEAT_MAX_MEM')}); choose a machine with more (machines(): "
+                        "executor.caps.mem) or ask for less")
     if "procs" in r:
         p = r["procs"]
         if not _num(p) or int(p) != p or p < 1:

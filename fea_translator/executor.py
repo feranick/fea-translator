@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.07.1
+Version: 2026.11.07.2
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (1): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments, split as a shell
@@ -88,13 +88,48 @@ def mem_mb(v) -> float | None:
 
 
 def caps() -> dict:
-    """Ceilings on what a study may ask (config/env): FEAT_MAX_TIMEOUT (s), FEAT_MAX_MEM, FEAT_MAX_PROCS."""
+    """Ceilings on what a study may ask: FEAT_MAX_TIMEOUT (s), FEAT_MAX_MEM, FEAT_MAX_PROCS (config/env), and with
+    SLURM the memory of the node jobs go to (job_mem_mb), when it is lower or no FEAT_MAX_MEM is set; mem_mb (MB) and
+    mem_from say how much and why (the router leaves out machines below a study's run.mem). Before 2026.11.07.2 the
+    node's memory was used only to size feat's own requests: a run.mem above it failed at submission."""
     out = {}
     for key, var in (("timeout_s", "FEAT_MAX_TIMEOUT"), ("mem", "FEAT_MAX_MEM"), ("procs", "FEAT_MAX_PROCS")):
         v = os.environ.get(var, "").strip()
         if v:
             out[key] = v if key == "mem" else (float(v) if key == "timeout_s" else int(float(v)))
+    if out.get("mem"):
+        out["mem_from"] = "FEAT_MAX_MEM"
+    nm = job_mem_mb()
+    if nm and (not out.get("mem") or (mem_mb(out["mem"]) or 0) > nm):
+        out["mem"] = f"{int(nm // 1024)}G" if nm >= 1024 else f"{int(nm)}M"
+        out["mem_from"] = "a node's memory (SLURM RealMemory)"
+    if out.get("mem") and mem_mb(out["mem"]):
+        out["mem_mb"] = int(mem_mb(out["mem"]))
     return out
+
+
+def job_mem_mb() -> float | None:
+    """The most memory one of this translator's jobs can ask for (MB): the RealMemory of the node its jobs are pinned
+    to (FEAT_SLURM_NODE, FEAT_SLURM_ARGS --nodelist), else the largest among the cluster's nodes; None without SLURM
+    or when SLURM does not know it (unset nodes report 1 MB)."""
+    if kind() != "slurm":
+        return None
+    nodes = cluster_nodes() or []
+    try:
+        pin = node_pin()[1]
+    except Exception:  # noqa: BLE001
+        pin = None
+    mem = {}
+    for n in nodes:
+        try:
+            v = float(n.get("RealMemory") or 0)
+        except ValueError:
+            continue
+        if v > 1:
+            mem[n.get("NodeName")] = v
+    if pin and pin in mem:
+        return mem[pin]
+    return max(mem.values()) if mem else None
 
 
 def procs_of(study: dict) -> int:
@@ -595,15 +630,6 @@ def _threads_by_size(study: dict) -> int:
     return max(1, min(procs, int(math.ceil(max(direct) / NODES_PER_THREAD))))
 
 
-def node_mem_gb() -> float | None:
-    """This node's memory for jobs (SLURM's RealMemory, MB), in GB; None when SLURM does not say."""
-    me = this_node(cluster_nodes())
-    try:
-        return float(me["RealMemory"]) / 1024 if me and me.get("RealMemory") else None
-    except (TypeError, ValueError):
-        return None
-
-
 def given_mem_gb(study: dict) -> tuple[float | None, str]:
     """(GB, where from) of the memory a study's CalculiX run gets when that is fixed: run.mem, a size in FEAT_SLURM_MEM
     or FEAT_SLURM_ARGS's --mem; with FEAT_SLURM_MEM=auto, what the machine allows (FEAT_MAX_MEM, the node's
@@ -622,11 +648,10 @@ def given_mem_gb(study: dict) -> tuple[float | None, str]:
         mb = mem_mb(v)
         if mb:
             return mb / 1024, f"FEAT_SLURM_MEM={v}"
-    lims = [(mem_mb(caps()["mem"]) / 1024, f"FEAT_MAX_MEM={caps()['mem']}")] if mem_mb(caps().get("mem", "")) else []
-    nm = node_mem_gb()
-    if nm:
-        lims.append((nm, "this node's memory"))
-    return min(lims) if lims else (None, "")
+    c = caps()   # FEAT_MAX_MEM, or the node's memory when lower
+    if mem_mb(c.get("mem", "")):
+        return mem_mb(c["mem"]) / 1024, f"{c.get('mem_from', 'FEAT_MAX_MEM')} {c['mem']}"
+    return None, ""
 
 
 def mem_need_gb(study: dict, threads: int) -> float | None:

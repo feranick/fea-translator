@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.11.05.2
+Version: 2026.11.07.2
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -239,7 +239,7 @@ def validate_studies(studies: dict) -> dict:
 
 @server.tool()
 @_tool
-def run_studies(studies: dict, solver: str = "auto", wait_s: float = 45) -> dict:
+def run_studies(studies: dict, solver: str = "auto", wait_s: float = 45, request_name: str | None = None) -> dict:
     """Meshes, solves and checks each study. Per study: results (max displacement, von Mises peaks
     with and without the support/load regions, safety factors, reactions, frequencies, buckling
     factors, temperatures, heat flows, probes), what each face selector matched, checks against
@@ -249,8 +249,10 @@ def run_studies(studies: dict, solver: str = "auto", wait_s: float = 45) -> dict
     latest_finish); 'next' says whether to collect them with study_status soon or to tell the user
     when to come back (runs over about 5 min). Fine meshes and converge: true can take minutes.
     With FEAT_EXECUTOR=slurm, long studies (and those with "queue": true) are SLURM jobs: their
-    progress has 'state' (queued, running) and 'job_id'; they keep running without this conversation."""
-    return api.run(studies, solver, wait=min(max(float(wait_s), 0.0), 50.0))
+    progress has 'state' (queued, running) and 'job_id'; they keep running without this conversation.
+    request_name ('run_<id>', optional): the request folder's name, so a caller knows the request path before the
+    answer; repeating it returns that request's status (no second submission)."""
+    return api.run(studies, solver, wait=min(max(float(wait_s), 0.0), 50.0), request_name=request_name)
 
 
 @server.tool()

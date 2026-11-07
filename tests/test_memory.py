@@ -2,7 +2,7 @@
 carbonio job 5797 (an S50 sleeve assembly, 2026.11.05): 6 threads in a 32 GB job were killed at 33.4 GB after 53 min
 (feat's estimate was 62 GB for 6 threads, 31 GB for 1); feat took it for a crash and restarted it on 1 thread without
 saying so, and the step-time share then said 160 h for about 11 h.
-Version: 2026.11.07.1
+Version: 2026.11.07.2
 """
 import json
 import time
@@ -233,3 +233,39 @@ def test_node_estimate_calibrated_by_this_machines_meshes(tmp_path, monkeypatch)
     (tmp_path / "timing.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
     assert executor.estimate_nodes(st) == pytest.approx(424303, abs=2)
     assert executor.estimate_nodes({"analysis": "static"}) == 107171
+
+
+# ---- 2026.11.07.2: the node's memory is a cap (reported, enforced); request_name
+
+def test_node_memory_is_a_cap(monkeypatch):
+    from fea_translator.study import validate_study
+    monkeypatch.setenv("FEAT_EXECUTOR", "slurm")
+    for v in ("FEAT_MAX_MEM", "FEAT_SLURM_ARGS", "FEAT_SLURM_NODE"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setattr(executor, "cluster_nodes", lambda: [{"NodeName": "carbonio", "RealMemory": "64000"},
+                                                              {"NodeName": "x", "RealMemory": "1"}])
+    monkeypatch.setattr(executor, "this_node", lambda nodes: nodes[0] if nodes else None)
+    c = executor.caps()
+    assert c["mem"] == "62G" and c["mem_mb"] == 63488 and c["mem_from"] == "a node's memory (SLURM RealMemory)"
+    errs = " | ".join(validate_study(dict(BOX, run={"mem": "90G"}))["errors"])
+    assert "run.mem: 90G is above 62G, the most on this machine (a node's memory (SLURM RealMemory))" in errs
+    assert validate_study(dict(BOX, run={"mem": "60G"}))["ok"]
+    monkeypatch.setenv("FEAT_MAX_MEM", "32G")                 # a lower setting stays, and says so
+    c = executor.caps()
+    assert c["mem"] == "32G" and c["mem_mb"] == 32768 and c["mem_from"] == "FEAT_MAX_MEM"
+    monkeypatch.setenv("FEAT_EXECUTOR", "local")              # no SLURM: only the settings
+    monkeypatch.delenv("FEAT_MAX_MEM")
+    assert "mem" not in executor.caps()
+
+
+def test_request_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("FEAT_OUT", str(tmp_path))
+    monkeypatch.setenv("FEAT_EXECUTOR", "local")
+    bad = {"s": {"analysis": "static"}}                         # invalid: answered at once, nothing runs
+    r = api.run(bad, "ref", wait=1, request_name="run_router_abc123")
+    assert r["request"] == str(tmp_path / "run_router_abc123") and r["done"]
+    again = api.run(bad, "ref", wait=1, request_name="run_router_abc123")
+    assert again["request"] == r["request"] and "submitted before" in again["note"]
+    assert "error" in api.run(bad, "ref", wait=1, request_name="../x")
+    (tmp_path / "run_half").mkdir()
+    assert "holds no request" in api.run(bad, "ref", wait=1, request_name="run_half")["error"]

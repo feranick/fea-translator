@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.07.1
+Version: 2026.11.07.2
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -33,6 +33,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -753,9 +754,17 @@ def _timing(folder: Path, progress: dict) -> tuple[dict, str]:
     return t, nxt
 
 
-def start(studies: dict, solver: str | None = None, prefix: str = "run") -> Path:
-    """Validates and starts the studies in the background; returns the request folder."""
-    folder = _request_dir(prefix)
+REQUEST_NAME = re.compile(r"^run_[A-Za-z0-9_.-]{1,80}$")
+
+
+def start(studies: dict, solver: str | None = None, prefix: str = "run", request_name: str | None = None) -> Path:
+    """Validates and starts the studies in the background; returns the request folder (request_name: its name,
+    chosen by the caller)."""
+    if request_name:
+        folder = out_root() / request_name
+        folder.mkdir(parents=True, exist_ok=False)
+    else:
+        folder = _request_dir(prefix)
     (folder / "studies.json").write_text(json.dumps(studies, indent=1))
     s = _solver(solver)
     invalid, jobs = {}, []
@@ -826,13 +835,28 @@ def _until(wait: float) -> float:
     return t if left is None else min(t, time.time() + left - 3.0)
 
 
-def run(studies: dict, solver: str | None = None, wait: float | None = None) -> dict:
+def run(studies: dict, solver: str | None = None, wait: float | None = None, request_name: str | None = None) -> dict:
     """Runs the studies into a new request folder under FEAT_OUT: per study <name>/<name>.inp,
     .dat, .frd (CalculiX), mesh.msh, part.step, <name>.json; and studies.json, results.json.
     Waits for all of them (wait None) or at most `wait` seconds; then the unfinished ones are
-    listed as pending and status(request) collects them later."""
-    folder = start(studies, solver)
-    return status(str(folder), 1e9 if wait is None else wait)
+    listed as pending and status(request) collects them later.
+    request_name ('run_<anything>'): the folder's name, chosen by the caller (the router) so that it knows the request
+    path even when the answer does not reach it in time; a call repeating a name that exists returns that request's
+    status instead of submitting again (a retry after a time-out cannot run the studies twice)."""
+    t0 = time.time()
+    if request_name is not None:
+        if not isinstance(request_name, str) or not REQUEST_NAME.match(request_name):
+            return {"error": "request_name: 'run_' followed by letters, digits, _ . - (up to 80)"}
+        if (out_root() / request_name / "request.json").is_file():
+            res = status(str(out_root() / request_name), 0.0 if wait is None else min(wait, 15.0))
+            return dict(res, note="this request_name was submitted before: its status, nothing submitted again")
+        if (out_root() / request_name).exists():
+            return {"error": f"request_name {request_name!r}: the folder exists but holds no request (still being "
+                             "submitted by an earlier call? call again in a few seconds)",
+                    "request": str(out_root() / request_name)}
+    folder = start(studies, solver, request_name=request_name)
+    # the wait counts from the call's start: building goals and submitting can take a while on a busy machine
+    return status(str(folder), 1e9 if wait is None else max(0.0, wait - (time.time() - t0)))
 
 
 def jobs(limit: int = 20, active: bool = False) -> dict:
