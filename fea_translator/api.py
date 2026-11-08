@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.07.2
+Version: 2026.11.08.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -634,13 +634,14 @@ def _progress(d: Path, study: dict, solver: str, timeout: float) -> dict:
             restart = None
     if restart:
         from .runner import crash_message
-        out["restarted"] = {k: restart.get(k) for k in ("solve", "threads", "crash", "out_of_memory", "peak_rss_mb",
-                                                       "limit_mb", "run_s", "s_per_iteration")}
+        out["restarted"] = {k: restart.get(k) for k in ("solve", "threads", "crash", "out_of_memory", "oom_scope",
+                                                       "peak_rss_mb", "limit_mb", "node_total_mb", "node_min_free_mb",
+                                                       "run_s", "s_per_iteration")}
         out["restarted"]["at"] = _clock(float(restart.get("at", now)), now)
         out["warning"] = (f"CalculiX {restart.get('message') or crash_message(restart)}, at {out['restarted']['at']}; "
                           "the time left counts from the restart"
                           + ("; for the threads next time, give the study more memory (run.mem)"
-                             if restart.get("out_of_memory") else ""))
+                             if restart.get("out_of_memory") and restart.get("oom_scope") != "node" else ""))
         # the restart has its own time limit: what is left of it, not of the first run
         out["eta_min_max"] = round(max(out["eta_min_max"] * 60 + (float(restart.get("at", now)) - p.get("stage_started", now)),
                                        0) / 60, 1)

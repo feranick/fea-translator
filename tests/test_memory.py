@@ -2,7 +2,7 @@
 carbonio job 5797 (an S50 sleeve assembly, 2026.11.05): 6 threads in a 32 GB job were killed at 33.4 GB after 53 min
 (feat's estimate was 62 GB for 6 threads, 31 GB for 1); feat took it for a crash and restarted it on 1 thread without
 saying so, and the step-time share then said 160 h for about 11 h.
-Version: 2026.11.07.2
+Version: 2026.11.08.1
 """
 import json
 import time
@@ -30,7 +30,7 @@ def fake_ccx(tmp_path, monkeypatch):
     exe.write_text(FAKE)
     exe.chmod(0o755)
     monkeypatch.setenv("FEAT_CCX", str(exe))
-    kills = {"n": 0}
+    kills = {"n": 0, "hits": 0, "job": True}   # job: the job's limit was reached (else the node ran out)
 
     def oom_kills():   # the cgroup's counter goes up by one each time CalculiX is killed
         return {"memory.events": kills["n"]}
@@ -39,9 +39,14 @@ def fake_ccx(tmp_path, monkeypatch):
         code = real_wait(*a, **k)
         if code == -9:
             kills["n"] += 1
+            kills["hits"] += 1 if kills["job"] else 0
         return code
     real_wait = runner._wait_rss
     monkeypatch.setattr(runner, "oom_kills", oom_kills)
+    monkeypatch.setattr(runner, "oom_limit_hits", lambda: {"cg": kills["hits"]})
+    monkeypatch.setattr(runner, "kernel_oom_constraint", lambda pid, since: None)
+    monkeypatch.setattr(runner, "node_jobs_text", lambda: "")
+    monkeypatch.setattr(runner, "KILLS", kills, raising=False)
     monkeypatch.setattr(runner, "_wait_rss", waited)
     monkeypatch.setattr(runner, "memory_limit_mb", lambda: 32768.0)
     runner.CRASHES.clear()
@@ -269,3 +274,60 @@ def test_request_name(tmp_path, monkeypatch):
     assert "error" in api.run(bad, "ref", wait=1, request_name="../x")
     (tmp_path / "run_half").mkdir()
     assert "holds no request" in api.run(bad, "ref", wait=1, request_name="run_half")["error"]
+
+
+
+# ---- 2026.11.08.1: the node ran out, not the job (carbonio, 2026.11.07: killed at 20.1 and 13.9 GB in 34 GB jobs)
+
+def test_oom_scope():
+    sc = runner.oom_scope
+    # the job's limit: a kill with a 'limit reached' count
+    assert sc({"k": 0}, {"k": 1}, {"c": 0}, {"c": 1}, -9, 33000, 34816, 20000, 64000) == "job"
+    # the node: a kill without one, far below the limit
+    assert sc({"k": 0}, {"k": 1}, {"c": 0}, {"c": 0}, -9, 14234, 34816, 300, 64000) == "node"
+    # the kernel's word wins
+    assert sc({}, {}, {}, {}, -9, 14234, 34816, None, None, kernel="CONSTRAINT_NONE") == "node"
+    assert sc({}, {}, {}, {}, -9, 14234, 34816, None, None, kernel="CONSTRAINT_MEMCG") == "job"
+    # cgroup v1 (no 'limit reached' count): the sizes decide
+    assert sc({"k": 0}, {"k": 1}, {}, {}, -9, 14234, 34816, 300, 64000) == "node"
+    assert sc({"k": 0}, {"k": 1}, {}, {}, -9, 33000, 34816, 300, 64000) == "job"
+    # no counters at all: SIGKILL near the limit, or with the node out of memory
+    assert sc({}, {}, {}, {}, -9, 33000, 34816, None, None) == "job"
+    assert sc({}, {}, {}, {}, -9, 14234, 34816, 500, 64000) == "node"
+    assert sc({}, {}, {}, {}, -9, 14234, 34816, 30000, 64000) is None     # a plain kill
+    assert sc({}, {}, {}, {}, -11, 14234, 34816, 500, 64000) is None      # a crash
+    assert sc({"k": 0}, {"k": 1}, {"c": 0}, {"c": 1}, 0, 1, 1, 1, 1) is None
+
+
+def test_node_out_of_memory_is_not_a_memory_request(fake_ccx, monkeypatch):
+    runner.KILLS["job"] = False
+    monkeypatch.setattr(runner, "meminfo_mb", lambda: (64000.0, 300.0))
+    monkeypatch.setattr(runner, "node_jobs_text", lambda: "; running on carbonio now: 5811 (feat:..., 34G), 5812 (x, 40G)")
+    monkeypatch.setenv("OMP_NUM_THREADS", "6")
+    monkeypatch.setenv("CCX_NPROC_EQUATION_SOLVER", "6")
+    runner.run_ccx(fake_ccx, 20)                                # threaded: restarted on 1 thread, said so
+    rec = runner.CRASHES[-1]
+    assert rec["oom_scope"] == "node" and rec["node_min_free_mb"] == 300.0 and rec["node_total_mb"] == 64000.0
+    assert rec["message"].startswith("the node ran out of memory (other processes): killed at ")
+    assert "below the job's 32.0 GB; the node's free memory fell to 0.3 GB of 62.5 GB; running on carbonio" in rec["message"]
+    assert "more run.mem will not help" in rec["message"]
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    monkeypatch.setenv("CCX_NPROC_EQUATION_SOLVER", "1")
+    monkeypatch.setenv("ALWAYS_KILL", "1")
+    with pytest.raises(runner.SolverError) as e:                 # one thread: an error that says what to do
+        runner.run_ccx(fake_ccx, 20)
+    assert "because the node ran out of memory (other processes)" in str(e.value)
+    assert "Run it when the node is free (jobs(), machines()); more run.mem will not help" in str(e.value)
+    assert "Ask for more memory" not in str(e.value)
+
+
+def test_kernel_log(monkeypatch):
+    import subprocess as sp
+    log = ("Memory cgroup out of memory: Killed process 213447 (ccx)\n"
+           "oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=task_0,mems_allowed=0,task=ccx,pid=213447,uid=1000\n"
+           "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,task=ccx,pid=5461,uid=1002\n")
+    monkeypatch.setattr(runner.shutil, "which", lambda c: "/usr/bin/journalctl")
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: sp.CompletedProcess(a, 0, log, ""))
+    assert runner.kernel_oom_constraint(213447, 0) == "CONSTRAINT_MEMCG"
+    assert runner.kernel_oom_constraint(5461, 0) == "CONSTRAINT_NONE"
+    assert runner.kernel_oom_constraint(1, 0) is None

@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.07.1
+Version: 2026.11.08.1
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -143,6 +143,126 @@ def oom_kills() -> dict:
     return out
 
 
+def oom_limit_hits() -> dict:
+    """{cgroup: times its memory reached its limit (cgroup v2 memory.events 'oom')}: a kill without one of these is
+    the node's out-of-memory killer, not the job's limit ({} on cgroup v1, where there is no such count)."""
+    out = {}
+    for d in _cgroup_dirs():
+        try:
+            for ln in (d / "memory.events").read_text().splitlines():
+                k, _, v = ln.partition(" ")
+                if k == "oom":
+                    out[str(d)] = int(v)
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def meminfo_mb() -> tuple[float, float] | None:
+    """(total, available) memory of this node in MB (/proc/meminfo); None elsewhere."""
+    try:
+        vals = {}
+        for ln in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = ln.partition(":")
+            if k in ("MemTotal", "MemAvailable"):
+                vals[k] = int(v.split()[0]) / 1024
+        return vals["MemTotal"], vals["MemAvailable"]
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+NODE_MEM: dict = {"total_mb": None, "samples": []}   # this run's samples of the node's available memory (t, MB)
+
+
+def _sample_node() -> None:
+    m = meminfo_mb()
+    if m:
+        NODE_MEM["total_mb"] = m[0]
+        NODE_MEM["samples"].append((time.time(), m[1]))
+        del NODE_MEM["samples"][:-200]
+
+
+def node_min_free_mb(seconds: float = 15.0) -> float | None:
+    """The node's least available memory in the last `seconds` of this run (MB); None without samples."""
+    if not NODE_MEM["samples"]:
+        return None
+    t_end = NODE_MEM["samples"][-1][0]
+    return min(a for t, a in NODE_MEM["samples"] if t >= t_end - seconds)
+
+
+def kernel_oom_constraint(pid: int, since: float) -> str | None:
+    """The kernel's own word on why it killed `pid`: 'CONSTRAINT_MEMCG' (a cgroup's limit: the job's) or
+    'CONSTRAINT_NONE' (the node ran out), from its log (journalctl -k), when this user may read it; else None."""
+    if not shutil.which("journalctl"):
+        return None
+    try:
+        r = subprocess.run(["journalctl", "-k", "-q", "-o", "cat", "--no-pager", "--since", f"@{int(since) - 5}"],
+                           capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    import re
+    for ln in r.stdout.splitlines():
+        m = re.search(r"oom-kill:constraint=(CONSTRAINT_\w+).*\bpid=(\d+)", ln)
+        if m and int(m.group(2)) == pid:
+            return m.group(1)
+    return None
+
+
+def oom_scope(kills0: dict, kills1: dict, hits0: dict, hits1: dict, code: int, rss_mb: float, limit_mb: float | None,
+              node_free_mb: float | None, node_total_mb: float | None, kernel: str | None = None) -> str | None:
+    """Whose memory ran out when CalculiX was killed: 'job' (its cgroup reached the job's limit: more memory or fewer
+    threads is the fix), 'node' (the node ran out with the job below its limit: other jobs or processes; run when the
+    node is free), None (not killed for memory). From the kernel's log when readable; else the cgroup counters (a kill
+    with no 'limit reached' count is the node's); else the sizes (carbonio, 2026.11.07: two runs 'out of memory' at
+    20.1 and 13.9 GB in 34 GB jobs)."""
+    if code == 0:
+        return None
+    if kernel:
+        return "job" if kernel == "CONSTRAINT_MEMCG" else "node"
+    grew = lambda a, b: any(b.get(k, 0) > n for k, n in a.items()) or any(k not in a and n > 0 for k, n in b.items())  # noqa: E731
+    node_low = bool(node_free_mb is not None and node_total_mb and node_free_mb < max(0.05 * node_total_mb, 1024))
+    near_limit = bool(limit_mb and rss_mb >= 0.8 * limit_mb)
+    if grew(kills0, kills1):
+        if hits1:
+            return "job" if grew(hits0, hits1) else "node"
+        return "node" if (node_low and not near_limit) else "job"
+    if code == -9:
+        if limit_mb and rss_mb >= 0.9 * limit_mb:
+            return "job"
+        if node_low:
+            return "node"
+    return None
+
+
+def node_jobs_text() -> str:
+    """The jobs running on this node (SLURM), with the memory each asked for, and a note when they add up to more
+    than the node has (SLURM then does not count memory when it places jobs); '' outside SLURM."""
+    node = os.environ.get("SLURMD_NODENAME")
+    if not node or not shutil.which("squeue"):
+        return ""
+    try:
+        r = subprocess.run(["squeue", "-h", "-w", node, "-t", "R", "-o", "%i|%m|%j"], capture_output=True, text=True,
+                           timeout=8)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    from .executor import mem_mb
+    jobs, total = [], 0.0
+    for ln in r.stdout.splitlines():
+        f = ln.split("|")
+        if len(f) >= 3:
+            mb = mem_mb(f[1]) or 0
+            total += mb
+            jobs.append(f"{f[0]} ({f[2][:40]}, {f[1]})")
+    if not jobs:
+        return ""
+    out = f"; running on {node} now: " + ", ".join(jobs[:8])
+    tot = NODE_MEM.get("total_mb")
+    if tot and total > tot:
+        out += (f" — together {total / 1024:.0f} GB asked on a node with {tot / 1024:.0f} GB: SLURM is not counting "
+                "memory when it places jobs here")
+    return out
+
+
 def memory_limit_mb() -> float | None:
     """The memory this process (and CalculiX) may use: the SLURM job's (SLURM_MEM_PER_NODE, MB), else its cgroup's
     memory.max (v2) or memory.limit_in_bytes (v1); None: no limit known."""
@@ -163,10 +283,24 @@ def memory_limit_mb() -> float | None:
     return None
 
 
+def node_oom_text(rec: dict) -> str:
+    """'the node ran out of memory (other processes): killed at 13.9 GB, below the job's 34.0 GB; the node's free
+    memory fell to 0.3 GB of 62.6 GB'."""
+    lim = f", below the job's {rec['limit_mb'] / 1024:.1f} GB" if rec.get("limit_mb") else ""
+    free = (f"; the node's free memory fell to {rec['node_min_free_mb'] / 1024:.1f} GB of {rec['node_total_mb'] / 1024:.1f} GB"
+            if rec.get("node_min_free_mb") is not None and rec.get("node_total_mb") else "")
+    return (f"the node ran out of memory (other processes): killed at {rec.get('peak_rss_mb', 0) / 1024:.1f} GB{lim}"
+            f"{free}{rec.get('node_jobs', '')}")
+
+
 def crash_message(rec: dict) -> str:
     """'killed at 33.4 GB of 32.0 GB with 6 threads; rerunning on 1 thread (about 2x slower by feat's thread model)',
     or the crash: what happened to a threaded CalculiX run, with the numbers that tell whether more memory is the fix."""
     slower = f"about {rec['threads'] ** 0.4:.1f}x slower by feat's thread model"
+    if rec.get("oom_scope") == "node":
+        return (f"{node_oom_text(rec)}, with {rec['threads']} threads after {rec.get('run_s', 0) / 60:.0f} min; rerunning "
+                f"on 1 thread ({slower}, less memory); more run.mem will not help: if the node is still short, run "
+                "when it is free")
     if rec.get("out_of_memory"):
         of = f" of {rec['limit_mb'] / 1024:.1f} GB" if rec.get("limit_mb") else ""
         return (f"out of memory: killed at {rec.get('peak_rss_mb', 0) / 1024:.1f} GB{of} with {rec['threads']} threads "
@@ -283,6 +417,7 @@ def _wait_rss(p: subprocess.Popen, timeout: float, monitor=None) -> int:
             PEAK["rss_mb"] = max(PEAK["rss_mb"], mb)
             PEAK["last_rss_mb"] = mb
             return p.returncode
+        _sample_node()   # the node's free memory: who ran out, if CalculiX is killed
         if cancel_requested():
             _kill_group(p)
             raise Cancelled("cancelled with cancel(request) while CalculiX ran")
@@ -340,17 +475,17 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None, nodes
     for k in ("OPENBLAS_NUM_THREADS", "GOTO_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
         env[k] = "1"
     log_path = inp.parent / f"{inp.stem}.log"
-    oom0 = oom_kills()
+    oom0, hits0 = oom_kills(), oom_limit_hits()
+    NODE_MEM["samples"] = []
+    _sample_node()
     PEAK["last_rss_mb"] = 0.0
     t_run = time.time()
+    # (2026.11.07.1-.2 raised CalculiX's oom_score_adj to 1000 so that feat would survive the job's limit; it also made
+    # CalculiX the node's first victim when other processes used up the node's memory. CalculiX is by far the job's
+    # largest process, so the job's own limit picks it anyway.)
     with open(log_path, "w") as fh:
         p = subprocess.Popen([exe, "-i", inp.stem], cwd=inp.parent, stdout=fh, stderr=subprocess.STDOUT, env=env,
                              start_new_session=True)   # its own process group: a cancel or timeout ends all of it
-        try:   # out of memory, the kernel kills CalculiX first, not feat (which then reports it and restarts)
-            with open(f"/proc/{p.pid}/oom_score_adj", "w") as fh_adj:
-                fh_adj.write("1000")
-        except OSError:
-            pass
         workers.track(p)   # a worker whose server dies takes its CalculiX run with it
         try:
             code = _wait_rss(p, timeout, monitor)    # waits with wait4, which also gives the child's peak memory
@@ -370,7 +505,17 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None, nodes
             errs.append(" ".join([ln.strip()] + more))
     threads = int(env.get("OMP_NUM_THREADS", "1"))
     limit = memory_limit_mb()
-    oom = out_of_memory(code, oom0, oom_kills(), PEAK["last_rss_mb"], limit)
+    scope = None
+    if code != 0:
+        scope = oom_scope(oom0, oom_kills(), hits0, oom_limit_hits(), code, PEAK["last_rss_mb"], limit,
+                          node_min_free_mb(), NODE_MEM["total_mb"],
+                          kernel_oom_constraint(p.pid, t_run) if code == -9 else None)
+    oom = scope is not None
+    node_info = {}
+    if scope == "node":
+        node_info = {"node_total_mb": round(NODE_MEM["total_mb"], 1) if NODE_MEM["total_mb"] else None,
+                     "node_min_free_mb": None if node_min_free_mb() is None else round(node_min_free_mb(), 1),
+                     "node_jobs": node_jobs_text()}
     if not errs and (code != 0 or not inp.with_suffix(".dat").is_file()) and threads > 1:
         # it died with no error of its own: out of memory (threads multiply the direct solver's memory), or a crash in
         # the threaded solver (the eigenvalue step on a 4-thread setup machine): once more single-threaded, as for
@@ -382,7 +527,7 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None, nodes
         except (OSError, ImportError):
             its = 0
         rec = {"solve": inp.stem, "crash": _exit_text(code), "threads": threads, "after_rerun": "ok",
-               "out_of_memory": oom, "peak_rss_mb": round(PEAK["last_rss_mb"], 1),
+               "out_of_memory": oom, "oom_scope": scope, **node_info, "peak_rss_mb": round(PEAK["last_rss_mb"], 1),
                "limit_mb": None if limit is None else round(limit, 1), "run_s": round(run_s, 1),
                "iterations": its, "s_per_iteration": round(run_s / its, 1) if its else None}
         rec["message"] = crash_message(rec)
@@ -397,6 +542,10 @@ def run_ccx(inp: Path, timeout: float, serial: bool = False, monitor=None, nodes
         except SolverError as exc:
             rec["after_rerun"] = str(exc)[:300]
             raise
+    if scope == "node":
+        rec = dict(node_info, peak_rss_mb=PEAK["last_rss_mb"], limit_mb=limit)
+        raise SolverError(f"CalculiX was killed with {threads} thread(s) because {node_oom_text(rec)}. Run it when the "
+                          "node is free (jobs(), machines()); more run.mem will not help")
     if oom:
         lim = f" (the job's limit is {limit / 1024:.1f} GB)" if limit else ""
         raise SolverError(f"CalculiX ran out of memory with {threads} thread(s): killed at "
@@ -1228,7 +1377,7 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
             msg = rr.get("message") or crash_message(rr)
             warn.append(f"CalculiX's solve of {rr['solve']}: {msg}{again}"
                         + ("; for the threads, give the study more memory (run.mem; see memory.estimate_gb)"
-                           if rr.get("out_of_memory") else ""))
+                           if rr.get("out_of_memory") and rr.get("oom_scope") != "node" else ""))
         for mn in res.get("memory_notes", []):
             warn.append(f"CalculiX's solve of {mn['solve']}: {mn['message']}")
         for rr in res.get("solver_reruns", []):
