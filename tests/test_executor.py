@@ -239,9 +239,14 @@ def test_size_estimate_from_a_goal(slurm):
 def test_benchmarks_return_at_once_and_bench_status_collects(slurm, monkeypatch):
     """run_benchmarks submits and returns within its wait (cfdt's waited for every job and timed out);
     bench_status collects them, here from SLURM jobs (fake) and from the local pool."""
+    t0 = time.time()
     r = api.bench(["axial_bar", "slab", "euler_column"], "ref", wait=0)
-    assert r["skipped"] == {"euler_column": "needs CalculiX"} and set(r["pending"]) == {"axial_bar", "slab"}
-    assert "bench_status(bench=" in r["next"]
+    assert time.time() - t0 < 30                         # it submits and answers; it does not wait for the runs
+    # a run may already be done when the answer is put together (a warm local pool solves axial_bar with the
+    # reference solver in a fraction of a second: llmt test, 2026.11.09): pending or passed, never lost
+    assert r["skipped"] == {"euler_column": "needs CalculiX"}
+    assert set(r["pending"]) | set(r["passed"]) == {"axial_bar", "slab"} and not r["failed"]
+    assert not r["pending"] or "bench_status(bench=" in r["next"]
     assert any(x["request"] == r["bench"] for x in api.jobs()["requests"])
     s = api.bench_status(r["bench"], wait=120)
     assert s["done"] and sorted(s["passed"]) == ["axial_bar", "slab"] and not s["failed"]
