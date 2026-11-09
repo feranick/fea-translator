@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.09.4
+Version: 2026.11.09.5
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -920,6 +920,21 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
     return {"translator": __version__, "executor": executor.kind(), "requests": out, **executor.queue_summary()}
 
 
+def _feat_left_s(d: Path, study: dict) -> float:
+    """Seconds feat's own deadline for a study's running CalculiX solve is away: its stage start + timeout + what was
+    added, less now (0 when unknown)."""
+    try:
+        p = json.loads((d / "progress.json").read_text())
+        t0, timeout = float(p["stage_started"]), float(p.get("timeout_s") or executor.timeout_s(study))
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0.0
+    try:
+        had = float(json.loads((d / "extended.json").read_text()).get("total_s", 0.0))
+    except (OSError, ValueError):
+        had = 0.0
+    return max(t0 + timeout + had - time.time(), 0.0)
+
+
 def extend(request: str, hours: float, names: list[str] | None = None) -> dict:
     """More time for a request's running studies (or the named ones): each one's CalculiX run moves its deadline
     back by `hours` within seconds (an 'extend' file in its folder, which the run consumes), and its SLURM job's
@@ -963,13 +978,24 @@ def extend(request: str, hours: float, names: list[str] | None = None) -> dict:
         if n in meta.get("slurm", []):
             try:
                 jid = json.loads((d / "job.json").read_text())["job_id"]
-                err = executor.extend_job(jid, int(math.ceil(secs / 60)))
-                rec["slurm_job"] = jid
-                rec["slurm_time_limit"] = "raised" if err is None else (
-                    f"not raised ({err}): ask an admin to run scontrol update JobId={jid} "
-                    f"TimeLimit=+{int(math.ceil(secs / 60))}, or the job ends at its old limit")
             except (OSError, json.JSONDecodeError, KeyError):
+                jid = None
                 rec["slurm_time_limit"] = "no job.json: not raised"
+            if jid:
+                rec["slurm_job"] = jid
+                left = executor.job_time_left_min(jid)       # the job's own limit may already cover it
+                need = _feat_left_s(d, studies.get(n) or {}) + secs + 600
+                if left is not None and (math.isinf(left) or left * 60 >= need):
+                    rec["slurm_time_limit"] = ("not needed: the job has no SLURM time limit" if math.isinf(left) else
+                                               f"not needed: the job has {left / 60:.1f} h left before SLURM's limit")
+                else:
+                    err = executor.extend_job(jid, int(math.ceil(secs / 60)))
+                    end = f" (in about {left / 60:.1f} h)" if left is not None else ""
+                    rec["slurm_time_limit"] = "raised" if err is None else (
+                        f"not raised ({err}): SLURM lets only an admin raise a running job's limit, so the job still "
+                        f"ends at its old limit{end}; an admin can run scontrol update JobId={jid} "
+                        f"TimeLimit=+{int(math.ceil(secs / 60))}. Jobs submitted from 2026.11.09.5 on take the "
+                        "partition's own limit (FEAT_SLURM_TIME=max), so extend needs no admin")
         rec["note"] = "the running CalculiX run takes it within about 5 s (extended.json records it)"
         out["studies"][n] = rec
     return out

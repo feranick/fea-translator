@@ -1,7 +1,7 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
 sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
 process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.11.07.2
+Version: 2026.11.09.5
 """
 import json
 import os
@@ -26,7 +26,8 @@ def slurm(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{FAKE}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("PYTHONPATH", f"{ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
     for k in ("FAKE_SBATCH_FAIL", "FAKE_SBATCH_PENDING", "FAKE_SBATCH_DELAY", "FAKE_SACCT_FAIL", "FEAT_PROCS",
-              "FAKE_SQUEUE_FAIL", "FAKE_SCONTROL_NODES", "FAKE_SCONTROL_FAIL"):
+              "FAKE_SQUEUE_FAIL", "FAKE_SCONTROL_NODES", "FAKE_SCONTROL_FAIL", "FAKE_SINFO_PARTITIONS", "FEAT_SLURM_TIME",
+              "FAKE_TIME_LEFT", "FAKE_SCONTROL_DENY"):
         monkeypatch.delenv(k, raising=False)
     return tmp_path
 
@@ -594,3 +595,51 @@ def test_answers_name_the_version_they_come_from(slurm):
     assert r["translator"] == __version__ and api.cancel(r["request"])["translator"] == __version__
     b = api.bench(["axial_bar"], "ref", wait=120)
     assert b["translator"] == __version__ and api.bench_status(b["bench"])["translator"] == __version__
+
+
+
+def test_slurm_time_from_the_partition(slurm, monkeypatch):
+    """SLURM lets only an admin raise a running job's limit (mochi job 3177, 2026.11.09): jobs take the partition's
+    own limit (FEAT_SLURM_TIME=max, the default), and extend needs only feat's own timeout (2026.11.09.5)."""
+    executor._PART.update(t=0.0, v=None)
+    st = {"analysis": "static", "run": {"timeout_s": 3600}}
+    need = executor.time_limit_min(st)
+    assert executor.job_time(st)[0] == str(need)                 # no partition info: the estimate
+    monkeypatch.setenv("FAKE_SINFO_PARTITIONS", "long*|infinite;short|2:00:00")
+    executor._PART.update(t=0.0, v=None)
+    assert executor.job_time(st)[0] == "UNLIMITED"
+    assert "#SBATCH --time=UNLIMITED" in executor.job_script(slurm / "out" / "r", "a", st)
+    monkeypatch.setenv("FEAT_SLURM_ARGS", "--partition=short")
+    executor._PART.update(t=0.0, v=None)
+    assert executor.job_time(st)[0] == "120" and "warning" not in executor.job_time(st)[1]
+    t, info = executor.job_time({"analysis": "static", "run": {"timeout_s": 7200}})   # 140 min: above the partition's
+    assert t == "120" and "below what the runs may take" in info["warning"]
+    monkeypatch.setenv("FAKE_SINFO_PARTITIONS", "long*|7-00:00:00")
+    monkeypatch.delenv("FEAT_SLURM_ARGS")
+    executor._PART.update(t=0.0, v=None)
+    assert executor.job_time(st)[0] == str(7 * 1440)
+    monkeypatch.setenv("FEAT_SLURM_TIME", "estimate")
+    assert executor.job_time(st)[0] == str(need)
+    monkeypatch.setenv("FEAT_SLURM_TIME", "100000")
+    assert executor.job_time(st)[0] == "100000"
+    assert [executor.slurm_minutes(x) for x in ("infinite", "1-12", "2:00:00", "30", "5:30", "bad")] == \
+        [float("inf"), 2160, 120, 30, 5.5, None]
+
+
+def test_extend_skips_or_explains_slurm(slurm, monkeypatch):
+    req = slurm / "out" / "run_x"
+    (req / "a").mkdir(parents=True)
+    (req / "request.json").write_text(json.dumps({"names": ["a"], "slurm": ["a"]}))
+    (req / "studies.json").write_text(json.dumps({"a": {"analysis": "static", "run": {"timeout_s": 3600}}}))
+    (req / "a" / "job.json").write_text(json.dumps({"job_id": "77"}))
+    (req / "a" / "progress.json").write_text(json.dumps({"stage_started": time.time() - 1800, "timeout_s": 3600}))
+    monkeypatch.setattr(executor, "job_time_left_min", lambda j: float("inf"))
+    assert api.extend(str(req), 2)["studies"]["a"]["slurm_time_limit"] == "not needed: the job has no SLURM time limit"
+    (req / "a" / "extend").unlink()
+    monkeypatch.setattr(executor, "job_time_left_min", lambda j: 600.0)      # 10 h left: covers 0.5 h + 2 h + 10 min
+    assert api.extend(str(req), 2)["studies"]["a"]["slurm_time_limit"].startswith("not needed: the job has 10.0 h left")
+    (req / "a" / "extend").unlink()
+    monkeypatch.setattr(executor, "job_time_left_min", lambda j: 40.0)
+    monkeypatch.setenv("FAKE_SCONTROL_DENY", "1")
+    r = api.extend(str(req), 2)["studies"]["a"]["slurm_time_limit"]
+    assert r.startswith("not raised (Access/permission denied for JobId=77)") and "only an admin" in r and "0.7 h" in r

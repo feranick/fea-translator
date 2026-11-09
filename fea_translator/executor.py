@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.07.2
+Version: 2026.11.09.5
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (1): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments, split as a shell
@@ -243,10 +243,99 @@ def time_limit_min(study: dict | None = None) -> int:
     return int(math.ceil(t / 60)) + mesh_margin_min(st) + 10
 
 
+def slurm_minutes(t: str | None) -> float | None:
+    """A SLURM time ('infinite', 'UNLIMITED', '7-00:00:00', '2:00:00', '30', '1-12') in minutes; inf for no limit;
+    None when it cannot be read."""
+    if not t:
+        return None
+    t = t.strip().lower()
+    if t in ("infinite", "unlimited"):
+        return math.inf
+    try:
+        days = 0
+        if "-" in t:
+            d, t = t.split("-", 1)
+            days = int(d)
+            f = [int(x) for x in t.split(":")] + [0, 0]
+            h, m, sec = f[0], f[1], f[2]
+        else:
+            f = [int(x) for x in t.split(":")]
+            h, m, sec = {1: (0, f[0], 0), 2: (0, f[0], f[-1]), 3: tuple(f)}[len(f)] if len(f) <= 3 else (0, 0, 0)
+        return days * 1440 + h * 60 + m + sec / 60
+    except (ValueError, KeyError):
+        return None
+
+
+_PART: dict = {"t": 0.0, "v": None}
+
+
+def partition_max_min() -> float | None:
+    """The time limit (MaxTime, minutes; inf: none) of the partition this translator's jobs go to (FEAT_SLURM_ARGS
+    --partition, else the default one), from sinfo; None when SLURM does not say. Kept for 5 minutes."""
+    if time.time() - _PART["t"] < 300 and _PART["v"] is not None:
+        return _PART["v"]
+    p = _run(["sinfo", "-h", "-o", "%P|%l"], timeout=10)
+    if p is None or p.returncode != 0:
+        return None
+    want = opt_value(slurm_args(), ("--partition",), ("-p",))
+    rows = [ln.split("|", 1) for ln in p.stdout.splitlines() if "|" in ln]
+    pick = None
+    for name, lim in rows:
+        if (want and name.rstrip("*") == want) or (not want and name.endswith("*")):
+            pick = lim
+            break
+    if pick is None and rows and not want:
+        pick = rows[0][1]
+    v = slurm_minutes(pick)
+    if v is not None:
+        _PART.update(t=time.time(), v=v)
+    return v
+
+
+def job_time(study: dict | None = None) -> tuple[str, dict]:
+    """(the job's --time, details). FEAT_SLURM_TIME: 'max' (default: the partition's own limit, UNLIMITED where it
+    has none, so that extend(request) needs only feat's own CalculiX timeout: SLURM lets only an admin raise a
+    running job's limit, mochi job 3177, 2026.11.09), 'estimate' (feat's time_limit_min: the runs' timeouts, the
+    meshing and 10 min), or minutes (at least the estimate). feat's own timeout still ends CalculiX and writes a
+    clean result; the SLURM limit is the backstop."""
+    need = time_limit_min(study)
+    setting = os.environ.get("FEAT_SLURM_TIME", "max").strip().lower() or "max"
+    info = {"needed_min": need, "setting": setting}
+    if setting == "estimate":
+        return str(need), info
+    if setting != "max":
+        try:
+            return str(max(need, int(float(setting)))), info
+        except ValueError:
+            info["warning"] = f"FEAT_SLURM_TIME={setting!r} is not max, estimate or minutes: the estimate"
+            return str(need), info
+    mx = partition_max_min()
+    if mx is None:
+        info["note"] = "the partition's limit is unknown (sinfo): the estimate"
+        return str(need), info
+    if math.isinf(mx):
+        info["partition_max"] = "infinite"
+        return "UNLIMITED", info
+    info["partition_max_min"] = int(mx)
+    if mx < need:
+        info["warning"] = (f"the partition's limit ({int(mx)} min) is below what the runs may take ({need} min): "
+                           "SLURM may stop the job before feat's own timeout")
+    return str(int(mx)), info
+
+
+def job_time_left_min(job_id: str) -> float | None:
+    """Minutes a running job has left before SLURM's limit (squeue %L); inf without a limit; None when unknown."""
+    p = _run(["squeue", "-h", "-j", str(job_id), "-o", "%L"], timeout=10)
+    if p is None or p.returncode != 0 or not p.stdout.strip():
+        return None
+    return slurm_minutes(p.stdout.strip().splitlines()[0])
+
+
 def status_key() -> dict:
     """The 'executor' key of tool_status (llmt status reads it)."""
     return {"kind": kind(), "sbatch": shutil.which("sbatch"), "min_minutes": min_minutes(),
             "procs": default_procs(), "timeout_s": timeout_s(), "time_limit_min": time_limit_min(),
+            "slurm_time": os.environ.get("FEAT_SLURM_TIME", "max"),
             "mem": os.environ.get("FEAT_SLURM_MEM", "auto"), "caps": caps(), "node": node_status(),
             "node_cores": node_cores()}
 
@@ -805,7 +894,7 @@ def job_script(request: Path, name: str, study: dict) -> str:
         f"#SBATCH --output={d / 'job.log'}",
         "#SBATCH --ntasks=1",
         f"#SBATCH --cpus-per-task={p}",
-        f"#SBATCH --time={time_limit_min(study)}",
+        f"#SBATCH --time={job_time(study)[0]}",
         *([f"#SBATCH --mem={mem_for(study)}"] if mem_for(study) else []),
         *([f"#SBATCH --nodelist={pin}"] if pin else []),
         "#SBATCH --export=ALL",
@@ -837,7 +926,8 @@ def submit(request: Path, name: str, study: dict) -> dict:
     job_id = p.stdout.strip().split(";")[0].split()[0]
     n = estimate_nodes(study)
     info = {"executor": "slurm", "job_id": job_id, "submitted": round(time.time(), 1), "procs": procs_for(study),
-            "time_min": time_limit_min(study), "mem": mem_for(study), "nodelist": node_pin()[1], "nodes_estimate": n,
+            "time_min": time_limit_min(study), "slurm_time": job_time(study)[0], "slurm_time_info": job_time(study)[1],
+            "mem": mem_for(study), "nodelist": node_pin()[1], "nodes_estimate": n,
             "nodes_estimate_raw": estimate_nodes_raw(study),
             "equation_solver": method_of(study, n) if n else None, "run": run_of(study), "command": cmd}
     try:

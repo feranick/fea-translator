@@ -86,7 +86,8 @@ def sbatch(args):
 def _fmt(fmt: str, jid: str, rec: dict, state: str) -> str:
     el = int(time.time() - rec["t0"])
     vals = {"i": jid, "T": state, "r": "Priority" if state == "PENDING" else "None", "S": "N/A",
-            "M": f"{el // 60}:{el % 60:02d}", "j": rec["name"], "C": str(rec["cpus"])}
+            "M": f"{el // 60}:{el % 60:02d}", "j": rec["name"], "C": str(rec["cpus"]),
+            "L": os.environ.get("FAKE_TIME_LEFT", "1:00:00")}
     return re.sub(r"%(\w)", lambda m: vals.get(m.group(1), ""), fmt)
 
 
@@ -145,11 +146,23 @@ def sacct(args):
 
 
 def sinfo(args):
+    fmt = args[args.index("-o") + 1] if "-o" in args else ""
+    if "%P" in fmt:   # partitions and their time limits: FAKE_SINFO_PARTITIONS ('long*|infinite;short|2:00:00')
+        parts = os.environ.get("FAKE_SINFO_PARTITIONS")
+        if not parts:
+            return 1
+        print("\n".join(parts.split(";")))
+        return 0
     print("2/6/0/8")
     return 0
 
 
 def scontrol(args):
+    if args and args[0] == "update" and os.environ.get("FAKE_SCONTROL_DENY"):
+        print(f"Access/permission denied for {args[1]}", file=sys.stderr)
+        return 1
+    if args and args[0] == "update":
+        return 0
     if os.environ.get("FAKE_SCONTROL_FAIL"):
         print("slurm_load_node error: Unable to contact slurm controller (connect failure)", file=sys.stderr)
         return 1
