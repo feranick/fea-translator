@@ -2,9 +2,10 @@
 study's time limit (api.extend), the SLURM time limit with the meshing and an assembly's modal runs.
 Job 419 on spark2 (an S50 sleeve, 2026.11.05): the stage estimate said 'eta 63 min' while CalculiX was at step time
 0.175 of the first of two steps after 10.5 h, at about 15 min per Newton iteration.
-Version: 2026.11.05.2
+Version: 2026.11.09.4
 """
 import json
+from pathlib import Path
 import time
 
 import pytest
@@ -98,3 +99,19 @@ def test_api_extend(tmp_path, monkeypatch):
     r = api.extend(str(req), 2, ["a"])
     assert r["studies"]["a"]["added_s"] == 1800 and "FEAT_MAX_TIMEOUT" in r["studies"]["a"]["capped"]
     assert "error" in api.extend(str(req), -1) and "no studies" in api.extend(str(req), 1, ["zz"])["error"]
+
+
+def test_status_gives_the_version_a_request_ran_with(tmp_path, monkeypatch):
+    """A 2026.11.09.2 bench on mochi read '2026.11.09.3' in bench_status after the upgrade (2026.11.09.4)."""
+    from fea_translator import __version__
+    assert api.ran_with({}, {"a": {"translator": "2026.11.09.2"}}) == {"translator": "2026.11.09.2",
+                                                                       "translator_now": __version__}
+    assert api.ran_with({"translator": "2026.11.09.2"}, {}) == {"translator": "2026.11.09.2", "translator_now": __version__}
+    assert api.ran_with({}, {"a": {"translator": "x"}, "b": {"translator": "y"}})["translator"] == ["x", "y"]
+    old = api.ran_with({}, {})
+    assert old["translator"] == __version__ and "not recorded" in old["translator_note"]
+    assert api.ran_with({}, {"a": {"translator": __version__}}) == {"translator": __version__}
+    monkeypatch.setenv("FEAT_OUT", str(tmp_path))
+    monkeypatch.setenv("FEAT_EXECUTOR", "local")
+    r = api.run({"s": {"analysis": "static"}}, "ref", wait=1)            # invalid: answered at once
+    assert json.loads((tmp_path / Path(r["request"]).name / "request.json").read_text())["translator"] == __version__

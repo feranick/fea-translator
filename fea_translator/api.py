@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.08.1
+Version: 2026.11.09.4
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -271,6 +271,21 @@ def _request_dir(prefix: str) -> Path:
     return d
 
 
+def ran_with(meta: dict, results: dict) -> dict:
+    """{"translator": the version a request's studies ran with (their results' own, else the one recorded when it was
+    submitted; a list when they differ), "translator_now": this server's, when it is another}. Before 2026.11.09.4 a
+    request's status gave the version installed when it was asked: a 2026.11.09.2 bench read '2026.11.09.3' after an
+    upgrade."""
+    vs = sorted({r["translator"] for r in results.values() if isinstance(r, dict) and r.get("translator")})
+    ran = (vs[0] if len(vs) == 1 else vs) if vs else meta.get("translator")
+    out = {"translator": ran if ran else __version__}
+    if not ran:
+        out["translator_note"] = "the version it ran with was not recorded (before 2026.11.09.4): this server's"
+    elif ran != __version__:
+        out["translator_now"] = __version__
+    return out
+
+
 def _collect(folder: Path) -> dict:
     """Status of every study of a request: finished ones with their results."""
     meta = json.loads((folder / "request.json").read_text())
@@ -310,7 +325,7 @@ def _collect(folder: Path) -> dict:
         else:
             pending.append(name)
     started = meta.get("started", time.time())
-    res = {"request": str(folder), "translator": __version__, "solver": meta["solver"], "done": not pending,
+    res = {"request": str(folder), **ran_with(meta, out), "solver": meta["solver"], "done": not pending,
            "pending": pending, "elapsed_s": round(time.time() - started, 1), "studies": out}
     if pending:
         studies = json.loads((folder / "studies.json").read_text()) if (folder / "studies.json").is_file() else {}
@@ -781,7 +796,7 @@ def start(studies: dict, solver: str | None = None, prefix: str = "run", request
     (folder / "request.json").write_text(json.dumps({"names": [j["name"] for j in jobs], "invalid": invalid,
                                                      "solver": s, "started": time.time(), "slurm": slurm,
                                                      "executor": executor.kind(),
-                                                     "timeout": executor.timeout_s()}))
+                                                     "timeout": executor.timeout_s(), "translator": __version__}))
     for n in slurm:   # one SLURM job per study; a failed submission is that study's result (no local fallback)
         info = executor.submit(folder, n, studies[n])
         if info.get("ok") is False:
@@ -1125,9 +1140,10 @@ def bench_status(bench: str, wait: float = 0.0) -> dict:
         return {"error": f"no benchmark request {folder}"}
     st = status(str(folder), wait)
     cases = {k: {x: v.get(x) for x in ("ok", "passed", "checks", "error", "why", "state", "seconds", "mesh",
-                                     "warnings", "solver_reruns") if x in v}
+                                     "warnings", "solver_reruns", "translator") if x in v}
              for k, v in st.get("studies", {}).items()}
-    out = {"bench": str(folder), "translator": __version__, "solver": st.get("solver"), "done": st.get("done"),
+    ver = {k: st[k] for k in ("translator", "translator_now", "translator_note") if k in st}
+    out = {"bench": str(folder), **ver, "solver": st.get("solver"), "done": st.get("done"),
            "passed": [k for k, v in cases.items() if v.get("passed")],
            "failed": [k for k, v in cases.items() if v.get("passed") is False or v.get("ok") is False],
            "pending": st.get("pending", []), "skipped": meta.get("skipped", {}), "cases": cases}
