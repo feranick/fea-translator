@@ -1,7 +1,7 @@
 """Worker processes end with the server (workers.py, api.shutdown_workers): on the stale-server exit (os._exit skips
 atexit) and when the server is killed (kill -9). carbonio, 2026.11.02: orphaned spawn workers and a resource_tracker
 from three releases kept them 'in use' for llmt gc.
-Version: 2026.11.03.1
+Version: 2026.11.09.6
 """
 import json
 import os
@@ -37,28 +37,39 @@ if __name__ == "__main__":
     from multiprocessing import resource_tracker
     pids = [p.pid for p in mp.active_children()]
     rt = getattr(resource_tracker._resource_tracker, "_pid", None)
-    print(json.dumps({"workers": pids, "tracker": rt}), flush=True)
+    roles = {**{str(w.pid): "study pool" for w in api._POOL.pool._pool},
+             **{str(w.pid): "aux pool" for w in api._AUX["pool"]._pool},
+             **{str(w.pid): "volume pool" for w in executor._VPOOL["ex"]._processes.values()}, str(d.pid): "deck"}
+    print(json.dumps({"workers": pids, "tracker": rt, "roles": roles}), flush=True)
     if sys.argv[1] == "exit":
+        sys.stdin.readline()                    # after the test has seen every worker alive (no race with the exit)
         mcp_server._exit_soon("test", 0.0)      # the stale-server exit: os._exit after shutdown_workers
     time.sleep(300)
 '''
 
 
 def _alive(pid: int) -> bool:
-    try:
-        with open(f"/proc/{pid}/stat") as fh:
-            return fh.read().rsplit(")", 1)[-1].split()[0] != "Z"   # a zombie has ended
-    except FileNotFoundError:
-        return False
-    except OSError:
-        pass
+    """A process that exists and is not a zombie. Linux: /proc; elsewhere (macOS has no /proc, which this helper took
+    for 'every process is gone' before 2026.11.09.6): kill(pid, 0), then ps for the zombie state."""
+    if os.path.isdir("/proc"):
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                return fh.read().rsplit(")", 1)[-1].split()[0] != "Z"   # a zombie has ended
+        except FileNotFoundError:
+            return False
+        except OSError:
+            pass
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    try:
+        st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return bool(st.strip()) and not st.strip().startswith("Z")
 
 
 def _start(tmp_path, mode):
@@ -66,15 +77,22 @@ def _start(tmp_path, mode):
     script.write_text(SCRIPT)
     env = dict(os.environ, PYTHONPATH=str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""),
                FEAT_OUT=str(tmp_path / "out"), FEAT_WORKERS="2", FEAT_AUX_WORKERS="2")
-    p = subprocess.Popen([sys.executable, str(script), mode], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         env=env, cwd=str(tmp_path))
+    p = subprocess.Popen([sys.executable, str(script), mode], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, env=env, cwd=str(tmp_path))
     line = p.stdout.readline()
     if not line:
         p.kill()
         pytest.fail(f"the server script did not start: {p.stderr.read()[-2000:]}")
     info = json.loads(line)
     assert len(info["workers"]) >= 6, info     # 2 study + 2 aux + 1 volume + 1 deck
-    assert all(_alive(w) for w in info["workers"])
+    dead = [w for w in info["workers"] if not _alive(w)]
+    if dead:                                   # which worker, and what ps says of it (a start-up race, or a real exit)
+        ps = {w: subprocess.run(["ps", "-o", "pid=,ppid=,stat=,etime=,command=", "-p", str(w)], capture_output=True,
+                                text=True).stdout.strip() or "(gone)" for w in dead}
+        p.kill()
+        err = p.stderr.read()[-2000:] if p.stderr else ""
+        pytest.fail(f"workers not alive at start: {[(w, info.get('roles', {}).get(str(w), '?'), ps[w]) for w in dead]}; "
+                    f"server stderr: {err}")
     return p, info
 
 
@@ -91,6 +109,8 @@ def _all_gone(pids, within=15.0):
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX processes")
 def test_the_stale_exit_stops_every_worker(tmp_path):
     p, info = _start(tmp_path, "exit")
+    p.stdin.write("go\n")                        # every worker seen alive: now the stale exit
+    p.stdin.flush()
     p.wait(timeout=60)
     assert p.returncode == 0, p.stderr.read()[-2000:]
     assert _all_gone(info["workers"] + [info["tracker"]]) == []

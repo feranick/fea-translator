@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.09.5
+Version: 2026.11.09.6
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -33,7 +33,6 @@ import json
 import math
 import multiprocessing as mp
 import os
-import re
 import time
 import uuid
 from pathlib import Path
@@ -62,7 +61,8 @@ def _solver(solver: str | None) -> str:
 def tool_status() -> dict:
     from .runner import find_ccx
 
-    out = {"translator": __version__, "ccx": find_ccx(), "default_solver": _solver(None)}
+    from .runtime import RUNTIME_VERSION
+    out = {"translator": __version__, "runtime": RUNTIME_VERSION, "ccx": find_ccx(), "default_solver": _solver(None)}
     try:
         import gmsh
         out["gmsh"] = getattr(gmsh, "__version__", "yes")
@@ -273,17 +273,13 @@ def _request_dir(prefix: str) -> Path:
 
 def ran_with(meta: dict, results: dict) -> dict:
     """{"translator": the version a request's studies ran with (their results' own, else the one recorded when it was
-    submitted; a list when they differ), "translator_now": this server's, when it is another}. Before 2026.11.09.4 a
-    request's status gave the version installed when it was asked: a 2026.11.09.2 bench read '2026.11.09.3' after an
-    upgrade."""
-    vs = sorted({r["translator"] for r in results.values() if isinstance(r, dict) and r.get("translator")})
-    ran = (vs[0] if len(vs) == 1 else vs) if vs else meta.get("translator")
-    out = {"translator": ran if ran else __version__}
-    if not ran:
-        out["translator_note"] = "the version it ran with was not recorded (before 2026.11.09.4): this server's"
-    elif ran != __version__:
-        out["translator_now"] = __version__
-    return out
+    submitted; a list when they differ), "translator_now": this server's, when it is another} (llmt-runtime's
+    requests.ran_with). Before 2026.11.09.4 a request's status gave the version installed when it was asked: a
+    2026.11.09.2 bench read '2026.11.09.3' after an upgrade."""
+    from llmt_runtime import requests as R
+
+    from .runtime import RT
+    return R.ran_with(RT, meta, results)
 
 
 def _collect(folder: Path) -> dict:
@@ -770,7 +766,7 @@ def _timing(folder: Path, progress: dict) -> tuple[dict, str]:
     return t, nxt
 
 
-REQUEST_NAME = re.compile(r"^run_[A-Za-z0-9_.-]{1,80}$")
+from llmt_runtime.requests import REQUEST_NAME  # noqa: E402 (run_<id>: the router names requests)
 
 
 def start(studies: dict, solver: str | None = None, prefix: str = "run", request_name: str | None = None) -> Path:
@@ -793,10 +789,14 @@ def start(studies: dict, solver: str | None = None, prefix: str = "run", request
     # SLURM unless the study is short (its estimate, as validate_studies reports it, below FEAT_SLURM_MIN_MINUTES):
     # a SLURM job can be cancelled and runs on, whatever happens to this server
     slurm = [j["name"] for j in jobs if executor.use_slurm(j["study"], _route_minutes(j["study"], s))]
-    (folder / "request.json").write_text(json.dumps({"names": [j["name"] for j in jobs], "invalid": invalid,
-                                                     "solver": s, "started": time.time(), "slurm": slurm,
-                                                     "executor": executor.kind(),
-                                                     "timeout": executor.timeout_s(), "translator": __version__}))
+    from llmt_runtime import requests as R
+
+    from .runtime import RT
+    # the versions it is submitted with ("translator", and llmt-runtime's "runtime"): status reports what it ran with
+    (folder / "request.json").write_text(json.dumps(R.request_meta(RT, names=[j["name"] for j in jobs], invalid=invalid,
+                                                                   solver=s, started=time.time(), slurm=slurm,
+                                                                   executor=executor.kind(),
+                                                                   timeout=executor.timeout_s())))
     for n in slurm:   # one SLURM job per study; a failed submission is that study's result (no local fallback)
         info = executor.submit(folder, n, studies[n])
         if info.get("ok") is False:
@@ -859,18 +859,22 @@ def run(studies: dict, solver: str | None = None, wait: float | None = None, req
     request_name ('run_<anything>'): the folder's name, chosen by the caller (the router) so that it knows the request
     path even when the answer does not reach it in time; a call repeating a name that exists returns that request's
     status instead of submitting again (a retry after a time-out cannot run the studies twice)."""
+    from llmt_runtime import requests as R
+
+    from .runtime import RT
     t0 = time.time()
-    if request_name is not None:
-        if not isinstance(request_name, str) or not REQUEST_NAME.match(request_name):
-            return {"error": "request_name: 'run_' followed by letters, digits, _ . - (up to 80)"}
-        if (out_root() / request_name / "request.json").is_file():
-            res = status(str(out_root() / request_name), 0.0 if wait is None else min(wait, 15.0))
-            return dict(res, note="this request_name was submitted before: its status, nothing submitted again")
-        if (out_root() / request_name).exists():
-            return {"error": f"request_name {request_name!r}: the folder exists but holds no request (still being "
-                             "submitted by an earlier call? call again in a few seconds)",
-                    "request": str(out_root() / request_name)}
-    folder = start(studies, solver, request_name=request_name)
+    kind_, found = R.check_request_name(RT, request_name)     # llmt-runtime: new | repeat (its status) | error
+    if kind_ == "error":
+        return found
+    if kind_ == "repeat":
+        res = status(str(found), 0.0 if wait is None else min(wait, 15.0))
+        return dict(res, note=R.REPEAT_NOTE)
+    try:
+        folder = start(studies, solver, request_name=request_name)
+    except FileExistsError:                                   # another call took the name between the look and now
+        return {"error": f"request_name {request_name!r}: the folder exists but holds no request (still being "
+                         "submitted by an earlier call? call again in a few seconds)",
+                "request": str(out_root() / request_name)}
     # the wait counts from the call's start: building goals and submitting can take a while on a busy machine
     return status(str(folder), 1e9 if wait is None else max(0.0, wait - (time.time() - t0)))
 

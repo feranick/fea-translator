@@ -11,6 +11,7 @@ Analyses: **linear static** (displacements, von Mises stress, reactions, safety 
 ```bash
 cd ~/Desktop/fea-translator
 python3 -m venv .venv && source .venv/bin/activate        # Python 3.10+
+pip install -e ../llmt-runtime                             # the translators' shared runtime, first (or: pip install -r requirements-standalone.txt)
 pip install -e ".[mesh,mcp,test]"                          # numpy, scipy, matplotlib, gmsh, MCP SDK, pytest
 pip install -e ".[render]"                                 # optional: VTK pictures (PyVista), "quality": "high"
 pip install -e ../build123d-translator                     # optional: parts as goals
@@ -24,6 +25,8 @@ On **Linux ARM (aarch64**, e.g. DGX Spark) PyPI has no Gmsh wheels, so the `mesh
 sudo apt install -y python3-gmsh
 ln -sf /usr/lib/python3/dist-packages/gmsh.py "$VIRTUAL_ENV/lib/python3.12/site-packages/gmsh.py"
 ```
+
+The executor's shared code (workers, out of memory, SLURM job states, request names, version recording) comes from **llmt-runtime** (`llmt-runtime>=2026.11.09.2`, a floor: any later version works). Inside llm-translators, `llmt install` / `llmt update` / `llmt deploy` install it first from the umbrella's pinned copy.
 
 CalculiX (`ccx`) is a separate program:
 
@@ -275,7 +278,8 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 | `fea_translator/joint.py` | Assemblies and joints: meshing parts, contacts, gaskets, bolt and nut connectors, the steps, contact states, leak and lift-off, frequencies |
 | `fea_translator/render.py` | Pictures: fields from the nodal solution, the saved state, validation, defaults, Matplotlib |
 | `fea_translator/render_vtk.py` | Pictures with VTK (PyVista) in a child process; the offscreen probe |
-| `fea_translator/workers.py` | Worker processes that end with their server (parent watch, their CalculiX runs) |
+| `fea_translator/workers.py` | Worker processes that end with their server (parent watch, their CalculiX runs): llmt-runtime's |
+| `fea_translator/runtime.py` | feat's llmt-runtime (`RT`: FEAT_ settings, hooks) |
 | `fea_translator/api.py`, `cli.py`, `mcp_server.py` | JSON API, `feat`, `feat-mcp` |
 | `examples/studies.json` | A bracket (static, modal), a finned plate (thermal), a column (buckling) |
 | `tests/` | Tests |
@@ -284,6 +288,7 @@ In the Claude desktop app's `claude_desktop_config.json` (or LM Studio's `mcp.js
 
 | Component | Version |
 |---|---|
+| Package, `runtime.py`, `workers.py`, `runner.py`, `executor.py`, `api.py` | 2026.11.09.6 (feat moves onto **llmt-runtime** (needs `llmt-runtime>=2026.11.09.2`), phase 1: worker processes (`workers.py` is llmt-runtime's: a SIGTERM to a worker, as `Pool.terminate()` sends, now also ends the CalculiX runs it started, which used to run on in their own process groups; the parent watch also follows the server's pid), memory and out of memory (the cgroup counters, the job's limit, the node's memory, job vs node, `threads_for_memory` with feat's model as the need), `ended_state` (the same states and wording; a job that left no `job.log` now says it never started), version recording (`request.json` also records `runtime`) and `ran_with`, `request_name` (two calls racing for one name: the second gets the 'still being submitted' error instead of an exception). `tool_status()` and its `executor` key report `runtime`. Why: the four translators each had their own copy of this code and had drifted (cfdt and omct matched only `oom-kill`, lmpt reported out of memory as a time-out); fixes now land once. Phase 2 (the SLURM layer) and phase 3 (the MCP server's stale handling) follow. Also `tests/test_workers.py` works on macOS: without /proc its process check took every worker for gone, and its stale-exit test raced the exit (the server now waits for the test to have seen its workers alive, and a failure names the worker, its role and `ps` line).) |
 | Package, `executor.py`, `api.py`, `tests/fake_slurm` | 2026.11.09.5 (SLURM time limits: SLURM lets only an admin raise a running job's limit (mochi job 3177: 'Access/permission denied'), so `extend` could not work without one; jobs now ask for the partition's own limit (`FEAT_SLURM_TIME=max`, default; `UNLIMITED` where it has none; `estimate` for the old sizing, or minutes), feat's own CalculiX timeout still ending runs first; job.json records `slurm_time` and why; `extend` asks SLURM only when the job's time left does not cover feat's new deadline, and when SLURM refuses it says when the job will end) |
 | Package, `api.py` | 2026.11.09.4 (a request's and a benchmark's status give the feat version its studies ran with (their results' own, else the one request.json now records at submission; a list when they differ), and `translator_now` when this server runs another: a 2026.11.09.2 bench on mochi read '2026.11.09.3' after the upgrade; benchmark cases list their own `translator`) |
 | Package, `bench.py` | 2026.11.09.3 (`assembly_partial_tie` on mochi: first frequency 156.06 Hz against 160.80 (2.9 %, within 5 %), tied on 144 nodes; its closed fraction came out 17 %, not the footprint's 11 %: the nodes on the footprint's rim count with their whole node area; the closed-fraction checks now take 10-20 %) |

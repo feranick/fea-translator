@@ -1,5 +1,9 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.08.1
+Version: 2026.11.09.6
+
+Memory and out of memory (the cgroup counters, the job's limit, the node's memory, job vs node, the wording) come from
+llmt-runtime (llmt_runtime.memory) since 2026.11.09.6; what feat does after a kill (a threaded CalculiX run restarted on
+one thread) and its memory model (executor.mem_gb) stay here.
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -25,6 +29,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from llmt_runtime import memory as M
 
 from . import __version__, deck, results, workers
 from .meshdata import Mesh, MeshError
@@ -66,109 +71,36 @@ RAW_ESTIMATE = {"nodes": None}      # the running study's node estimate before m
 
 def _own_rss_gb() -> float:
     """This process's resident memory (GB): it shares the job's memory with CalculiX."""
-    try:
-        for ln in Path("/proc/self/status").read_text().splitlines():
-            if ln.startswith("VmRSS:"):
-                return int(ln.split()[1]) / 2 ** 20
-    except (OSError, ValueError, IndexError):
-        pass
-    return 0.0
+    return M.own_rss_mb() / 1024
 
 
 def threads_for_memory(nodes: int, method: str, threads: int, limit_mb: float | None) -> tuple[int, dict | None]:
     """(threads, note) for a CalculiX run on the meshed `nodes`, from feat's memory model (executor.mem_gb) and the
     memory the job has (less this process's own): 1 thread when the threads asked for would not fit; a note when even
-    that may not fit. The size estimate before meshing can be far off (carbonio job 5807, an S50 sleeve assembly:
-    107,171 nodes estimated, 424,303 meshed; 6 threads in 30 GB were killed after 7 min), the meshed count is not."""
+    that may not fit (llmt_runtime.memory.threads_for_memory, feat's model as the need). The size estimate before
+    meshing can be far off (carbonio job 5807, an S50 sleeve assembly: 107,171 nodes estimated, 424,303 meshed;
+    6 threads in 30 GB were killed after 7 min), the meshed count is not."""
     if not limit_mb or nodes <= 0:
         return threads, None
     from .executor import ask_gb, mem_gb
-    avail = limit_mb / 1024 - _own_rss_gb() - 0.5
-    need = {t: mem_gb(nodes, method, t) for t in sorted({threads, 1})}
-    note = {"nodes": nodes, "threads_asked": threads, "limit_gb": round(limit_mb / 1024, 1),
-            "available_gb": round(avail, 1), "estimate_gb": {str(k): round(v, 1) for k, v in need.items()}}
-    use = threads
-    if threads > 1 and need[threads] > avail:
-        use = 1
-        note["message"] = (f"the meshed {nodes:,} nodes need about {need[threads]:.0f} GB with {threads} threads and "
-                           f"{need[1]:.0f} GB with 1; the job has {limit_mb / 1024:.0f} GB: CalculiX runs on 1 thread")
-    if need[1] > avail and use == 1:
-        note["message"] = (note.get("message", f"the meshed {nodes:,} nodes need about {need[1]:.0f} GB with 1 thread; "
-                                               f"the job has {limit_mb / 1024:.0f} GB")
-                           + f"; it may run out of memory: ask for {ask_gb(need[1])}G (run.mem)")
-    note["threads"] = use
-    return use, (note if "message" in note else None)
+    t, note = M.threads_for_memory(lambda n: mem_gb(nodes, method, n), threads, limit_mb,
+                                   what=f"the meshed {nodes:,} nodes", solver="CalculiX", ask_gb=ask_gb,
+                                   own_mb=_own_rss_gb() * 1024)
+    return t, (None if note is None else {"nodes": nodes, **note})
 
 
-def _cgroup_dirs() -> list[Path]:
-    """This process's memory cgroups, its own first and then each parent (cgroup v2, or v1's memory hierarchy);
-    [] where there are none (macOS). A SLURM job's CalculiX runs in the same cgroup as feat."""
-    try:
-        lines = Path("/proc/self/cgroup").read_text().splitlines()
-    except OSError:
-        return []
-    out = []
-    for ln in lines:
-        parts = ln.split(":", 2)
-        if len(parts) != 3:
-            continue
-        hid, ctrl, rel = parts
-        if hid == "0" and ctrl == "":
-            root = Path("/sys/fs/cgroup")
-        elif "memory" in ctrl.split(","):
-            root = Path("/sys/fs/cgroup/memory")
-        else:
-            continue
-        d = root / rel.strip().lstrip("/")
-        while True:
-            out.append(d)
-            if d == root or d.parent == d:
-                break
-            d = d.parent
-    return out
-
-
-def oom_kills() -> dict:
-    """{cgroup: processes killed by the out-of-memory killer so far} (v2 memory.events, v1 memory.oom_control)."""
-    out = {}
-    for d in _cgroup_dirs():
-        for f in ("memory.events", "memory.oom_control"):
-            try:
-                for ln in (d / f).read_text().splitlines():
-                    k, _, v = ln.partition(" ")
-                    if k == "oom_kill":
-                        out[str(d / f)] = int(v)
-            except (OSError, ValueError):
-                pass
-    return out
-
-
-def oom_limit_hits() -> dict:
-    """{cgroup: times its memory reached its limit (cgroup v2 memory.events 'oom')}: a kill without one of these is
-    the node's out-of-memory killer, not the job's limit ({} on cgroup v1, where there is no such count)."""
-    out = {}
-    for d in _cgroup_dirs():
-        try:
-            for ln in (d / "memory.events").read_text().splitlines():
-                k, _, v = ln.partition(" ")
-                if k == "oom":
-                    out[str(d)] = int(v)
-        except (OSError, ValueError):
-            pass
-    return out
-
-
-def meminfo_mb() -> tuple[float, float] | None:
-    """(total, available) memory of this node in MB (/proc/meminfo); None elsewhere."""
-    try:
-        vals = {}
-        for ln in Path("/proc/meminfo").read_text().splitlines():
-            k, _, v = ln.partition(":")
-            if k in ("MemTotal", "MemAvailable"):
-                vals[k] = int(v.split()[0]) / 1024
-        return vals["MemTotal"], vals["MemAvailable"]
-    except (OSError, ValueError, KeyError, IndexError):
-        return None
+# the cgroup counters, the job's memory limit and the node's memory: llmt-runtime's (the names stay: feat's run_ccx and
+# tests use them here)
+_cgroup_dirs = M.cgroup_dirs
+oom_kills = M.oom_kills
+oom_limit_hits = M.oom_limit_hits
+meminfo_mb = M.meminfo_mb
+kernel_oom_constraint = M.kernel_oom_constraint
+oom_scope = M.oom_scope
+memory_limit_mb = M.memory_limit_mb
+node_oom_text = M.node_oom_text
+out_of_memory = M.out_of_memory
+_exit_text = M.exit_text
 
 
 NODE_MEM: dict = {"total_mb": None, "samples": []}   # this run's samples of the node's available memory (t, MB)
@@ -190,107 +122,10 @@ def node_min_free_mb(seconds: float = 15.0) -> float | None:
     return min(a for t, a in NODE_MEM["samples"] if t >= t_end - seconds)
 
 
-def kernel_oom_constraint(pid: int, since: float) -> str | None:
-    """The kernel's own word on why it killed `pid`: 'CONSTRAINT_MEMCG' (a cgroup's limit: the job's) or
-    'CONSTRAINT_NONE' (the node ran out), from its log (journalctl -k), when this user may read it; else None."""
-    if not shutil.which("journalctl"):
-        return None
-    try:
-        r = subprocess.run(["journalctl", "-k", "-q", "-o", "cat", "--no-pager", "--since", f"@{int(since) - 5}"],
-                           capture_output=True, text=True, timeout=8)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    import re
-    for ln in r.stdout.splitlines():
-        m = re.search(r"oom-kill:constraint=(CONSTRAINT_\w+).*\bpid=(\d+)", ln)
-        if m and int(m.group(2)) == pid:
-            return m.group(1)
-    return None
-
-
-def oom_scope(kills0: dict, kills1: dict, hits0: dict, hits1: dict, code: int, rss_mb: float, limit_mb: float | None,
-              node_free_mb: float | None, node_total_mb: float | None, kernel: str | None = None) -> str | None:
-    """Whose memory ran out when CalculiX was killed: 'job' (its cgroup reached the job's limit: more memory or fewer
-    threads is the fix), 'node' (the node ran out with the job below its limit: other jobs or processes; run when the
-    node is free), None (not killed for memory). From the kernel's log when readable; else the cgroup counters (a kill
-    with no 'limit reached' count is the node's); else the sizes (carbonio, 2026.11.07: two runs 'out of memory' at
-    20.1 and 13.9 GB in 34 GB jobs)."""
-    if code == 0:
-        return None
-    if kernel:
-        return "job" if kernel == "CONSTRAINT_MEMCG" else "node"
-    grew = lambda a, b: any(b.get(k, 0) > n for k, n in a.items()) or any(k not in a and n > 0 for k, n in b.items())  # noqa: E731
-    node_low = bool(node_free_mb is not None and node_total_mb and node_free_mb < max(0.05 * node_total_mb, 1024))
-    near_limit = bool(limit_mb and rss_mb >= 0.8 * limit_mb)
-    if grew(kills0, kills1):
-        if hits1:
-            return "job" if grew(hits0, hits1) else "node"
-        return "node" if (node_low and not near_limit) else "job"
-    if code == -9:
-        if limit_mb and rss_mb >= 0.9 * limit_mb:
-            return "job"
-        if node_low:
-            return "node"
-    return None
-
-
 def node_jobs_text() -> str:
     """The jobs running on this node (SLURM), with the memory each asked for, and a note when they add up to more
-    than the node has (SLURM then does not count memory when it places jobs); '' outside SLURM."""
-    node = os.environ.get("SLURMD_NODENAME")
-    if not node or not shutil.which("squeue"):
-        return ""
-    try:
-        r = subprocess.run(["squeue", "-h", "-w", node, "-t", "R", "-o", "%i|%m|%j"], capture_output=True, text=True,
-                           timeout=8)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    from .executor import mem_mb
-    jobs, total = [], 0.0
-    for ln in r.stdout.splitlines():
-        f = ln.split("|")
-        if len(f) >= 3:
-            mb = mem_mb(f[1]) or 0
-            total += mb
-            jobs.append(f"{f[0]} ({f[2][:40]}, {f[1]})")
-    if not jobs:
-        return ""
-    out = f"; running on {node} now: " + ", ".join(jobs[:8])
-    tot = NODE_MEM.get("total_mb")
-    if tot and total > tot:
-        out += (f" — together {total / 1024:.0f} GB asked on a node with {tot / 1024:.0f} GB: SLURM is not counting "
-                "memory when it places jobs here")
-    return out
-
-
-def memory_limit_mb() -> float | None:
-    """The memory this process (and CalculiX) may use: the SLURM job's (SLURM_MEM_PER_NODE, MB), else its cgroup's
-    memory.max (v2) or memory.limit_in_bytes (v1); None: no limit known."""
-    v = os.environ.get("SLURM_MEM_PER_NODE")
-    if v:
-        try:
-            return float(v)
-        except ValueError:
-            pass
-    for d in _cgroup_dirs():
-        for f in ("memory.max", "memory.limit_in_bytes"):
-            try:
-                t = (d / f).read_text().strip()
-            except OSError:
-                continue
-            if t.isdigit() and int(t) < 2 ** 60:
-                return int(t) / 2 ** 20
-    return None
-
-
-def node_oom_text(rec: dict) -> str:
-    """'the node ran out of memory (other processes): killed at 13.9 GB, below the job's 34.0 GB; the node's free
-    memory fell to 0.3 GB of 62.6 GB'."""
-    lim = f", below the job's {rec['limit_mb'] / 1024:.1f} GB" if rec.get("limit_mb") else ""
-    free = (f"; the node's free memory fell to {rec['node_min_free_mb'] / 1024:.1f} GB of {rec['node_total_mb'] / 1024:.1f} GB"
-            if rec.get("node_min_free_mb") is not None and rec.get("node_total_mb") else "")
-    return (f"the node ran out of memory (other processes): killed at {rec.get('peak_rss_mb', 0) / 1024:.1f} GB{lim}"
-            f"{free}{rec.get('node_jobs', '')}")
+    than the node has (llmt_runtime.memory.node_jobs_text with this run's node total); '' outside SLURM."""
+    return M.node_jobs_text(NODE_MEM.get("total_mb"))
 
 
 def crash_message(rec: dict) -> str:
@@ -307,29 +142,6 @@ def crash_message(rec: dict) -> str:
                 f"after {rec.get('run_s', 0) / 60:.0f} min; rerunning on 1 thread ({slower}, about half the memory)")
     return (f"crashed ({rec.get('crash')}, no error message) with {rec['threads']} threads after "
             f"{rec.get('run_s', 0) / 60:.0f} min; rerunning on 1 thread ({slower})")
-
-
-def out_of_memory(code: int, before: dict, after: dict, rss_mb: float, limit_mb: float | None) -> bool:
-    """Was a CalculiX run that ended with `code` killed for memory? Its cgroup counted an OOM kill meanwhile, or
-    (no cgroup counters) SIGKILL with its peak resident memory at 90 % of the limit or more. (carbonio, 2026.11.05:
-    an S50 sleeve assembly with 6 threads was killed at 33.4 GB in a 32 GB job and was taken for a crash.)"""
-    if code == 0:
-        return False
-    if any(after.get(k, 0) > n for k, n in before.items()) or any(k not in before and n > 0 for k, n in after.items()):
-        return True
-    return code == -9 and bool(limit_mb) and rss_mb >= 0.9 * limit_mb
-
-
-def _exit_text(code: int) -> str:
-    """'exit code 3', or the signal that killed the process ('signal 11 (SIGSEGV)')."""
-    if code < 0:
-        import signal
-
-        try:
-            return f"signal {-code} ({signal.Signals(-code).name})"
-        except ValueError:
-            return f"signal {-code}"
-    return f"exit code {code}"
 
 
 class Cancelled(Exception):

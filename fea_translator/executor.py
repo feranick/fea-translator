@@ -1,5 +1,8 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.09.5
+Version: 2026.11.09.6
+
+From 2026.11.09.6 ended_state is llmt-runtime's (llmt_runtime.jobs.ended_state, with feat's oom_advice), and
+status_key reports llmt-runtime's version ("runtime"); the rest of the SLURM layer moves in phase 2.
 
 Settings (environment): FEAT_EXECUTOR local | slurm (local); FEAT_SLURM_MIN_MINUTES (1): studies whose
 time estimate is below run locally even with slurm; FEAT_SLURM_ARGS: extra sbatch arguments, split as a shell
@@ -337,7 +340,13 @@ def status_key() -> dict:
             "procs": default_procs(), "timeout_s": timeout_s(), "time_limit_min": time_limit_min(),
             "slurm_time": os.environ.get("FEAT_SLURM_TIME", "max"),
             "mem": os.environ.get("FEAT_SLURM_MEM", "auto"), "caps": caps(), "node": node_status(),
-            "node_cores": node_cores()}
+            "node_cores": node_cores(), "runtime": _runtime_version()}
+
+
+def _runtime_version() -> str:
+    """llmt-runtime's version (machines() and llmt status show it)."""
+    from llmt_runtime import __version__ as v
+    return v
 
 
 # ----------------------------------------------------------------------------- a call's time budget
@@ -1058,18 +1067,13 @@ def oom_advice(folder: Path) -> str:
 
 
 def ended_state(acct: str | None, log: Path) -> tuple[str, str]:
-    """(state, why) of a job that left the queue without writing a result."""
-    a = (acct or "").upper()
-    tail = _tail(log)
-    if a.startswith("TIMEOUT") or (not a and "DUE TO TIME LIMIT" in tail):
-        return "timed_out", ("SLURM's time limit stopped it before feat's own timeout: raise FEAT_TIMEOUT "
-                             "(it also sets the job's limit) or coarsen the mesh / drop converge")
-    if a.startswith("OUT_OF_MEMORY") or re.search(r"oom[-_ ]kill|out of memory", tail, re.I):
-        return "out_of_memory", oom_advice(Path(log).parent)
-    if a.startswith("CANCELLED") or (not a and "CANCELLED" in tail):
-        who = acct.split("by", 1)[1].strip() if acct and "by" in acct else None
-        return "cancelled", "cancelled" + (f" by {who}" if who else "") + " (scancel or cancel())"
-    return "failed", "the job ended without a result" + (f"; job.log:\n{tail}" if tail else " (no job.log)")
+    """(state, why) of a job that left the queue without writing a result: llmt-runtime's ended_state (sacct's state,
+    else job.log: 'DUE TO TIME LIMIT', 'CANCELLED', SLURM's out-of-memory wording 'Detected N oom_kill events'), with
+    feat's oom_advice and timeout hint (runtime.RT's hooks)."""
+    from llmt_runtime import jobs as J
+
+    from .runtime import RT
+    return J.ended_state(RT, acct, Path(log))
 
 
 def job_states(request: Path, names: list[str]) -> dict:
