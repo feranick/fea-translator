@@ -1,7 +1,7 @@
 """Assemblies (analysis "assembly", joint.py): steps and their loads, contacts (hard, penalty, bonded, clearance), nuts
 on a meshed shaft, probes, part stresses, modal steps on the loaded state, validation, pictures. Offline: the CalculiX
 runs are the assembly_* benchmarks (test_fea.test_benchmark_calculix, FEAT_SLOW_TESTS=1).
-Version: 2026.11.09.1
+Version: 2026.11.09.2
 """
 import copy
 import math
@@ -213,7 +213,8 @@ def test_assembly_validation():
     no_rho = _boxes()
     no_rho["parts"]["top"]["material"] = {"E": 70000, "nu": 0.3}
     assert "needs a density" in errs(no_rho)
-    for name in ("assembly_clamp", "assembly_press_fit", "assembly_bonded_beam", "assembly_clamped_beam"):
+    for name in ("assembly_clamp", "assembly_press_fit", "assembly_bonded_beam", "assembly_clamped_beam",
+                 "assembly_partial_tie"):
         assert validate_study(cases()[name])["ok"], name
     assert errs(_boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
                                   "clearance": 0.05}])) == ""

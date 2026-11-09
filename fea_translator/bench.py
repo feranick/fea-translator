@@ -1,5 +1,5 @@
 """bench.py — benchmark studies with closed-form answers: the translator's checker.
-Version: 2026.11.05.1
+Version: 2026.11.09.2
 
     run(solver="ccx", names=None, folder=...) -> {case: {...results, checks, passed}}
 
@@ -192,7 +192,8 @@ def cases(solver: str = "ccx") -> dict:
 NEEDS = {"euler_column": {"ccx"}, "plate_hole": {"ccx", "gmsh"}, "lame_ring": {"gmsh"}, "coax_capacitor": {"gmsh"},
          "joint_pull": {"ccx"}, "joint_cover": {"ccx", "gmsh"}, "joint_two_bolt": {"ccx"},
          "assembly_clamp": {"ccx", "gmsh"}, "assembly_press_fit": {"ccx", "gmsh"},
-         "assembly_bonded_beam": {"ccx", "gmsh"}, "assembly_clamped_beam": {"ccx", "gmsh"}}
+         "assembly_bonded_beam": {"ccx", "gmsh"}, "assembly_clamped_beam": {"ccx", "gmsh"},
+         "assembly_partial_tie": {"ccx", "gmsh"}}
 # benchmarks that take minutes each with CalculiX (measured on mochi, 2026.11.02): the test suite skips them unless
 # FEAT_SLOW_TESTS=1; run_benchmarks and `feat bench` run them as any other
 # benchmarks of features not released yet: kept, not run (interference fits did not converge in CalculiX's face-to-face
@@ -205,7 +206,7 @@ def pending_cases() -> dict:
 
 
 SLOW = {"joint_pull": 15, "joint_cover": 15, "joint_two_bolt": 3, "assembly_clamp": 10, "assembly_press_fit": 2,
-        "assembly_bonded_beam": 5, "assembly_clamped_beam": 10}   # assembly_*: estimates until measured
+        "assembly_bonded_beam": 5, "assembly_clamped_beam": 10, "assembly_partial_tie": 10}   # assembly_*: estimates
 
 
 def _joint_cases() -> dict:
@@ -363,5 +364,24 @@ def _assembly_cases() -> dict:
     clamped = beam({"law": "hard", "friction": 0.3},
                    [{"kind": "pressure", "name": "clamp", "faces": {"part": "upper", "nz": 1}, "p": 50.0}])
     clamped["expect"].append({"quantity": "steps.0.contacts.joint.closed_fraction", "value": 1.0, "tol": 0.01})
+    # assembly_partial_tie: the whole cantilever (r 10, 300) on a base disk r 30, 10 thick, fixed underneath, held by
+    # friction under the same 50 MPa clamp; the contact's slave face is the disk's top, so it closes only under the
+    # beam ((10/30)^2 = 11 % of it) and the modal run ties it there only (a nodal *TIE): the beam must come out
+    # clamped (Euler-Bernoulli, 5 %: the disk under the root gives a little), not floating (s50_hubfit_loose,
+    # 2026.11.09: a contact closed on part of its face was left free and the parts floated at 0.2-0.5 Hz)
+    partial = {"analysis": "assembly", "mesh": {"size": 4},
+               "parts": {"base": {"part": cyl(30, 10)}, "beam": {"part": cyl(r, Lb), "move": [0, 0, 10]}},
+               "bcs": [{"kind": "fixed", "name": "root", "faces": {"part": "base", "nz": -1}},
+                       {"kind": "force", "name": "side", "faces": {"part": "beam", "nz": 1}, "fx": F},
+                       {"kind": "pressure", "name": "clamp", "faces": {"part": "beam", "nz": 1}, "p": 50.0}],
+               "contacts": [{"name": "joint", "faces": {"part": "base", "nz": 1}, "with": {"part": "beam", "nz": -1},
+                             "law": "hard", "friction": 0.3}],
+               "probes": [{"name": "tip", "faces": {"part": "beam", "nz": 1}}],
+               "steps": [{"kind": "static", "loads": ["side"]}, {"kind": "modal", "modes": 4}], "run": {"timeout_s": 1800},
+               "expect": [{"quantity": "steps.0.probes.tip.ux", "value": tip, "tol": 0.10},
+                          {"quantity": "steps.0.contacts.joint.closed_fraction", "value": (r / 30) ** 2, "tol": 0.35},
+                          {"quantity": "modal.0.tied_where_closed.joint.closed_fraction", "value": (r / 30) ** 2,
+                           "tol": 0.35},
+                          {"quantity": "frequencies.0", "value": f1, "tol": 0.05}]}
     return {"assembly_clamp": clamp, "assembly_press_fit": press, "assembly_bonded_beam": bonded,
-            "assembly_clamped_beam": clamped}
+            "assembly_clamped_beam": clamped, "assembly_partial_tie": partial}
