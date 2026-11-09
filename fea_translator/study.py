@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.11.07.2
+Version: 2026.11.09.1
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -151,7 +151,7 @@ ASSEMBLY_DOC = ("analysis assembly: parts, bcs, gaskets, bolts as joint, and con
                 "bonded | {stiffness}, friction 0.2, clearance mm (< 0: interference)}], nuts [{name, size, preload | "
                 "torque, at [[x,y,z]], bears_on, thread {part, depth}}] (a nut on a meshed shaft), probes [{name, faces}], "
                 "steps [{kind: preload} (with bolts or nuts, first), {kind: static, loads: [bc names], scale}, {kind: "
-                "sweep, bc, steps}, {kind: modal, modes} (closed pairs tied)]. Loads no step names act in every step. Results: steps[] "
+                "sweep, bc, steps}, {kind: modal, modes} (pairs tied where closed; floating parts' rigid-body modes left out)]. Loads no step names act in every step. Results: steps[] "
                 "(contacts: force, pressure, closed_fraction, stick_fraction, opening, slip; probes; parts: peak von "
                 "Mises), modal[] (frequencies_Hz, after_step), frequencies. README: Assembly studies.")
 FIELD_NAMES = ("von_mises", "displacement", "ux", "uy", "uz", "max_principal", "safety_factor", "temperature",

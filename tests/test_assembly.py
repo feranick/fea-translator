@@ -1,7 +1,7 @@
 """Assemblies (analysis "assembly", joint.py): steps and their loads, contacts (hard, penalty, bonded, clearance), nuts
 on a meshed shaft, probes, part stresses, modal steps on the loaded state, validation, pictures. Offline: the CalculiX
 runs are the assembly_* benchmarks (test_fea.test_benchmark_calculix, FEAT_SLOW_TESTS=1).
-Version: 2026.11.05.1
+Version: 2026.11.09.1
 """
 import copy
 import math
@@ -159,8 +159,23 @@ def test_assembly_results(boxes):
     m = res["modal"][0]
     assert m["step"] == 2 and m["after_step"] == 1 and m["contacts"]["c"]["closed_fraction"] == 1.0 and m["tied"] == ["c"]
     assert any("partly slipping" in w for w in res["warnings"])
-    assert joint.modal_ties(plan, s0) == (["c"], [], ["c"])
-    assert joint.modal_ties(plan, {"contacts": {"c": dict(c, closed_fraction=0.2)}})[1] == ["c"]   # open: free
+    assert joint.modal_ties(plan, s0) == ({"c": None}, [], ["c"], {})            # closed all over: tied whole
+    some = c["_closed_nodes"][:5]                                                 # closed on part of it: tied there
+    t, f, sl, part = joint.modal_ties(plan, {"contacts": {"c": dict(c, closed_fraction=0.2, _closed_nodes=some)}})
+    assert t == {"c": some} and f == [] and part == {"c": [5, 0.2]}
+    assert joint.modal_ties(plan, {"contacts": {"c": dict(c, closed_fraction=0.0, _closed_nodes=[])}})[1] == ["c"]  # open: free
+    # a part with no tied path to a support floats: its rigid-body modes are left out, with a warning
+    assert joint.free_groups(plan, {"c": None}) == [] and joint.free_groups(plan, {}) == [["top"]]
+    rb = {2: dict(runs[2], eigen=[{"hz": 0.22}, {"hz": 0.31}] + eig, tied=[], free=["c"], floating=[["top"]],
+                  extra_modes=6)}
+    r2 = joint.evaluate(st, parts, plan, EIGEN, frd, rb)
+    assert r2["modal"][0]["rigid_body_Hz"] == [0.22, 0.31] and r2["frequencies"] == pytest.approx([159.1549, 166.9227, 1006.584])
+    assert any("part(s) top have no tied path to a support (their contacts c were open at step 1)" in w for w in r2["warnings"])
+    deck, _ = joint.write("m", st, parts, modal={"modes": 3, "ties": {"c": some}, "tol": 0.1})   # tied at those nodes
+    assert "*SURFACE, NAME=CT_C, TYPE=NODE\nCTN_C\n*TIE, NAME=T_C, POSITION TOLERANCE=0.1\nCT_C, CM_C" in deck
+    assert "*NSET, NSET=CTN_C\n" + ", ".join(str(q) for q in some) in deck
+    lo = {2: dict(runs[2], eigen=[{"hz": 0.5}] + eig)}                            # not floating, yet below 1 Hz: said
+    assert any("frequencies below 1 Hz (0.5)" in w for w in joint.evaluate(st, parts, plan, EIGEN, frd, lo)["warnings"])
     assert "leak" not in res and "bolt_preload_error" not in res and res["contacts"]["c"]["law"]["kind"] == "hard"
     # pictures: the state keeps the static step for the modal step, and the mode shapes
     from fea_translator import render

@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.07.1
+Version: 2026.11.09.1
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -478,7 +478,8 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
     for p in parts:
         L.append(f"*ELEMENT, TYPE={etype}, ELSET=E_{_name(p['name'])}")
         L += [f"{p['e0'] + e + 1}, " + ", ".join(str(p["n0"] + n + 1) for n in row) for e, row in enumerate(p["mesh"].tets)]
-    plan = {"analysis": an, "sets": {}, "supports": [], "loads": [], "kinds": {}, "bolts": [], "gaskets": [],
+    plan = {"analysis": an, "sets": {}, "supports": [], "support_parts": [], "part_names": [q["name"] for q in parts],
+            "loads": [], "kinds": {}, "bolts": [], "gaskets": [],
             "contacts": [], "probes": {}, "steps": [], "sweep": None, "selection": {}, "n_nodes": n_next - 1,
             "n_elements": e_next - 1, "element": etype, "load_mag": {}}
     dsteps = deck_steps(study)
@@ -514,6 +515,8 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
                     if key in bc:
                         bnd.append(f"{sname}, {d + 1}, {d + 1}, {_g(bc[key])}")
             plan["supports"].append(bname)
+            plan.setdefault("support_parts", [])
+            plan["support_parts"] = sorted(set(plan["support_parts"]) | {q["name"] for q, _ in sel})
         elif k == "pressure":
             rows = [(e + 1, s) for e, s in _gfaces(sel)]
             area = sum(p["mesh"].area_of(tg) for p, tg in sel)
@@ -629,6 +632,7 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
                   for p, tgs in slave for tg_ in tgs)
         gap = face_gap(X, sn, _gnodes(master), _unit(nrm))
         plan["gaskets"].append({"name": g["name"], "slave_faces": sf, "seal": g.get("seal", {}),
+                                "parts": sorted({q["name"] for q, _ in slave} | {q["name"] for q, _ in master}),
                                 "inner_at": g.get("inner_at"), "tags": gtags(parts, slave),
                                 "with_tags": gtags(parts, master), "normal": _unit(nrm).tolist(),
                                 "law": law, "friction": friction_lines(law["stiffness_MPa_mm"], g),
@@ -649,7 +653,13 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
         fr = friction_lines(K, {"friction": mu}) if mu > 0 and law["kind"] != "bonded" else []
         if modal is not None:
             if c["name"] in modal["ties"]:
-                L += [f"*TIE, NAME=T_{cn}, POSITION TOLERANCE={_g(modal['tol'])}", f"CS_{cn}, CM_{cn}"]
+                only = (modal["ties"].get(c["name"]) if isinstance(modal["ties"], dict) else None)
+                if only:   # tied where it was closed: those slave nodes, as a nodal surface
+                    L += [f"*NSET, NSET=CTN_{cn}"] + _lines(sorted(int(q) for q in only))
+                    L += [f"*SURFACE, NAME=CT_{cn}, TYPE=NODE", f"CTN_{cn}"]
+                    L += [f"*TIE, NAME=T_{cn}, POSITION TOLERANCE={_g(modal['tol'])}", f"CT_{cn}, CM_{cn}"]
+                else:
+                    L += [f"*TIE, NAME=T_{cn}, POSITION TOLERANCE={_g(modal['tol'])}", f"CS_{cn}, CM_{cn}"]
         else:
             L += [f"*SURFACE INTERACTION, NAME=CI_{cn}"]
             if law["kind"] == "bonded":   # tied in every direction: CalculiX takes the tangential stiffness from
@@ -665,6 +675,7 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
         nrm = sum((p["mesh"].groups[tg_].normal * p["mesh"].groups[tg_].area[:, None]).sum(axis=0)
                   for p, tgs in slave for tg_ in tgs)
         plan["contacts"].append({"name": c["name"], "slave_faces": sf, "tags": gtags(parts, slave),
+                                 "parts": sorted({q["name"] for q, _ in slave} | {q["name"] for q, _ in master}),
                                  "with_tags": gtags(parts, master), "normal": _unit(nrm).tolist(), "law": law,
                                  "friction_mu": mu, "friction": fr, "interaction": f"CI_{cn}",
                                  "clearance_mm": c.get("clearance"),
@@ -1065,7 +1076,8 @@ def contact_state(c: dict, cmap: dict | None, area: dict) -> dict | None:
     sl = [math.hypot(cmap.get(n, {}).get("cslip1", 0.0), cmap.get(n, {}).get("cslip2", 0.0)) for n in area]
     op = [float(cmap.get(n, {}).get("copen", 0.0)) for n in area]
     closed = sum(a for n, a in area.items() if p[n] > 0)
-    out = {"force_N": round(sum(p[n] * a for n, a in area.items()), 3), "max_pressure_MPa": round(max(p.values(), default=0.0), 6),
+    out = {"_closed_nodes": sorted(n for n in area if p[n] > 0),   # for a modal step's ties (removed from results)
+           "force_N": round(sum(p[n] * a for n, a in area.items()), 3), "max_pressure_MPa": round(max(p.values(), default=0.0), 6),
            "mean_pressure_MPa": round(sum(p[n] * a for n, a in area.items()) / A, 6),
            "closed_fraction": round(closed / A, 6), "max_opening_mm": round(max(op, default=0.0), 8),
            "max_slip_mm": round(max(sl, default=0.0), 8)}
@@ -1243,11 +1255,41 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
         for s in modal:
             run = (modal_runs or {}).get(s["step"]) or {}
             base = next((r for r in reversed(res["steps"]) if r["step"] < s["step"]), None)
-            fr = [round(float(e["hz"]), 6) for e in run.get("eigen", [])][:s["modes"]]
-            res["modal"].append({"step": s["step"], "name": s.get("name"), "after_step": base["step"] if base else None,
-                                 "frequencies_Hz": fr, "tied": run.get("tied", []), "free": run.get("free", []),
-                                 "contacts": {k: {q: v[q] for q in ("closed_fraction", "stick_fraction", "force_N")}
-                                              for k, v in (base or {}).get("contacts", {}).items() if v}})
+            allf = [round(float(e["hz"]), 6) for e in run.get("eigen", [])]
+            floating = run.get("floating") or []
+            rigid = [f for f in allf if f < RIGID_HZ][:max(run.get("extra_modes", 0), 0)] if floating else []
+            fr = [f for f in allf if f not in rigid][:s["modes"]]
+            rec_m = {"step": s["step"], "name": s.get("name"), "after_step": base["step"] if base else None,
+                     "frequencies_Hz": fr, "tied": run.get("tied", []), "free": run.get("free", []),
+                     "contacts": {k: {q: v[q] for q in ("closed_fraction", "stick_fraction", "force_N")}
+                                  for k, v in (base or {}).get("contacts", {}).items() if v}}
+            if run.get("tied_where_closed"):
+                rec_m["tied_where_closed"] = {k: {"nodes": v[0], "closed_fraction": v[1]}
+                                              for k, v in run["tied_where_closed"].items()}
+            if floating:
+                rec_m["floating_parts"] = floating
+                rec_m["rigid_body_Hz"] = rigid
+            res["modal"].append(rec_m)
+            at = f"step {base['step']}" if base else "the start"
+            for grp in floating:
+                opened = [x["name"] for x in plan["contacts"] + plan["gaskets"]
+                          if x["name"] in run.get("free", []) and set(x.get("parts", [])) & set(grp)]
+                res.setdefault("warnings", []).append(
+                    f"modal step {s['step']}: part(s) {', '.join(grp)} have no tied path to a support (their contacts "
+                    f"{', '.join(opened) or '(none)'} were open at {at}); they float on feat's stabilisation springs"
+                    + (f": their rigid-body modes ({', '.join(f'{f:.3g}' for f in rigid)} Hz) are left out of "
+                       "frequencies_Hz" if rigid else "")
+                    + "; the frequencies are not the assembly's: support or close those contacts (preload, clearance)")
+            low = [f for f in fr if f < RIGID_HZ]
+            if low:
+                res.setdefault("warnings", []).append(
+                    f"modal step {s['step']}: frequencies below {RIGID_HZ:g} Hz ({', '.join(f'{f:.3g}' for f in low)}): "
+                    "a part or a mechanism is not held (rigid-body motion on feat's stabilisation springs); check the "
+                    "supports and the contacts' states")
+            for k, v in (rec_m.get("tied_where_closed") or {}).items():
+                res.setdefault("warnings", []).append(
+                    f"modal step {s['step']}: contact {k} was closed on {100 * v['closed_fraction']:.0f} % of its face at "
+                    f"{at}: tied there only ({v['nodes']} nodes), free elsewhere")
             if run.get("error"):
                 res.setdefault("warnings", []).append(f"modal step {s['step']}: {run['error']}")
             for k in run.get("slipping", []):
@@ -1893,23 +1935,61 @@ TIE_CLOSED = 0.5      # a pair at least this closed at the base step is tied for
 STICK_WARN = 0.9      # ... and when less of it sticks, the frequencies are an upper bound (it was partly slipping)
 
 
-def modal_ties(plan: dict, base: dict | None) -> tuple[list[str], list[str], list[str]]:
-    """(tied, free, slipping) pairs for a modal step on the state `base` (a result step): bonded contacts, and
-    contacts and gaskets closed over TIE_CLOSED of their area, are tied; the others are free."""
-    tied, free, slip = [], [], []
+def modal_ties(plan: dict, base: dict | None) -> tuple[dict, list[str], list[str], dict]:
+    """(tied {pair: None (all of it) or its closed slave nodes}, free, slipping, partial {pair: [closed, all]}) for a
+    modal step on the state `base` (a result step). Bonded contacts are tied whole; a contact closed anywhere is tied
+    at its closed nodes (where it carries load), however little of it is closed; gaskets closed over TIE_CLOSED of
+    their area are tied. (s50_hubfit_loose, 2026.11.09: sleeve_on_collar, closed on part of its face and 73 % stuck,
+    was left free under a 50 % rule; the impeller and sleeve then floated: 0.22-0.53 Hz.)"""
+    tied, free, slip, partial = {}, [], [], {}
     cst = (base or {}).get("contacts") or {}
     gst = (base or {}).get("gaskets") or {}
     for c in plan["contacts"]:
         st = cst.get(c["name"]) or {}
-        if c["law"]["kind"] == "bonded" or (st.get("closed_fraction") or 0) >= TIE_CLOSED:
-            tied.append(c["name"])
-            if c["law"]["kind"] != "bonded" and st.get("stick_fraction") is not None and st["stick_fraction"] < STICK_WARN:
-                slip.append(c["name"])
+        closed = st.get("_closed_nodes") or []
+        if c["law"]["kind"] == "bonded" or (st.get("closed_fraction") or 0) >= 0.999:
+            tied[c["name"]] = None
+        elif closed:
+            tied[c["name"]] = closed
+            partial[c["name"]] = [len(closed), round(float(st.get("closed_fraction") or 0), 4)]
         else:
             free.append(c["name"])
+            continue
+        if c["law"]["kind"] != "bonded" and st.get("stick_fraction") is not None and st["stick_fraction"] < STICK_WARN:
+            slip.append(c["name"])
     for g in plan["gaskets"]:
-        (tied if (gst.get(g["name"]) or {}).get("contact_fraction", 0) >= TIE_CLOSED else free).append(g["name"])
-    return tied, free, slip
+        if (gst.get(g["name"]) or {}).get("contact_fraction", 0) >= TIE_CLOSED:
+            tied[g["name"]] = None
+        else:
+            free.append(g["name"])
+    return tied, free, slip, partial
+
+
+def free_groups(plan: dict, tied) -> list[list[str]]:
+    """Groups of parts with no tied path to a support in a modal run (each would move as a rigid body on feat's
+    stabilisation springs): parts joined by tied pairs, without a part that a support holds. Bolts and nuts are axial
+    springs: they do not hold a part in the other directions, so they do not join parts here."""
+    names = list(plan.get("part_names") or [])
+    up = {n: n for n in names}
+
+    def root(n):
+        while up[n] != n:
+            up[n] = up[up[n]]
+            n = up[n]
+        return n
+    for x in plan["contacts"] + plan["gaskets"]:
+        ps = [q for q in x.get("parts", []) if q in up]
+        if x["name"] in tied and len(ps) > 1:
+            for q in ps[1:]:
+                up[root(q)] = root(ps[0])
+    held = {root(q) for q in plan.get("support_parts", []) if q in up}
+    groups: dict = {}
+    for n in names:
+        groups.setdefault(root(n), []).append(n)
+    return [sorted(g) for r, g in groups.items() if r not in held]
+
+
+RIGID_HZ = 1.0   # modes below this are rigid-body motion on the stabilisation springs, or a mechanism
 
 
 def modal_run(name: str, study: dict, parts: list[dict], plan: dict, res: dict, step: dict, folder: Path,
@@ -1919,14 +1999,18 @@ def modal_run(name: str, study: dict, parts: list[dict], plan: dict, res: dict, 
     step after frictional contact kept no tangential stiffness: assembly_clamped_beam's first mode was 0 Hz.)"""
     from .runner import SolverError, run_ccx
     base = next((r for r in reversed(res["steps"]) if r["step"] < step["step"]), None)
-    tied, free, slip = modal_ties(plan, base)
+    tied, free, slip, partial = modal_ties(plan, base)
+    floating = free_groups(plan, tied)
+    extra = 6 * len(floating)   # their rigid-body modes come first: ask for that many more
     h = min(float(p["info"].get("size") or 1.0) for p in parts)
     gaps = [max(float((x.get("gap") or {}).get("max_mm") or 0.0), abs(float(x.get("clearance_mm") or 0.0)))
             for x in plan["contacts"] + plan["gaskets"] if x["name"] in tied]
     tol = 0.25 * h + max(gaps, default=0.0)
-    out = {"tied": tied, "free": free, "slipping": slip}
+    out = {"tied": sorted(tied), "free": free, "slipping": slip, "tied_where_closed": partial, "floating": floating,
+           "extra_modes": extra}
     try:
-        text, _ = write(f"{name}_modal{step['step']}", study, parts, modal={"modes": step["modes"], "ties": set(tied), "tol": tol})
+        text, _ = write(f"{name}_modal{step['step']}", study, parts,
+                        modal={"modes": int(step["modes"]) + extra, "ties": tied, "tol": tol})
         inp = folder / f"{name}_modal{step['step']}.inp"
         inp.write_text(text)
         from .executor import modal_timeout_s
@@ -2013,6 +2097,10 @@ def solve(name: str, study: dict, folder: Path, solver: str, timeout: float, pro
     res["seconds"] = {"mesh": round(t1 - t0, 3), "solve": round(t2 - t1, 3), "total": round(time.perf_counter() - t0, 3)}
     res["files"] = {k: str(inp.with_suffix(s)) for k, s in (("inp", ".inp"), ("dat", ".dat"), ("frd", ".frd"))
                     if inp.with_suffix(s).is_file()}
+    for r in res.get("steps", []):   # the closed nodes were for the modal ties
+        for v in (r.get("contacts") or {}).values():
+            if isinstance(v, dict):
+                v.pop("_closed_nodes", None)
     res["deck"] = {"steps": len(plan["steps"]), "bolts": sum(len(b["bolts"]) for b in plan["bolts"]),
                    "gaskets": len(plan["gaskets"])}
     from .runner import CRASHES, MEMORY_NOTES, PEAK
