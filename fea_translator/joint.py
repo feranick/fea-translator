@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.10.2
+Version: 2026.11.10.3
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -651,8 +651,6 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
             L.append(f"*SOLID SECTION, ELSET=EF_{fn}, MATERIAL=MF_{fn}, ORIENTATION=OF_{fn}")
             fnodes = np.unique(tets_all[f["elements"]])
             L += [f"*NSET, NSET=NF_{fn}"] + _lines((fnodes + 1).tolist())
-    if fits:
-        L += ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", "NALL, 0."]
     plan["_eigen"] = {}   # the fits' strains, per part, for the stresses recomputed from the displacements
     for cn_, f in fits.items():
         plan["_eigen"].setdefault(f["inner"], []).append(
@@ -892,6 +890,10 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
         if ld["kind"] == "grav":
             dummy_dl = f"{ld['items'][0][0]}, GRAV, 0., 0., 0., -1."
             break
+    if fits:   # CalculiX wants a temperature at every node, the connectors' and springs' too (checktemp: 'no final
+        # temperature defined in node 1496', assembly_press_fit on carbonio, 2026.11.10.2): 0 everywhere, 1 under a fit
+        L += ["*NSET, NSET=N_TEMP, GENERATE", f"1, {n_next - 1}, 1",
+              "*INITIAL CONDITIONS, TYPE=TEMPERATURE", "N_TEMP, 0."]
     prev_kind = None
     for s in dsteps:
         if s["kind"] == "modal":   # a separate linear run on the state the previous step left (solve, write(modal=))
@@ -908,7 +910,7 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
         if first:
             L += ["*BOUNDARY"] + bnd if bnd else []
             if fits:   # the fits' interference, grown with the step (a temperature of 1 is the whole interference)
-                L += ["*TEMPERATURE"] + [f"NF_{_name(cn_)}, 1." for cn_ in fits]
+                L += ["*TEMPERATURE", "N_TEMP, 0."] + [f"NF_{_name(cn_)}, 1." for cn_ in fits]
         elif pret:
             L += ["*BOUNDARY, FIXED", "N_PRETENSION, 1, 1"]
         cl, dl = step_loads(s["loads"])

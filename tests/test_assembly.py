@@ -1,7 +1,7 @@
 """Assemblies (analysis "assembly", joint.py): steps and their loads, contacts (hard, penalty, bonded, clearance), nuts
 on a meshed shaft, probes, part stresses, modal steps on the loaded state, validation, pictures. Offline: the CalculiX
 runs are the assembly_* benchmarks (test_fea.test_benchmark_calculix, FEAT_SLOW_TESTS=1).
-Version: 2026.11.10.2
+Version: 2026.11.10.3
 """
 import copy
 import math
@@ -352,7 +352,12 @@ def test_interference_fit_as_an_expansion():
     text, plan = joint.write("t", st, parts)
     assert "*EXPANSION, TYPE=ORTHO, ZERO=0.\n0.001, 0.001, 0." in text and "SYSTEM=CYLINDRICAL" in text
     assert "*SOLID SECTION, ELSET=EF_FIT, MATERIAL=MF_FIT, ORIENTATION=OF_FIT" in text
-    assert "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, 0." in text and "*TEMPERATURE\nNF_FIT, 1." in text
+    # a temperature at every node, the springs' too (CalculiX's checktemp), then 1 under the fit
+    n_max = max(int(ln.split(",")[0]) for blk in text.split("*NODE")[1:] for ln in blk.split("\n*")[0].splitlines()[1:]
+                if ln.strip() and ln.split(",")[0].strip().isdigit())
+    assert f"*NSET, NSET=N_TEMP, GENERATE\n1, {n_max}, 1\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\nN_TEMP, 0." in text
+    assert "*TEMPERATURE\nN_TEMP, 0.\nNF_FIT, 1." in text
+    assert text.index("*INITIAL CONDITIONS") < text.index("*STEP")
     assert "*STATIC\n0.02, 1., 1e-05, 0.1" in text and "TYPE=NODE TO SURFACE\nCS_FIT, CM_FIT" in text
     c = plan["contacts"][0]
     assert c["interference_method"] == "expansion" and c["interference_nodes_moved"] is None
