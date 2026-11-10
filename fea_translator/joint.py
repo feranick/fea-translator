@@ -3,7 +3,7 @@ parts in contact (hard, penalty or bonded, with friction, clearance or interfere
 pretension, and a list of steps: the preload, static steps with their loads, a load swept up in steps (a joint: to
 find where it leaks and lifts off), and modal steps on the preloaded, loaded state (*FREQUENCY, PERTURBATION).
 A joint study is an assembly whose steps are [preload, sweep].
-Version: 2026.11.09.1
+Version: 2026.11.10.2
 
     parts = mesh_parts(study, folder)              each part meshed on its own (nodes and elements offset when merged)
     text, plan = write(name, study, parts)          the deck: contact pairs, bolt connectors, preload + pressure steps
@@ -45,7 +45,7 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__, results
-from .meshdata import EDGE_MID, EDGES, FACES, Mesh, MeshError
+from .meshdata import EDGE_MID, EDGES, FACES, Mesh, MeshError, fit_cylinder
 from .study import G_SCALE, MATERIALS, _num, _point, _selector, bc_name, material_of, mesh_errors, to_deck_units
 
 # ISO 261 coarse threads: nominal diameter d, pitch P (mm); ISO 273 medium clearance; ISO 7089 washer outer diameter
@@ -410,12 +410,13 @@ def deck_steps(study: dict) -> list[dict]:
     out = []
     for s in steps:
         k = s.get("kind")
+        inc = {q: float(s[q]) for q in ("first_increment", "max_increment") if _num(s.get(q))}
         if k == "preload":
-            out.append({"kind": "preload", "what": "preload", "factor": 0.0, "loads": dict(const)})
+            out.append({"kind": "preload", "what": "preload", "factor": 0.0, "loads": dict(const), **inc})
         elif k == "static":
             f = float(s.get("scale", 1.0))
             out.append({"kind": "static", "what": s.get("name") or "static", "name": s.get("name"), "factor": None,
-                        "loads": {**const, **{n: f for n in s.get("loads", []) or []}}})
+                        "loads": {**const, **{n: f for n in s.get("loads", []) or []}}, **inc})
         elif k == "sweep":
             n = int(s.get("steps", 10))
             out += [{"kind": "sweep", "what": "swept load", "factor": j / n, "loads": {**const, s["bc"]: j / n}}
@@ -446,6 +447,62 @@ def contact_law(c: dict, parts: list[dict], slave, master) -> dict:
     return {"kind": law, "stiffness_MPa_mm": HARD_FACTOR * E / h, "E_MPa": E, "h_mm": h}
 
 
+FIT_METHODS = ("expansion", "overlap")
+
+
+def fit_geometry(parts: list[dict], c: dict, X: np.ndarray) -> dict | None:
+    """A cylindrical interference fit's geometry: {inner (the part with the convex face), r, axis, point, t: (t0, t1)
+    the axial span both faces share, elements (the inner part's, 0-based global, whose centroids lie in that span)},
+    or None when the pair is not one convex and one concave cylinder of two different parts about one axis."""
+    groups = [(p, p["mesh"].groups[t]) for key in ("faces", "with") for p, tg in select(parts, c[key]) for t in tg]
+    if not groups or any(getattr(g, "concave", None) is None or not g.radius for _, g in groups):
+        return None
+    convex = [(p, g) for p, g in groups if not g.concave]
+    concave = [(p, g) for p, g in groups if g.concave]
+    inner = {p["name"] for p, _ in convex}
+    if not convex or not concave or len(inner) != 1 or inner & {p["name"] for p, _ in concave}:
+        return None
+    pin = convex[0][0]
+    nodes = np.unique(np.concatenate([g.nodes() + p["n0"] for p, g in convex]))
+    fit = fit_cylinder(X[nodes], np.concatenate([g.normal for _, g in convex]))
+    if fit is None:
+        return None
+    r, axis, point = float(np.mean([g.radius for _, g in convex])), np.asarray(fit[1], float), np.asarray(fit[2], float)
+    axis = axis / np.linalg.norm(axis)
+
+    def span(sel):
+        t = (X[np.unique(np.concatenate([g.nodes() + p["n0"] for p, g in sel]))] - point) @ axis
+        return float(t.min()), float(t.max())
+    (a0, a1), (b0, b1) = span(convex), span(concave)
+    t0, t1 = max(a0, b0), min(a1, b1)
+    if t1 <= t0:
+        return None
+    tets = pin["mesh"].tets[:, :4] + pin["n0"]
+    cen = X[tets].mean(axis=1)
+    tt = (cen - point) @ axis
+    rad = np.linalg.norm((cen - point) - np.outer(tt, axis), axis=1)
+    h = float(pin["info"].get("size") or 1.0)
+    pick = np.nonzero((tt >= t0) & (tt <= t1) & (rad <= r + 0.5 * h))[0]
+    if not len(pick):
+        return None
+    return {"inner": pin["name"], "r": r, "axis": axis, "point": point, "t": (t0, t1),
+            "elements": (pick + pin["e0"]).tolist(), "part": pin}
+
+
+def eigenstrain(plan: dict, p: dict) -> np.ndarray | None:
+    """(E, 6: xx, yy, zz, 2xy, 2xz, 2yz) strain a part's interference fits put into its elements (a fit's in-plane
+    expansion eps (I - a a^T) about its axis a, whole at the end of the first step), or None."""
+    fl = (plan.get("_eigen") or {}).get(p["name"])
+    if not fl:
+        return None
+    out = np.zeros((len(p["mesh"].tets), 6))
+    for f in fl:
+        a = np.asarray(f["axis"], float)
+        T = float(f["strain"]) * (np.eye(3) - np.outer(a, a))
+        out[f["elements"]] = [T[0, 0], T[1, 1], T[2, 2], 2 * T[0, 1], 2 * T[0, 2], 2 * T[1, 2]]
+    return out
+
+
 def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) -> tuple[str, dict]:
     """The deck of a joint or assembly study, and its plan (node sets, connectors, gaskets, contacts, steps) for
     reading the results. modal {modes, ties: {pair names}, tol}: instead, the linear frequency run of a modal step
@@ -462,11 +519,27 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
     # interference not enforced (closed 0-19 %, pressures near 0) or did not converge, whether made with *CLEARANCE
     # or in the geometry; node-to-surface took it in 8 increments, 1.4 % off Lame (tools/interference_matrix.py,
     # mochi 2026.11.05)
+    # A cylindrical fit takes its interference as an expansion instead (fit_method 'expansion', the default where the
+    # faces are one convex and one concave cylinder): the inner part's elements under the fit get an orthotropic
+    # expansion, radial and hoop, of interference / r per degree, and a temperature ramped from 0 to 1 over the first
+    # step, so the interference grows with the step's increments instead of being there whole at its start (S50 tight
+    # hub fit, 424k nodes, -0.021 mm: hard contact failed after 3 attempts of its first increment, a 2e5 MPa/mm
+    # penalty was still on attempt 3 after 5.5 h). A uniform in-plane expansion eps of a disc or ring moves its outer
+    # face by eps x r, the interference; axially it is free (no expansion along the axis)
     Xw = all_nodes(parts).copy()
     tets_all = np.concatenate([p["mesh"].tets + p["n0"] for p in parts])
-    moved = {}
+    moved, fits = {}, {}
     for c in study.get("contacts", []) or []:
         if float(c.get("clearance", 0.0) or 0.0) < 0:
+            geo = (fit_geometry(parts, c, Xw) if c.get("fit_method", "expansion") == "expansion" and modal is None
+                   else None)
+            taken = {e for f in fits.values() for e in f["elements"]}
+            if geo is not None and not taken & set(geo["elements"]):
+                geo["delta"] = abs(float(c["clearance"]))
+                fits[c["name"]] = geo
+                continue
+            if modal is not None and c.get("fit_method", "expansion") == "expansion":
+                continue    # the frequency run starts from the undeformed parts: the fit's state is in its ties
             nn, nrm = face_node_normals(Xw, tets_all, _gfaces(select(parts, c["faces"])))
             Xw[nn] += abs(float(c["clearance"])) * nrm
             moved[c["name"]] = len(nn)
@@ -548,13 +621,47 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
             LD[bname] = {"kind": "grav", "items": [(f"E_{_name(p['name'])}", gm * G_SCALE, gv / gm) for p in parts]}
             plan["load_mag"][bname] = 0.0
             plan["loads"].append(bname)
-    # materials and sections
+    # materials and sections (a fit's elements: the part's material with the fit's expansion, in a cylindrical
+    # orientation about the fit's axis: 1 radial, 2 hoop, 3 axial)
     for p in parts:
         m = to_deck_units(p["material"])
-        L += [f"*MATERIAL, NAME=M_{_name(p['name'])}", "*ELASTIC", f"{_g(m['E'])}, {_g(m['nu'])}"]
+        pn = _name(p["name"])
+        own = [(cn_, f) for cn_, f in fits.items() if f["inner"] == p["name"]]
+        L += [f"*MATERIAL, NAME=M_{pn}", "*ELASTIC", f"{_g(m['E'])}, {_g(m['nu'])}"]
         if "density" in m:
             L += ["*DENSITY", _g(m["density"])]
-        L.append(f"*SOLID SECTION, ELSET=E_{_name(p['name'])}, MATERIAL=M_{_name(p['name'])}")
+        if not own:
+            L.append(f"*SOLID SECTION, ELSET=E_{pn}, MATERIAL=M_{pn}")
+            continue
+        infit = {e for _, f in own for e in f["elements"]}
+        rest = [p["e0"] + e + 1 for e in range(len(p["mesh"].tets)) if p["e0"] + e not in infit]
+        if rest:
+            L += [f"*ELSET, ELSET=E_{pn}_REST"] + _lines(rest) + [f"*SOLID SECTION, ELSET=E_{pn}_REST, MATERIAL=M_{pn}"]
+        for cn_, f in own:
+            fn = _name(cn_)
+            eps = f["delta"] / f["r"]
+            a, b = f["point"], f["point"] + f["axis"] * max(f["r"], 1.0)
+            L += [f"*ELSET, ELSET=EF_{fn}"] + _lines([e + 1 for e in f["elements"]])
+            L += [f"*MATERIAL, NAME=MF_{fn}", "*ELASTIC", f"{_g(m['E'])}, {_g(m['nu'])}"]
+            if "density" in m:
+                L += ["*DENSITY", _g(m["density"])]
+            L += ["*EXPANSION, TYPE=ORTHO, ZERO=0.", f"{_g(eps)}, {_g(eps)}, 0."]
+            L += [f"*ORIENTATION, NAME=OF_{fn}, SYSTEM=CYLINDRICAL",
+                  ", ".join(_g(v) for v in (*a, *b))]
+            L.append(f"*SOLID SECTION, ELSET=EF_{fn}, MATERIAL=MF_{fn}, ORIENTATION=OF_{fn}")
+            fnodes = np.unique(tets_all[f["elements"]])
+            L += [f"*NSET, NSET=NF_{fn}"] + _lines((fnodes + 1).tolist())
+    if fits:
+        L += ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", "NALL, 0."]
+    plan["_eigen"] = {}   # the fits' strains, per part, for the stresses recomputed from the displacements
+    for cn_, f in fits.items():
+        plan["_eigen"].setdefault(f["inner"], []).append(
+            {"elements": [e - f["part"]["e0"] for e in f["elements"]], "strain": f["delta"] / f["r"],
+             "axis": f["axis"].tolist()})
+    plan["fits"] = {cn_: {"method": "expansion", "inner": f["inner"], "r_mm": round(f["r"], 4),
+                          "interference_mm": f["delta"], "strain": round(f["delta"] / f["r"], 9),
+                          "elements": len(f["elements"]), "span_mm": round(f["t"][1] - f["t"][0], 4)}
+                    for cn_, f in fits.items()}
     # connectors (bolts, nuts): a spring (SPRINGA) from a cut node C at the head (a nut: its bearing face) to the nut or
     # thread end B2, the pretension an equation across the cut: u_C = mean(u_head) - u_PT * axis (CalculiX's own
     # *PRE-TENSION SECTION on a beam deletes the beam and leaves a rigid link: the bolt would have no stretch)
@@ -679,8 +786,11 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
                                  "with_tags": gtags(parts, master), "normal": _unit(nrm).tolist(), "law": law,
                                  "friction_mu": mu, "friction": fr, "interaction": f"CI_{cn}",
                                  "clearance_mm": c.get("clearance"),
-                                 "contact_type": "node to surface" if c["name"] in moved else "surface to surface",
+                                 "contact_type": "node to surface" if (c["name"] in moved or c["name"] in fits)
+                                 else "surface to surface",
                                  "interference_nodes_moved": moved.get(c["name"]),
+                                 "interference_method": ("expansion" if c["name"] in fits else "overlap" if c["name"]
+                                                         in moved else None),
                                  "gap": face_gap(X, _gnodes(slave), _gnodes(master), _unit(nrm)),
                                  "area": sum(p["mesh"].area_of(tg) for p, tg in slave)})
         plan["selection"][f"contact {c['name']}"] = [dict(p["mesh"].groups[t].describe(), part=p["name"]) for p, tg in slave for t in tg]
@@ -789,10 +899,16 @@ def write(name: str, study: dict, parts: list[dict], modal: dict | None = None) 
             continue
         first = s["ccx_step"] == 1
         # the first step from a small increment (the contact is found at a twentieth of the load); later steps add a
-        # part of the load in one increment (CalculiX cuts it back if contact needs it)
-        L += ["*STEP, INC=1000", "*STATIC", "0.05, 1., 1e-05, 0.25" if first else "1., 1., 1e-08, 1."]
+        # part of the load in one increment (CalculiX cuts it back if contact needs it); a step's first_increment and
+        # max_increment (fractions of the step) override these
+        d0, dmin, dmax = (0.05, 1e-05, 0.25) if first else (1.0, 1e-08, 1.0)
+        d0 = float(s.get("first_increment") or d0)
+        dmax = max(float(s.get("max_increment") or dmax), d0)
+        L += ["*STEP, INC=1000", "*STATIC", f"{_g(d0)}, 1., {_g(min(dmin, d0))}, {_g(dmax)}"]
         if first:
             L += ["*BOUNDARY"] + bnd if bnd else []
+            if fits:   # the fits' interference, grown with the step (a temperature of 1 is the whole interference)
+                L += ["*TEMPERATURE"] + [f"NF_{_name(cn_)}, 1." for cn_ in fits]
         elif pret:
             L += ["*BOUNDARY, FIXED", "N_PRETENSION, 1, 1"]
         cl, dl = step_loads(s["loads"])
@@ -985,7 +1101,7 @@ def face_node_normals(X: np.ndarray, tets: np.ndarray, faces) -> tuple[np.ndarra
     return nodes, N / np.maximum(np.linalg.norm(N, axis=1), 1e-300)[:, None]
 
 
-def nodal_internal_forces(mesh, U: np.ndarray, material: dict) -> np.ndarray:
+def nodal_internal_forces(mesh, U: np.ndarray, material: dict, eigen: np.ndarray | None = None) -> np.ndarray:
     """The element forces at each node (N, 3): f_a = sum over elements of the integral of sigma . grad N_a, from the
     displacements (CalculiX's element formulation: 4 Gauss points for 10-node tetrahedra). At nodes with no load
     but a contact, their sum over a face is the contact force on it, exactly as the discretization balances it."""
@@ -1004,6 +1120,14 @@ def nodal_internal_forces(mesh, U: np.ndarray, material: dict) -> np.ndarray:
     G = np.einsum("eqkj,qnj->eqnk", np.linalg.inv(J), dNdxi)          # dN/dx (E, q, n, 3)
     gu = np.einsum("eqnk,enc->eqck", G, np.asarray(U, float)[mesh.tets])   # du_c/dx_k
     eps = 0.5 * (gu + np.swapaxes(gu, -1, -2))
+    if eigen is not None:   # an interference fit's strain in these elements (eigenstrain: Voigt, engineering shears)
+        e6 = np.asarray(eigen, float)
+        T = np.zeros((len(e6), 3, 3))
+        T[:, 0, 0], T[:, 1, 1], T[:, 2, 2] = e6[:, 0], e6[:, 1], e6[:, 2]
+        T[:, 0, 1] = T[:, 1, 0] = e6[:, 3] / 2
+        T[:, 0, 2] = T[:, 2, 0] = e6[:, 4] / 2
+        T[:, 1, 2] = T[:, 2, 1] = e6[:, 5] / 2
+        eps = eps - T[:, None]
     tr = np.trace(eps, axis1=-2, axis2=-1)
     sig = 2 * mu * eps + lam * tr[..., None, None] * np.eye(3)
     fe = np.einsum("eqnk,eqck,eq->enc", G, sig, det * w)                # (E, n, 3)
@@ -1217,7 +1341,8 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
                         sl = slice(part["n0"], part["n0"] + len(part["mesh"].nodes))
                         key = (ccx, part["name"])
                         if key not in fint:
-                            fint[key] = nodal_internal_forces(part["mesh"], disp[ccx][sl], part["material"])
+                            fint[key] = nodal_internal_forces(part["mesh"], disp[ccx][sl], part["material"],
+                                                              eigenstrain(plan, part))
                         f = fint[key][nodes - part["n0"]]
                         fn = -np.einsum("ij,ij->i", f, nrm)                          # compression positive
                         ft = f + fn[:, None] * nrm
@@ -1242,7 +1367,8 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
             rec["parts"] = {}
             for p in parts:
                 sl = slice(p["n0"], p["n0"] + len(p["mesh"].nodes))
-                vm = von_mises(nodal_stress(p["mesh"], U[sl], {"material": p["material"]}, {}))
+                vm = von_mises(nodal_stress(p["mesh"], U[sl], {"material": p["material"]},
+                                            {"eigenstrain": eigenstrain(plan, p)}))
                 k = int(np.argmax(vm))
                 rec["parts"][p["name"]] = {"peak_von_mises_MPa": round(float(vm[k]), 4),
                                            "at": np.round(p["mesh"].nodes[k], 3).tolist(),
@@ -1345,6 +1471,10 @@ def evaluate(study: dict, parts: list[dict], plan: dict, dat_text: str, frd_text
             res["contacts"][c["name"]] = {"law": c["law"], "friction": c["friction_mu"], "area_mm2": round(c["area"], 4),
                                           "clearance_mm": c.get("clearance_mm"), "contact_type": c.get("contact_type"),
                                           "gap_mm": (c.get("gap") or {}).get("median_mm")}
+            if c.get("interference_method"):   # how its interference was made: expansion (ramped) or overlap
+                res["contacts"][c["name"]]["interference_method"] = c["interference_method"]
+                if c["name"] in (plan.get("fits") or {}):
+                    res["contacts"][c["name"]]["fit"] = plan["fits"][c["name"]]
             gp = (c.get("gap") or {}).get("median_mm")
             if gp is not None and gp > GAP_TOL and c.get("clearance_mm") is None:
                 res.setdefault("warnings", []).append(
@@ -1445,7 +1575,7 @@ def save_state(folder: Path, study: dict, parts: list[dict], plan: dict, res: di
             continue
         for p in parts:
             sl = slice(p["n0"], p["n0"] + len(p["mesh"].nodes))
-            S[s, sl] = nodal_stress(p["mesh"], U[s, sl], {"material": p["material"]}, {})
+            S[s, sl] = nodal_stress(p["mesh"], U[s, sl], {"material": p["material"]}, {"eigenstrain": eigenstrain(plan, p)})
     fields = {"U_steps": U.astype(np.float32), "S_steps": S.astype(np.float32), "cp_steps": cp.astype(np.float32)}
     first_modal = next((s for s in steps if s["kind"] == "modal"), None)
     if first_modal is not None and modes_frd:
@@ -1698,8 +1828,12 @@ def _validate_steps(st: dict, bcs: list, bnames: list, parts: dict) -> list[str]
             errs.append(f"{w}: {{kind: {' | '.join(STEP_KINDS)}, ...}}")
             continue
         k = s["kind"]
-        allowed = {"preload": {"kind"}, "static": {"kind", "loads", "scale", "name"},
+        allowed = {"preload": {"kind", "first_increment", "max_increment"},
+                   "static": {"kind", "loads", "scale", "name", "first_increment", "max_increment"},
                    "sweep": {"kind", "bc", "steps"}, "modal": {"kind", "modes", "name"}}[k]
+        for q in ("first_increment", "max_increment"):
+            if q in s and (not _num(s[q]) or not 0 < s[q] <= 1):
+                errs.append(f"{w}.{q}: a fraction of the step, 0 < x <= 1")
         if set(s) - allowed:
             errs.append(f"{w} ({k}): unknown keys {sorted(set(s) - allowed)} (allowed: {', '.join(sorted(allowed))})")
         if "name" in s and not _word(s["name"]):
@@ -1744,7 +1878,7 @@ def _validate_assembly(st: dict, names: set) -> tuple[list[str], list[str]]:
     errs, warns = [], []
     contacts = st.get("contacts", [])
     if not isinstance(contacts, list):
-        errs.append("contacts: a list of {name, faces, with, law, friction, clearance}")
+        errs.append("contacts: a list of {name, faces, with, law, friction, clearance, fit_method}")
         contacts = []
     for i, c in enumerate(contacts):
         w = f"contact {i + 1}"
@@ -1771,7 +1905,12 @@ def _validate_assembly(st: dict, names: set) -> tuple[list[str], list[str]]:
             errs.append(f"{w}.clearance: mm, > 0 an initial gap, < 0 an interference (a press fit)")
         if law == "bonded" and _num(c.get("clearance")) and c["clearance"] != 0:
             errs.append(f"{w}: a bonded contact takes no clearance")
-        extra = set(c) - {"name", "faces", "with", "law", "friction", "clearance"}
+        if "fit_method" in c:
+            if c["fit_method"] not in FIT_METHODS:
+                errs.append(f"{w}.fit_method: {' | '.join(FIT_METHODS)} (how an interference is made)")
+            elif not (_num(c.get("clearance")) and c["clearance"] < 0):
+                errs.append(f"{w}.fit_method: only with an interference (a negative clearance)")
+        extra = set(c) - {"name", "faces", "with", "law", "friction", "clearance", "fit_method"}
         if extra:
             errs.append(f"{w}: unknown keys {sorted(extra)}")
     nuts = st.get("nuts", [])

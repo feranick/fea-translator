@@ -1,7 +1,7 @@
 """Assemblies (analysis "assembly", joint.py): steps and their loads, contacts (hard, penalty, bonded, clearance), nuts
 on a meshed shaft, probes, part stresses, modal steps on the loaded state, validation, pictures. Offline: the CalculiX
 runs are the assembly_* benchmarks (test_fea.test_benchmark_calculix, FEAT_SLOW_TESTS=1).
-Version: 2026.11.09.2
+Version: 2026.11.10.2
 """
 import copy
 import math
@@ -309,3 +309,97 @@ def test_an_interference_fit_overlaps_the_parts(tmp_path):
     Z = X[top["n0"]:top["n0"] + len(top["mesh"].nodes), 2]
     bottom = np.isclose(top["mesh"].nodes[:, 2], 20)
     assert np.allclose(Z[bottom], 20 - 0.01) and np.allclose(Z[~bottom], top["mesh"].nodes[~bottom, 2])
+
+
+# ---- 2026.11.10.2: interference fits grown over the first step (an expansion), not there whole at its start ----------
+
+def _tube(ri, ro, h, nr, nt, nz, z0=0.0):
+    """A ring (ri..ro) of height h, from a box mesh mapped to polar coordinates (no Gmsh needed)."""
+    from fea_translator.meshdata import Mesh, box_mesh
+    m = box_mesh(ro - ri, 2 * math.pi, h, nr, nt, nz, order=2, origin=[ri, 0, z0])
+    r, t, z = m.nodes[:, 0], m.nodes[:, 1], m.nodes[:, 2]
+    return Mesh(np.column_stack([r * np.cos(t), r * np.sin(t), z]), m.tets, m.surfaces, {}).build()
+
+
+def _fit(shaft_h=10.0, **contact):
+    """A ring r 20-40, 10 thick, on a tube r 5-20 (shaft_h long, from z -10 when longer), 0.02 mm interference."""
+    from fea_translator.study import material_of
+    z0 = 0.0 if shaft_h == 10.0 else -10.0
+    meshes = (("shaft", _tube(5, 20, shaft_h, 3, 24, max(2, int(shaft_h // 5)), z0)), ("ring", _tube(20, 40, 10, 3, 24, 2)))
+    parts, n0, e0 = [], 0, 0
+    for name, mesh in meshes:
+        parts.append({"name": name, "mesh": mesh, "info": {"size": 5.0}, "n0": n0, "e0": e0,
+                      "material": material_of({"material": "steel"})})
+        n0, e0 = n0 + len(mesh.nodes), e0 + len(mesh.tets)
+    st = {"analysis": "assembly", "parts": {"shaft": {}, "ring": {}},
+          "bcs": [{"kind": "slider", "name": "a", "faces": {"part": "shaft", "nz": -1}},
+                  {"kind": "slider", "name": "b", "faces": {"part": "ring", "nz": -1}}],
+          "contacts": [dict({"name": "fit", "faces": {"part": "ring", "cyl_r": 20, "side": "inner"},
+                             "with": {"part": "shaft", "cyl_r": 20}, "clearance": -0.02}, **contact)],
+          "steps": [{"kind": "static", "first_increment": 0.02, "max_increment": 0.1}]}
+    return st, parts
+
+
+def test_interference_fit_as_an_expansion():
+    """The S50 tight hub fit (424k nodes, -0.021 mm) could not get through its first increment with the interference
+    there whole: a cylindrical fit now gets it as an orthotropic expansion (radial, hoop: interference / r) of the inner
+    part under the fit, by a temperature ramped 0 -> 1 over the first step."""
+    st, parts = _fit()
+    X = joint.all_nodes(parts)
+    geo = joint.fit_geometry(parts, st["contacts"][0], X)
+    assert geo["inner"] == "shaft" and abs(geo["r"] - 20) < 1e-6 and np.allclose(np.abs(geo["axis"]), [0, 0, 1])
+    assert geo["t"] == pytest.approx((0.0, 10.0)) and len(geo["elements"]) == len(parts[0]["mesh"].tets)
+    text, plan = joint.write("t", st, parts)
+    assert "*EXPANSION, TYPE=ORTHO, ZERO=0.\n0.001, 0.001, 0." in text and "SYSTEM=CYLINDRICAL" in text
+    assert "*SOLID SECTION, ELSET=EF_FIT, MATERIAL=MF_FIT, ORIENTATION=OF_FIT" in text
+    assert "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, 0." in text and "*TEMPERATURE\nNF_FIT, 1." in text
+    assert "*STATIC\n0.02, 1., 1e-05, 0.1" in text and "TYPE=NODE TO SURFACE\nCS_FIT, CM_FIT" in text
+    c = plan["contacts"][0]
+    assert c["interference_method"] == "expansion" and c["interference_nodes_moved"] is None
+    assert plan["fits"]["fit"] == {"method": "expansion", "inner": "shaft", "r_mm": 20.0, "interference_mm": 0.02,
+                                   "strain": 0.001, "elements": len(parts[0]["mesh"].tets), "span_mm": 10.0}
+    # the nodes are where the parts are: nothing moved
+    lines = text.split("*NODE, NSET=NALL\n")[1].split("\n*")[0].splitlines()
+    assert np.allclose(np.array([[float(v) for v in ln.split(",")[1:]] for ln in lines]), X, atol=1e-6)
+    # a free tube with the fit's strain and its own expansion carries no stress and no element force
+    sh = parts[0]["mesh"]
+    U = np.column_stack([0.001 * sh.nodes[:, 0], 0.001 * sh.nodes[:, 1], np.zeros(len(sh.nodes))])
+    E = joint.eigenstrain(plan, parts[0])
+    assert np.allclose(E, [0.001, 0.001, 0, 0, 0, 0]) and joint.eigenstrain(plan, parts[1]) is None
+    from fea_translator.render import nodal_stress
+    assert np.abs(nodal_stress(sh, U, {"material": parts[0]["material"]}, {"eigenstrain": E})).max() < 1e-8
+    assert np.abs(joint.nodal_internal_forces(sh, U, parts[0]["material"], E)).max() < 1e-8
+    assert np.abs(joint.nodal_internal_forces(sh, U, parts[0]["material"])).max() > 1.0     # without it: forces
+    # the frequency run starts from the undeformed parts: no expansion there, nothing moved
+    mtext, _ = joint.write("m", st, parts, modal={"modes": 3, "ties": {"fit": None}, "tol": 0.5})
+    assert "*EXPANSION" not in mtext and "*TEMPERATURE" not in mtext
+
+
+def test_interference_fit_only_under_the_hub_and_overlap_on_request():
+    st, parts = _fit(shaft_h=30.0)                        # a tube from z -10 to 20 under a 10-thick ring at 0..10
+    text, plan = joint.write("t", st, parts)
+    geo = joint.fit_geometry(parts, st["contacts"][0], joint.all_nodes(parts))
+    cen = joint.all_nodes(parts)[parts[0]["mesh"].tets[:, :4]].mean(axis=1)
+    inside = np.nonzero((cen[:, 2] >= 0) & (cen[:, 2] <= 10))[0]
+    assert sorted(geo["elements"]) == sorted(inside.tolist()) and 0 < len(inside) < len(cen)
+    assert "*ELSET, ELSET=E_SHAFT_REST" in text and "*SOLID SECTION, ELSET=E_SHAFT_REST, MATERIAL=M_SHAFT" in text
+    # fit_method 'overlap': the slave face's nodes moved into the shaft, as before
+    st, parts = _fit(fit_method="overlap")
+    text, plan = joint.write("t", st, parts)
+    assert "*EXPANSION" not in text and plan["contacts"][0]["interference_method"] == "overlap"
+    assert plan["contacts"][0]["interference_nodes_moved"] > 0
+
+
+def test_fit_and_increment_validation():
+    def errs(st):
+        return " | ".join(validate_study(st)["errors"])
+    st = _boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
+                           "clearance": -0.01, "fit_method": "glue"}])
+    assert "fit_method: expansion | overlap" in errs(st)
+    st = _boxes(contacts=[{"name": "c", "faces": {"part": "top", "nz": -1}, "with": {"part": "base", "nz": 1},
+                           "fit_method": "expansion"}])
+    assert "only with an interference" in errs(st)
+    st = _boxes(steps=[{"kind": "static", "loads": ["side"], "first_increment": 0}, {"kind": "modal", "modes": 3}])
+    assert "first_increment: a fraction of the step" in errs(st)
+    st = _boxes(steps=[{"kind": "static", "loads": ["side"], "first_increment": 0.01, "max_increment": 0.2}])
+    assert errs(st) == ""

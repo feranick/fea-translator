@@ -1,5 +1,5 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.09.8
+Version: 2026.11.10.2
 
 Memory and out of memory (the cgroup counters, the job's limit, the node's memory, job vs node, the wording) come from
 llmt-runtime (llmt_runtime.memory) since 2026.11.09.6; what feat does after a kill (a threaded CalculiX run restarted on
@@ -624,6 +624,8 @@ def recompute_stresses(mesh: Mesh, U: np.ndarray, study: dict, plan: dict, bound
     if plan.get("temperatures") is not None:
         dT = np.einsum("qa,ea->eq", N, np.asarray(plan["temperatures"], float)[mesh.tets]) - float(plan["T_ref"])
         eps[..., :3] -= float(mat["alpha"]) * dT[..., None]
+    if plan.get("eigenstrain") is not None:   # (E, 6) per element (an assembly's interference fit: joint.eigenstrain)
+        eps -= np.asarray(plan["eigenstrain"], float)[:, None, :]
     tr = eps[..., :3].sum(axis=-1)
     sig = np.empty_like(eps)
     sig[..., :3] = lam * tr[..., None] + 2 * mu * eps[..., :3]
