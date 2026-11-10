@@ -1,5 +1,5 @@
 """runtime.py — feat's llmt-runtime: the executor code the translators share, with feat's settings and hooks.
-Version: 2026.11.09.10
+Version: 2026.11.10.1
 
     RT          llmt_runtime.Runtime for feat (FEAT_ settings, the `feat` CLI, threads: --cpus-per-task)
     RUNTIME_VERSION   llmt-runtime's version (tool_status().executor.runtime)
@@ -13,8 +13,12 @@ llmt_runtime.server.Server (mcp_server.GUARD, built on RT: FEAT_EXIT_WHEN_STALE,
 
 The hooks are small wrappers that import executor and api when called: executor imports RT from here.
 
-FEAT_SLURM_TIME: feat's former 'estimate' (until 2026.11.09.7: the runs' timeouts, the meshing and 10 min) is the
-runtime's 'timeout'; time_aliases keeps existing FEAT_SLURM_TIME=estimate settings (config/env) meaning that.
+FEAT_SLURM_TIME takes the runtime's words, max (feat's default) | timeout | estimate | minutes, with the meanings they
+have in every translator. feat's former 'estimate' (until 2026.11.09.7: the runs' timeouts, the meshing and 10 min) is
+'timeout'; the alias that kept it (time_aliases) was dropped in 2026.11.10.1, when no machine's config/env set
+FEAT_SLURM_TIME (carbonio, mochi, spark1, spark2). 'estimate' now sizes the job from the study's own run-time estimate
+(api.start passes it), and each CalculiX run's timeout fits that limit (hooks.timeout_for_limit: executor.
+timeout_for_limit; `feat run-study` reads it from job.json).
 """
 from __future__ import annotations
 
@@ -56,6 +60,11 @@ def _job_extra(study: dict) -> dict:
     return job_extra(study)
 
 
+def _timeout_for_limit(study: dict, minutes: int) -> float:
+    from .executor import timeout_for_limit
+    return timeout_for_limit(study, minutes)
+
+
 def _running_progress(folder: Path, study: dict) -> dict:
     from .api import job_progress
     return job_progress(folder, study)
@@ -68,8 +77,8 @@ def _solver_left_s(folder: Path, study: dict) -> float:
 
 RT = Runtime(prefix="FEAT", cli="feat", package="fea_translator", version=__version__, kind="threads",
              out_default="~/feat_runs", min_minutes=1.0, timeout_default=900.0, slurm_time_default="max",
-             time_aliases={"estimate": "timeout"},
              hooks=Hooks(procs=_procs, mem_auto=_mem_auto, time_need_min=_time_need_min, solves=_solves,
+                         timeout_for_limit=_timeout_for_limit,
                          job_extra=_job_extra, oom_advice=_oom_advice,
                          timeout_hint="or coarsen the mesh / drop converge",
                          running_progress=_running_progress, solver_left_s=_solver_left_s))

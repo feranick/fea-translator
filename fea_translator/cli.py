@@ -1,5 +1,5 @@
 """cli.py — the `feat` command line. Every command prints JSON.
-Version: 2026.11.05.2
+Version: 2026.11.10.1
 
     feat status                          versions; CalculiX and Gmsh found or not
     feat format > study_format.json      the study format
@@ -47,7 +47,10 @@ def run_study(request: str, name: str) -> int:
     os.environ.setdefault("FEAT_OUT", str(folder.parent))   # timing records next to the request
     n = os.environ.get("SLURM_CPUS_PER_TASK") or str(executor.procs_for(study))
     os.environ["OMP_NUM_THREADS"] = os.environ["CCX_NPROC_EQUATION_SOLVER"] = str(n)
-    _run(name, study, folder / name, meta.get("solver", "ccx"), executor.timeout_s(study))   # the study's run.timeout_s, else FEAT_TIMEOUT
+    # each run's timeout as the job was sized: job.json's timeout_s (FEAT_SLURM_TIME=estimate makes it shorter than the
+    # study's run.timeout_s or FEAT_TIMEOUT, so that it fires before SLURM's limit), else the study's
+    from llmt_runtime import jobs as J
+    _run(name, study, folder / name, meta.get("solver", "ccx"), J.job_timeout_s(folder / name, executor.timeout_s(study)))
     return 0 if (folder / name / f"{name}.json").is_file() else 1
 
 

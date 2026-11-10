@@ -2,7 +2,7 @@
 sacct, sinfo and scontrol (llmt-runtime's merged fake: llmt_runtime.testing): routing, job scripts, submit -> running
 -> done collected by a new process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the
 status key.
-Version: 2026.11.09.8
+Version: 2026.11.10.1
 """
 import json
 import os
@@ -635,7 +635,7 @@ def test_slurm_time_from_the_partition(slurm, monkeypatch):
     monkeypatch.delenv("FEAT_SLURM_ARGS")
     executor._PART.update(t=0.0, v=None)
     assert executor.job_time(st)[0] == str(7 * 1440)
-    monkeypatch.setenv("FEAT_SLURM_TIME", "estimate")             # feat's word for llmt-runtime's 'timeout'
+    monkeypatch.setenv("FEAT_SLURM_TIME", "timeout")              # the runs' timeouts, the meshing and 10 min
     assert executor.job_time(st)[0] == str(need)
     monkeypatch.setenv("FEAT_SLURM_TIME", "100000")
     assert executor.job_time(st)[0] == "100000"

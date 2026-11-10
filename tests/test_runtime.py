@@ -1,7 +1,7 @@
 """feat on llmt-runtime (2026.11.09.6, phase 1; 2026.11.09.8, phase 2: the SLURM layer; 2026.11.09.10, phase 3: the MCP
 server's stale handling and tool wrapper): the shared pieces are the runtime's, configured for feat (runtime.RT and its
 hooks; mcp_server.GUARD).
-Version: 2026.11.09.10
+Version: 2026.11.10.1
 """
 import asyncio
 import json
@@ -134,7 +134,7 @@ def _request(state: Path, jid: str, log: str | None = None) -> Path:
 def test_slurm_layer_is_the_runtimes():
     assert executor.deadline is S.deadline and executor.remaining is S.remaining and executor._CALL is S._CALL
     assert executor._NODES is S._NODES and executor._PART is S._PART and executor.FINAL == J.FINAL
-    assert RT.time_aliases == {"estimate": "timeout"} and RT.slurm_time_default == "max"
+    assert not RT.time_aliases and RT.slurm_time_default == "max"     # no alias since 2026.11.10.1
     h = RT.hooks                                    # feat's sizing, through the hooks
     assert h.procs(BOX) == executor.procs_for(BOX) and h.time_need_min(BOX) == executor.time_limit_min(BOX)
     assert h.solves({"analysis": "joule", "converge": True}) == 4 and h.mem_auto(BOX) == executor.mem_auto(BOX)
@@ -142,17 +142,40 @@ def test_slurm_layer_is_the_runtimes():
     assert h.solver_left_s(Path("/nonexistent"), {}) == 0.0
 
 
-def test_slurm_time_estimate_keeps_its_feat_meaning(monkeypatch):
-    """FEAT_SLURM_TIME=estimate meant the runs' timeouts, the meshing and 10 min in feat until 2026.11.09.7: the
-    runtime's 'timeout'; RT.time_aliases keeps config/env files that say 'estimate' meaning that."""
-    st = {"analysis": "static", "run": {"timeout_s": 600}}
-    assert executor.time_limit_min(st) == 10 + 10 + 10
-    for word in ("timeout", "estimate"):
-        monkeypatch.setenv("FEAT_SLURM_TIME", word)
-        t, info = executor.job_time(st)
-        assert t == "30" and info["setting"] == "timeout" and info["time_from"] == "timeout"
-        k = executor.status_key()
-        assert k["slurm_time"] == k["time"] == "timeout" and k["runtime"] == llmt_runtime.__version__
+def test_slurm_time_timeout_and_estimate(monkeypatch, tmp_path):
+    """FEAT_SLURM_TIME takes the runtime's words with their common meanings (2026.11.10.1: the alias that read feat's old
+    'estimate' as 'timeout' is gone; no machine's config/env set it). 'timeout': the runs' timeouts, the meshing and
+    10 min. 'estimate': from the study's run-time estimate (3 x + 10 min, at least FEAT_SLURM_TIME_MIN 20, at most
+    'timeout'), and each CalculiX run's timeout fits that limit; `feat run-study` reads it from job.json."""
+    st = {"analysis": "static"}                                   # FEAT_TIMEOUT 900 s: 15 + 10 + 10 min
+    monkeypatch.delenv("FEAT_TIMEOUT", raising=False)
+    need = executor.time_limit_min(st)
+    assert need == 35
+    monkeypatch.setenv("FEAT_SLURM_TIME", "timeout")
+    t, info = executor.job_time(st)
+    assert t == "35" and info["setting"] == "timeout" and info["time_from"] == "timeout"
+    k = executor.status_key()
+    assert k["slurm_time"] == k["time"] == "timeout" and k["runtime"] == llmt_runtime.__version__
+    monkeypatch.setenv("FEAT_SLURM_TIME", "estimate")
+    t, info = executor.job_time(st, 2.0)                          # 2 min expected: max(20, 3 x 2 + 10) = 20
+    assert t == "20" and info["setting"] == "estimate" and info["time_from"] == "estimate"
+    assert info["timeout_s"] == executor.timeout_for_limit(st, 20) == 60.0      # nothing left after meshing: 60 s
+    t, info = executor.job_time(st, 6.0)                          # 3 x 6 + 10 = 28 min: timeouts of 8 min
+    assert t == "28" and info["timeout_s"] == (28 - 10 - 10) * 60.0
+    assert executor.job_time(st, 60.0)[0] == "35"                 # never above 'timeout'
+    t, info = executor.job_time(st)                               # no estimate: the timeouts
+    assert t == "35" and info["time_from"] == "timeout"
+    assert executor.job_time({"analysis": "static", "run": {"timeout_s": 600}}, 2.0)[1]["time_from"] == "study"
+    # the inverse of time_limit_min, with an assembly's modal runs (each max(10 min, a quarter of the timeout))
+    asm = {"analysis": "assembly", "steps": [{"kind": "static"}, {"kind": "modal", "modes": 4}]}
+    for minutes in (40, 400):
+        tt = executor.timeout_for_limit(asm, minutes)
+        used = tt * executor.solves_of(asm) + executor.modal_runs_of(asm) * executor.modal_timeout_s(tt)
+        assert abs(used / 60 + executor.mesh_margin_min(asm) + 10 - minutes) < 1e-6
+    # run-study takes the job's timeout from job.json
+    from llmt_runtime import jobs as J
+    (tmp_path / "job.json").write_text(json.dumps({"timeout_s": 480.0}))
+    assert J.job_timeout_s(tmp_path, 900.0) == 480.0 and J.job_timeout_s(tmp_path / "none", 900.0) == 900.0
 
 
 def test_caps_and_job_memory_exact(slurm, monkeypatch):

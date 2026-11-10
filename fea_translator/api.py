@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.09.8
+Version: 2026.11.10.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -102,6 +102,29 @@ def validate(studies: dict) -> dict:
     return out
 
 
+def _estimate_s(study: dict, s: str) -> float | None:
+    """Seconds a study is expected to take (meshing and solves): this machine's timing records scaled to its estimated
+    mesh (when they include meshes within 10x of its size), else the mochi measurements (CalculiX); None when it cannot
+    be told."""
+    rt = _rates(study.get("analysis", ""), s)
+    nodes = executor.estimate_nodes(study)
+    stages = ["mesh", "solve"] + (["mesh_fine", "solve_fine"] if study.get("converge") else [])
+    if rt is not None and (nodes is None or rt["max_nodes"] * 10 >= nodes or s != "ccx"):
+        return sum(_stage_s(st, nodes, rt) or 0 for st in stages)
+    if s == "ccx":
+        return executor.measured_seconds(study)
+    return None
+
+
+def job_estimate_min(study: dict, solver: str | None = None) -> float | None:
+    """Minutes a study is expected to take, for FEAT_SLURM_TIME=estimate: _estimate_s, never above the timeouts; None
+    when it cannot be told (the job then takes the timeouts)."""
+    sec = _estimate_s(study, _solver(solver))
+    if sec is None:
+        return None
+    return min(sec / 60, executor.time_limit_min(study))
+
+
 def estimate(study: dict, solver: str | None = None) -> dict:
     """{minutes, procs, mem_mb} of a study, from the functions that size its SLURM job: procs after the size
     cap (executor.procs_for), memory as its --mem (or what CalculiX needs when the job asks for none),
@@ -110,15 +133,7 @@ def estimate(study: dict, solver: str | None = None) -> dict:
     mochi measurements, else the time limit (every solve's timeout); never above the time limit."""
     s = _solver(solver)
     limit = executor.solves_of(study) * executor.timeout_s(study) / 60
-    rt = _rates(study.get("analysis", ""), s)
-    nodes = executor.estimate_nodes(study)
-    stages = ["mesh", "solve"] + (["mesh_fine", "solve_fine"] if study.get("converge") else [])
-    if rt is not None and (nodes is None or rt["max_nodes"] * 10 >= nodes or s != "ccx"):
-        sec = sum(_stage_s(st, nodes, rt) or 0 for st in stages)
-    elif s == "ccx":
-        sec = executor.measured_seconds(study)
-    else:
-        sec = None
+    sec = _estimate_s(study, s)
     minutes = limit if sec is None else min(limit, sec / 60)
     mem = executor.mem_for(study) or executor.mem_auto(study)
     return {"minutes": round(max(minutes, 0.1), 1), "procs": executor.procs_for(study),
@@ -799,8 +814,10 @@ def start(studies: dict, solver: str | None = None, prefix: str = "run", request
                                                                    solver=s, started=time.time(), slurm=slurm,
                                                                    executor=executor.kind(),
                                                                    timeout=executor.timeout_s())))
+    from llmt_runtime import slurm as S
+    sized = S.time_setting(RT) == "estimate"   # FEAT_SLURM_TIME=estimate: the job's limit from the study's estimate
     for n in slurm:   # one SLURM job per study; a failed submission is that study's result (no local fallback)
-        info = executor.submit(folder, n, studies[n])
+        info = executor.submit(folder, n, studies[n], job_estimate_min(studies[n], s) if sized else None)
         if info.get("ok") is False:
             (folder / n).mkdir(parents=True, exist_ok=True)
             (folder / n / f"{n}.json").write_text(json.dumps({**info, "state": "failed"}))

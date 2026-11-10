@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.09.8
+Version: 2026.11.10.1
 
 From 2026.11.09.8 the SLURM layer is llmt-runtime's (llmt_runtime.slurm and llmt_runtime.jobs, configured by
 runtime.RT): the settings, caps and the node's memory, the machine (cluster nodes, this node, pinning, cores), time
@@ -21,7 +21,7 @@ the job's memory. Where SLURM gives a job without --mem the whole node (CR_Core_
 DefMemPerNode=UNLIMITED, as on mochi: 60000M each), only one job runs at a time; auto asks for what
 CalculiX needs, from the study's node count when it is known before meshing, else 8G (never above the node's memory).
 FEAT_SLURM_TIME: max (default: the partition's own limit) | timeout (the runs' timeouts, the meshing and 10 min) |
-minutes; 'estimate' is read as 'timeout', its meaning in feat before 2026.11.09.8 (runtime.RT's time_aliases).
+estimate (from the study's run-time estimate, each run's timeout cut to fit: timeout_for_limit) | minutes.
 
 Per study (docs/EXECUTION.md "Per-study run settings"): "run": {"timeout_s", "mem", "procs", "queue"}
 overrides FEAT_TIMEOUT, the job's --mem (any --mem/--mem-per-cpu in FEAT_SLURM_ARGS is dropped, the
@@ -181,13 +181,28 @@ def partition_max_min() -> float | None:
     return S.partition_max_min(RT)
 
 
-def job_time(study: dict | None = None) -> tuple[str, dict]:
+def job_time(study: dict | None = None, estimate_min: float | None = None) -> tuple[str, dict]:
     """(the job's --time, details). FEAT_SLURM_TIME: 'max' (default: the partition's own limit, UNLIMITED where it
     has none, so that extend(request) needs only feat's own CalculiX timeout: SLURM lets only an admin raise a
     running job's limit, mochi job 3177, 2026.11.09), 'timeout' (feat's time_limit_min: the runs' timeouts, the
-    meshing and 10 min; 'estimate', feat's word for it before 2026.11.09.8, is read so), or minutes (at least that).
-    feat's own timeout still ends CalculiX and writes a clean result; the SLURM limit is the backstop."""
-    return S.job_time(RT, study)
+    meshing and 10 min), 'estimate' (from the study's run-time estimate, estimate_min: max(FEAT_SLURM_TIME_MIN 20,
+    3 x estimate + 10) min, at most 'timeout'; each run's timeout then fits it: timeout_for_limit), or minutes (at
+    least 'timeout'). feat's own timeout still ends CalculiX and writes a clean result; the SLURM limit is the
+    backstop. (Until 2026.11.10.1 'estimate' was read as 'timeout', feat's word for it before 2026.11.09.8.)"""
+    return S.job_time(RT, study, estimate_min)
+
+
+def timeout_for_limit(study: dict, minutes: int) -> float:
+    """Seconds each CalculiX run of a study may take when its job has `minutes` (FEAT_SLURM_TIME=estimate): the
+    inverse of time_limit_min. The limit less 10 min and the meshing margin is shared by the solves (each the
+    timeout) and an assembly's modal runs (each max(600 s, a quarter of it)); at least 60 s."""
+    st = study or {}
+    avail = (int(minutes) - 10 - mesh_margin_min(st)) * 60.0
+    n, m = solves_of(st), modal_runs_of(st)
+    t = (avail - 600.0 * m) / n                      # the modal runs at their 10-minute floor
+    if m and MODAL_FRACTION * t > 600.0:             # ... or a quarter of the timeout each
+        t = avail / (n + MODAL_FRACTION * m)
+    return max(60.0, t)
 
 
 def job_time_left_min(job_id: str) -> float | None:
@@ -672,11 +687,12 @@ def job_script(request: Path, name: str, study: dict) -> str:
                         node_pin()[0])
 
 
-def submit(request: Path, name: str, study: dict) -> dict:
+def submit(request: Path, name: str, study: dict, estimate_min: float | None = None) -> dict:
     """Writes job.sh and submits it; returns job.json's content, or {'ok': False, 'why': ...} (never a
     silent fallback to local). A job that sbatch took but answered too late for is found by its name (job.json
-    'adopted'). job.json: the runtime's keys and feat's (job_extra)."""
-    return J.submit(RT, Path(request), name, study)
+    'adopted'). job.json: the runtime's keys and feat's (job_extra). estimate_min: the study's run-time estimate,
+    for FEAT_SLURM_TIME=estimate."""
+    return J.submit(RT, Path(request), name, study, estimate_min)
 
 
 # ----------------------------------------------------------------------------- queue (llmt-runtime's)
