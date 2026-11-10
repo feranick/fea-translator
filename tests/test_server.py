@@ -1,6 +1,6 @@
 """The MCP server: stale servers after a deploy (llm-translators docs/SHARED.md) and every tool answering within
 its time (docs/EXECUTION.md: the router counts on an answer within 50 s).
-Version: 2026.10.25.1
+Version: 2026.11.09.8
 """
 import asyncio
 import json
@@ -13,7 +13,7 @@ import pytest
 mcp = pytest.importorskip("mcp")
 from fea_translator import mcp_server as S  # noqa: E402
 
-FAKE = Path(__file__).parent / "fake_slurm"
+from llmt_runtime.testing import fake_slurm  # noqa: E402
 ROOT = Path(__file__).parents[1]
 
 
@@ -111,9 +111,8 @@ def test_every_tool_answers_within_the_call_budget(tmp_path, monkeypatch):
     instead of 48), with the job pending."""
     monkeypatch.setenv("FEAT_OUT", str(tmp_path / "out"))
     monkeypatch.setenv("FEAT_EXECUTOR", "slurm")
-    monkeypatch.setenv("FAKE_SLURM_DIR", str(tmp_path / "fake"))
+    fake_slurm(tmp_path, monkeypatch)            # llmt-runtime's fake SLURM, first on PATH (feat's own until 2026.11.09.8)
     monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
-    monkeypatch.setenv("PATH", f"{FAKE}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("PYTHONPATH", f"{ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
     from fea_translator import bench
     st = dict(bench.cases("ref")["axial_bar"], queue=True)

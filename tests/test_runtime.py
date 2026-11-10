@@ -108,9 +108,9 @@ def slurm(tmp_path, monkeypatch):
     return fake_slurm(tmp_path, monkeypatch)
 
 
-def _fake_job(state: Path, jid: str, **rec) -> None:
+def _fake_job(state_dir: Path, jid: str, **rec) -> None:
     """A job in the fake's queue (a record as its sbatch writes them; pid 999999: not running)."""
-    d = state / "jobs"
+    d = state_dir / "jobs"
     d.mkdir(parents=True, exist_ok=True)
     base = {"name": "feat:r:s", "cpus": 1, "t0": time.time(), "log": "x", "pid": 999999, "node": "fake1"}
     (d / f"{jid}.json").write_text(json.dumps({**base, **rec}))
