@@ -2,12 +2,13 @@
 carbonio job 5797 (an S50 sleeve assembly, 2026.11.05): 6 threads in a 32 GB job were killed at 33.4 GB after 53 min
 (feat's estimate was 62 GB for 6 threads, 31 GB for 1); feat took it for a crash and restarted it on 1 thread without
 saying so, and the step-time share then said 160 h for about 11 h.
-Version: 2026.11.08.1
+Version: 2026.11.09.8
 """
 import json
 import time
 from pathlib import Path
 
+import llmt_runtime.slurm
 import pytest
 
 from fea_translator import api, executor, runner
@@ -89,7 +90,8 @@ def test_out_of_memory_test():
 @pytest.fixture
 def machine(monkeypatch):
     monkeypatch.setattr(executor, "node_cores", lambda: 12)
-    monkeypatch.setattr(executor, "cluster_nodes", lambda: None)
+    # the machine is llmt-runtime's (2026.11.09.8): no SLURM cluster where it asks (caps, node pinning)
+    monkeypatch.setattr(llmt_runtime.slurm, "cluster_nodes", lambda: None)
     for v in ("FEAT_SLURM_MEM", "FEAT_MAX_MEM", "FEAT_SLURM_ARGS", "FEAT_MAX_PROCS"):
         monkeypatch.delenv(v, raising=False)
 
@@ -247,13 +249,17 @@ def test_node_memory_is_a_cap(monkeypatch):
     monkeypatch.setenv("FEAT_EXECUTOR", "slurm")
     for v in ("FEAT_MAX_MEM", "FEAT_SLURM_ARGS", "FEAT_SLURM_NODE"):
         monkeypatch.delenv(v, raising=False)
-    monkeypatch.setattr(executor, "cluster_nodes", lambda: [{"NodeName": "carbonio", "RealMemory": "64000"},
-                                                              {"NodeName": "x", "RealMemory": "1"}])
-    monkeypatch.setattr(executor, "this_node", lambda nodes: nodes[0] if nodes else None)
+    # caps is llmt-runtime's (2026.11.09.8): its node memory comes from llmt_runtime.slurm's cluster_nodes/this_node
+    monkeypatch.setattr(llmt_runtime.slurm, "cluster_nodes", lambda: [{"NodeName": "carbonio", "RealMemory": "64000"},
+                                                                         {"NodeName": "x", "RealMemory": "1"}])
+    monkeypatch.setattr(llmt_runtime.slurm, "this_node", lambda nodes: nodes[0] if nodes else None)
     c = executor.caps()
-    assert c["mem"] == "62G" and c["mem_mb"] == 63488 and c["mem_from"] == "a node's memory (SLURM RealMemory)"
+    # llmt-runtime fix (2026.11.09.8): the node's memory exactly, '64000M' / 64000 MB (it read '62G' / 63488, rounded
+    # down to GB, and refused a run.mem of 64000M)
+    assert c["mem"] == "64000M" and c["mem_mb"] == 64000 and c["mem_from"] == "a node's memory (SLURM RealMemory)"
     errs = " | ".join(validate_study(dict(BOX, run={"mem": "90G"}))["errors"])
-    assert "run.mem: 90G is above 62G, the most on this machine (a node's memory (SLURM RealMemory))" in errs
+    assert "run.mem: 90G is above 64000M, the most on this machine (a node's memory (SLURM RealMemory))" in errs
+    assert validate_study(dict(BOX, run={"mem": "64000M"}))["ok"]     # the fix: the node's whole memory may be asked
     assert validate_study(dict(BOX, run={"mem": "60G"}))["ok"]
     monkeypatch.setenv("FEAT_MAX_MEM", "32G")                 # a lower setting stays, and says so
     c = executor.caps()

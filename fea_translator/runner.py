@@ -1,9 +1,10 @@
 """runner.py — one study from start to end: part, mesh, deck, solver, results, checks.
-Version: 2026.11.09.6
+Version: 2026.11.09.8
 
 Memory and out of memory (the cgroup counters, the job's limit, the node's memory, job vs node, the wording) come from
 llmt-runtime (llmt_runtime.memory) since 2026.11.09.6; what feat does after a kill (a threaded CalculiX run restarted on
-one thread) and its memory model (executor.mem_gb) stay here.
+one thread) and its memory model (executor.mem_gb) stay here. The running solve's side of extend (take_extension) is
+llmt-runtime's since 2026.11.09.8.
 
     run_study(name, study, folder, solver="ccx") -> results dict (also written as <name>.json)
 
@@ -191,20 +192,11 @@ EXTENDED = {"s": 0.0}   # seconds added to the running study's CalculiX time lim
 
 def take_extension(folder: Path | None) -> float:
     """Seconds asked for in <study folder>/extend (api.extend writes it), consumed: the file is renamed to
-    extend.applied.<time>, and the total so far is kept in extended.json (progress reads it)."""
-    if folder is None:
-        return 0.0
-    f = Path(folder) / "extend"
-    try:
-        secs = float(f.read_text().strip())
-        f.rename(f.with_name(f"extend.applied.{int(time.time())}"))
-    except (OSError, ValueError):
-        return 0.0
+    extend.applied.<time>, and the total so far is kept in extended.json (progress reads it). llmt-runtime's
+    (llmt_runtime.jobs.take_extension, 2026.11.09.8); EXTENDED keeps this process's total for the result."""
+    from llmt_runtime import jobs as J
+    secs = J.take_extension(folder)
     EXTENDED["s"] += secs
-    try:
-        (Path(folder) / "extended.json").write_text(json.dumps({"total_s": EXTENDED["s"], "at": time.time()}))
-    except OSError:
-        pass
     return secs
 
 
@@ -1135,7 +1127,9 @@ def run_study(name: str, study: dict, folder: Path, solver: str = "ccx", timeout
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     prog = Progress(folder, study, solver, timeout)
-    for f in (RESTART_FILE, MEMORY_FILE):   # an earlier run's are not this one's
+    # an earlier run's are not this one's (extended.json: llmt-runtime's take_extension adds to its total, which is
+    # this run's, as EXTENDED)
+    for f in (RESTART_FILE, MEMORY_FILE, "extended.json"):
         try:
             (folder / f).unlink()
         except OSError:

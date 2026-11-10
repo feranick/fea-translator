@@ -1,7 +1,8 @@
 """SLURM execution (executor.py, llm-translators docs/EXECUTION.md) with fake sbatch, squeue, scancel,
-sacct and sinfo (tests/fake_slurm): routing, job scripts, submit -> running -> done collected by a new
-process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the status key.
-Version: 2026.11.09.5
+sacct, sinfo and scontrol (llmt-runtime's merged fake: llmt_runtime.testing): routing, job scripts, submit -> running
+-> done collected by a new process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the
+status key.
+Version: 2026.11.09.8
 """
 import json
 import os
@@ -10,11 +11,12 @@ import sys
 import time
 from pathlib import Path
 
+import llmt_runtime.slurm
 import pytest
+from llmt_runtime.testing import fake_slurm
 
 from fea_translator import api, bench, executor
 
-FAKE = Path(__file__).parent / "fake_slurm"
 ROOT = Path(__file__).parents[1]
 
 
@@ -22,12 +24,13 @@ ROOT = Path(__file__).parents[1]
 def slurm(tmp_path, monkeypatch):
     monkeypatch.setenv("FEAT_OUT", str(tmp_path / "out"))
     monkeypatch.setenv("FEAT_EXECUTOR", "slurm")
-    monkeypatch.setenv("FAKE_SLURM_DIR", str(tmp_path / "fake"))
-    monkeypatch.setenv("PATH", f"{FAKE}{os.pathsep}{os.environ['PATH']}")
+    fake_slurm(tmp_path, monkeypatch)      # the commands in tmp_path/bin, first on PATH; FAKE_SLURM_DIR tmp_path/slurm
     monkeypatch.setenv("PYTHONPATH", f"{ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
-    for k in ("FAKE_SBATCH_FAIL", "FAKE_SBATCH_PENDING", "FAKE_SBATCH_DELAY", "FAKE_SACCT_FAIL", "FEAT_PROCS",
-              "FAKE_SQUEUE_FAIL", "FAKE_SCONTROL_NODES", "FAKE_SCONTROL_FAIL", "FAKE_SINFO_PARTITIONS", "FEAT_SLURM_TIME",
-              "FAKE_TIME_LEFT", "FAKE_SCONTROL_DENY"):
+    for k in ("FAKE_SBATCH_FAIL", "FAKE_SBATCH_PENDING", "FAKE_PENDING", "FAKE_SBATCH_DELAY", "FAKE_SBATCH_SLEEP",
+              "FAKE_SBATCH_SLOW_AFTER", "FAKE_MIN_JOB_AGE", "FAKE_PRIORITY", "FAKE_RUN_NODE", "FAKE_START",
+              "FAKE_SACCT_FAIL", "FEAT_PROCS", "FAKE_SQUEUE_FAIL", "FAKE_SCONTROL_NODES", "FAKE_SCONTROL_FAIL",
+              "FAKE_SINFO_FAIL", "FAKE_SINFO_PARTITIONS", "FAKE_SINFO_CPUS", "FEAT_SLURM_TIME", "FAKE_TIME_LEFT",
+              "FAKE_SCONTROL_DENY"):
         monkeypatch.delenv(k, raising=False)
     return tmp_path
 
@@ -89,7 +92,8 @@ def test_submit_run_and_collect_from_a_new_process(slurm):
     assert (req / "bar" / "job.log").is_file()
     j = api.jobs()
     assert j["requests"][0]["request"] == str(req) and j["requests"][0]["studies"]["bar"]["state"] == "done"
-    assert j["machine"] == {"cpus": 8, "cpus_allocated": 2}
+    # llmt-runtime's queue_summary (2026.11.09.8): sinfo -N, each node counted once, and the idle CPUs too
+    assert j["machine"] == {"cpus": 8, "cpus_allocated": 2, "cpus_idle": 6}
 
 
 def test_queued_state_and_submission_failure(slurm, monkeypatch):
@@ -110,8 +114,10 @@ def _ended(slurm, sacct_state=None, log="", sacct_fail=False, monkeypatch=None):
     fake = Path(os.environ["FAKE_SLURM_DIR"]) / "jobs"
     fake.mkdir(parents=True, exist_ok=True)
     jid = str(5000 + len(list(fake.glob("*.json"))))
+    # the merged fake's job record has the node it ran on (its sacct prints NodeList)
     (fake / f"{jid}.json").write_text(json.dumps({"name": "feat:r:s", "cpus": 1, "t0": time.time(), "log": "x",
-                                                  "pid": 999999, **({"sacct": sacct_state} if sacct_state else {})}))
+                                                  "pid": 999999, "node": "fake1",
+                                                  **({"sacct": sacct_state} if sacct_state else {})}))
     req = Path(os.environ["FEAT_OUT"]) / f"run_ended_{jid}"
     (req / "s").mkdir(parents=True)
     (req / "studies.json").write_text(json.dumps({"s": _bar()}))
@@ -372,7 +378,8 @@ def sparks(slurm, monkeypatch):
     f.write_text(SPARKS)
     monkeypatch.setenv("FAKE_SCONTROL_NODES", str(f))
     monkeypatch.setattr(executor.socket, "gethostname", lambda: "claude-test-host")
-    monkeypatch.setattr(executor, "_addresses", lambda: {"192.168.1.20", "100.76.107.42"})
+    # this_node is llmt-runtime's (2026.11.09.8): it asks llmt_runtime.slurm.addresses()
+    monkeypatch.setattr(llmt_runtime.slurm, "addresses", lambda: {"192.168.1.20", "100.76.107.42"})
     return slurm
 
 
@@ -405,7 +412,7 @@ def test_node_pinning_in_a_two_node_cluster(sparks, monkeypatch):
     monkeypatch.delenv("FEAT_SLURM_ARGS")
     monkeypatch.delenv("FEAT_SLURM_NODE")
     monkeypatch.setattr(executor.socket, "gethostname", lambda: "elsewhere")
-    monkeypatch.setattr(executor, "_addresses", lambda: {"10.0.0.9"})
+    monkeypatch.setattr(llmt_runtime.slurm, "addresses", lambda: {"10.0.0.9"})
     ns = executor.node_status()
     assert ns["nodelist"] is None and "none of the cluster's nodes" in ns["warning"]
 
@@ -441,7 +448,12 @@ def test_slurm_that_does_not_answer_is_asked_again(sparks, monkeypatch):
     monkeypatch.setenv("FAKE_SCONTROL_FAIL", "1")
     assert executor.cluster_nodes() is None and executor.node_status()["cluster_nodes"] is None
     monkeypatch.delenv("FAKE_SCONTROL_FAIL")
-    assert executor.node_status()["cluster_nodes"] == 2           # at once, not after a cache expires
+    # llmt-runtime (2026.11.09.8): a failed scontrol is not asked again within 5 s (NODES_RETRY_S), so a dead
+    # controller costs one timeout per call, not one per question; 5 s later it is asked at once, not after the
+    # 60 s cache
+    assert executor.node_status()["cluster_nodes"] is None
+    executor._NODES["failed"] -= llmt_runtime.slurm.NODES_RETRY_S
+    assert executor.node_status()["cluster_nodes"] == 2
     monkeypatch.setenv("FAKE_SBATCH_DELAY", "3")                   # the job is still running when squeue fails
     r = api.run({"bar": _bar(queue=True)}, "ref", wait=0)
     req = Path(r["request"])
@@ -623,7 +635,7 @@ def test_slurm_time_from_the_partition(slurm, monkeypatch):
     monkeypatch.delenv("FEAT_SLURM_ARGS")
     executor._PART.update(t=0.0, v=None)
     assert executor.job_time(st)[0] == str(7 * 1440)
-    monkeypatch.setenv("FEAT_SLURM_TIME", "estimate")
+    monkeypatch.setenv("FEAT_SLURM_TIME", "estimate")             # feat's word for llmt-runtime's 'timeout'
     assert executor.job_time(st)[0] == str(need)
     monkeypatch.setenv("FEAT_SLURM_TIME", "100000")
     assert executor.job_time(st)[0] == "100000"
@@ -638,13 +650,14 @@ def test_extend_skips_or_explains_slurm(slurm, monkeypatch):
     (req / "studies.json").write_text(json.dumps({"a": {"analysis": "static", "run": {"timeout_s": 3600}}}))
     (req / "a" / "job.json").write_text(json.dumps({"job_id": "77"}))
     (req / "a" / "progress.json").write_text(json.dumps({"stage_started": time.time() - 1800, "timeout_s": 3600}))
-    monkeypatch.setattr(executor, "job_time_left_min", lambda j: float("inf"))
+    # extend is llmt-runtime's extend_request (2026.11.09.8): it asks llmt_runtime.slurm.job_time_left_min
+    monkeypatch.setattr(llmt_runtime.slurm, "job_time_left_min", lambda j: float("inf"))
     assert api.extend(str(req), 2)["studies"]["a"]["slurm_time_limit"] == "not needed: the job has no SLURM time limit"
     (req / "a" / "extend").unlink()
-    monkeypatch.setattr(executor, "job_time_left_min", lambda j: 600.0)      # 10 h left: covers 0.5 h + 2 h + 10 min
+    monkeypatch.setattr(llmt_runtime.slurm, "job_time_left_min", lambda j: 600.0)   # 10 h: covers 0.5 h + 2 h + 10 min
     assert api.extend(str(req), 2)["studies"]["a"]["slurm_time_limit"].startswith("not needed: the job has 10.0 h left")
     (req / "a" / "extend").unlink()
-    monkeypatch.setattr(executor, "job_time_left_min", lambda j: 40.0)
+    monkeypatch.setattr(llmt_runtime.slurm, "job_time_left_min", lambda j: 40.0)
     monkeypatch.setenv("FAKE_SCONTROL_DENY", "1")
     r = api.extend(str(req), 2)["studies"]["a"]["slurm_time_limit"]
     assert r.startswith("not raised (Access/permission denied for JobId=77)") and "only an admin" in r and "0.7 h" in r

@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.09.6
+Version: 2026.11.09.8
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -14,6 +14,9 @@ Version: 2026.11.09.6
     read_file(path)                  a written file as base64 (only under the output folder)
     jobs(limit, active)              recent requests with SLURM jobs and their states; the queue
     cancel(request, names)           stops a request's studies (scancel)
+    extend(request, hours, names)    more time for running studies
+                                     (jobs, cancel, extend: llmt-runtime's list_jobs, cancel_request, extend_request
+                                     from 2026.11.09.8; the local pool's side of cancel stays here)
     tool_status()                    versions, solver and mesher found, the executor, the renderers
     render_images(study_folder, images)  new pictures of a finished study from its saved state (no solving)
     in_worker(what, fn_name, kwargs, wait)  slow work of a tool call in a worker process, within wait
@@ -30,7 +33,6 @@ from __future__ import annotations
 
 import base64
 import json
-import math
 import multiprocessing as mp
 import os
 import time
@@ -882,46 +884,22 @@ def run(studies: dict, solver: str | None = None, wait: float | None = None, req
 def jobs(limit: int = 20, active: bool = False) -> dict:
     """The newest requests under FEAT_OUT with SLURM jobs, their studies' states, job ids and times;
     the translator's queue (running, queued, CPUs) and the machine's CPUs. active: only requests with
-    queued or running studies."""
-    root = out_root()
-    reqs = sorted((d for g in ("run_*", "bench_*") for d in root.glob(g) if (d / "request.json").is_file()),
-                  key=lambda d: d.stat().st_mtime, reverse=True) if root.is_dir() else []
-    out = []
-    for d in reqs:
-        if len(out) >= max(1, int(limit)):
-            break
-        try:
-            meta = json.loads((d / "request.json").read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        names = meta.get("slurm", [])
-        if not names or not any((d / n / "job.json").is_file() for n in names):
-            continue
-        left = executor.remaining()
-        if left is not None and left < 5:   # within the call's time: say so rather than answer late
-            out.append({"request": str(d), "started": _clock(meta.get("started", d.stat().st_mtime)),
-                        "note": "not checked: SLURM was slow and the call ran out of time; ask again"})
-            continue
-        st = executor.job_states(d, names)
-        if active and not any(v["state"] in ("queued", "running") for v in st.values()):
-            continue
-        studies = {}
-        for n, v in st.items():
-            rec = dict(v)
-            if v["state"] == "done":
-                try:
-                    r = json.loads((d / n / f"{n}.json").read_text())
-                    rec["ok"] = r.get("ok")
-                    if r.get("ok") is False:
-                        rec["why"] = r.get("why")
-                except (OSError, json.JSONDecodeError):
-                    pass
-            elif v["state"] == "running":
-                pr = _progress(d / n, {}, meta.get("solver", "ccx"), float(meta.get("timeout", 900)))
-                rec.update({k: pr[k] for k in ("stage", "eta_min", "eta_min_max") if k in pr})
-            studies[n] = rec
-        out.append({"request": str(d), "started": _clock(meta.get("started", d.stat().st_mtime)), "studies": studies})
-    return {"translator": __version__, "executor": executor.kind(), "requests": out, **executor.queue_summary()}
+    queued, running (or unknown: SLURM did not answer) studies. llmt-runtime's list_jobs (2026.11.09.8), with feat's
+    progress of running studies (job_progress)."""
+    from .runtime import RT
+    return RT.jobs.list_jobs(limit, active)
+
+
+def job_progress(folder: Path, study: dict) -> dict:
+    """Where a running SLURM study is, for jobs() (the runtime's hooks.running_progress): stage, eta_min, eta_min_max
+    from its progress.json, with the request's solver and timeout (request.json)."""
+    folder = Path(folder)
+    try:
+        meta = json.loads((folder.parent / "request.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    pr = _progress(folder, {}, meta.get("solver", "ccx"), float(meta.get("timeout", 900)))
+    return {k: pr[k] for k in ("stage", "eta_min", "eta_min_max") if k in pr}
 
 
 def _feat_left_s(d: Path, study: dict) -> float:
@@ -943,65 +921,23 @@ def extend(request: str, hours: float, names: list[str] | None = None) -> dict:
     """More time for a request's running studies (or the named ones): each one's CalculiX run moves its deadline
     back by `hours` within seconds (an 'extend' file in its folder, which the run consumes), and its SLURM job's
     time limit is raised by as much (scontrol; SLURM may refuse a user's raise: then an admin has to). Within
-    FEAT_MAX_TIMEOUT when set (the study's run.timeout_s plus what was added)."""
+    FEAT_MAX_TIMEOUT when set (the study's run.timeout_s plus what was added). llmt-runtime's extend_request
+    (2026.11.09.8): the SLURM limit is raised only when the job's time left does not cover feat's new deadline
+    (_feat_left_s + the hours + 10 min)."""
+    from .runtime import RT
     folder = Path(request).expanduser()
     try:
         meta = json.loads((folder / "request.json").read_text())
     except (OSError, json.JSONDecodeError):
         return {"error": f"no request {folder}"}
-    if not (isinstance(hours, (int, float)) and hours > 0):
-        return {"error": "hours: a number > 0"}
-    want = list(names) if names else list(meta.get("names", []))
-    unknown = [n for n in want if n not in meta.get("names", [])]
-    if unknown:
-        return {"error": f"no studies {unknown} in this request ({meta.get('names', [])})"}
-    studies = json.loads((folder / "studies.json").read_text())
-    cap = executor.caps().get("timeout_s")
-    out = {"request": str(folder), "translator": __version__, "studies": {}}
-    for n in want:
-        d = folder / n
-        rec = {}
-        if (d / f"{n}.json").is_file():
-            out["studies"][n] = {"state": "finished: nothing to extend"}
-            continue
-        secs = float(hours) * 3600
-        if cap:
-            try:
-                had = float(json.loads((d / "extended.json").read_text()).get("total_s", 0.0))
-            except (OSError, ValueError):
-                had = 0.0
-            room = float(cap) - executor.timeout_s(studies.get(n)) - had
-            if room <= 0:
-                out["studies"][n] = {"error": f"at FEAT_MAX_TIMEOUT ({cap:g} s) already"}
-                continue
-            if secs > room:
-                secs, rec["capped"] = room, f"to FEAT_MAX_TIMEOUT ({cap:g} s)"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "extend").write_text(str(secs))
-        rec["added_s"] = round(secs, 1)
-        if n in meta.get("slurm", []):
-            try:
-                jid = json.loads((d / "job.json").read_text())["job_id"]
-            except (OSError, json.JSONDecodeError, KeyError):
-                jid = None
-                rec["slurm_time_limit"] = "no job.json: not raised"
-            if jid:
-                rec["slurm_job"] = jid
-                left = executor.job_time_left_min(jid)       # the job's own limit may already cover it
-                need = _feat_left_s(d, studies.get(n) or {}) + secs + 600
-                if left is not None and (math.isinf(left) or left * 60 >= need):
-                    rec["slurm_time_limit"] = ("not needed: the job has no SLURM time limit" if math.isinf(left) else
-                                               f"not needed: the job has {left / 60:.1f} h left before SLURM's limit")
-                else:
-                    err = executor.extend_job(jid, int(math.ceil(secs / 60)))
-                    end = f" (in about {left / 60:.1f} h)" if left is not None else ""
-                    rec["slurm_time_limit"] = "raised" if err is None else (
-                        f"not raised ({err}): SLURM lets only an admin raise a running job's limit, so the job still "
-                        f"ends at its old limit{end}; an admin can run scontrol update JobId={jid} "
-                        f"TimeLimit=+{int(math.ceil(secs / 60))}. Jobs submitted from 2026.11.09.5 on take the "
-                        "partition's own limit (FEAT_SLURM_TIME=max), so extend needs no admin")
-        rec["note"] = "the running CalculiX run takes it within about 5 s (extended.json records it)"
-        out["studies"][n] = rec
+    try:
+        studies = json.loads((folder / "studies.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        studies = {}
+    out = RT.jobs.extend_request(folder, meta, studies, hours, names)
+    for rec in out.get("studies", {}).values():
+        if "note" in rec:
+            rec["note"] = "the running CalculiX run takes it within about 5 s (extended.json records it)"
     return out
 
 
@@ -1010,37 +946,31 @@ def cancel(request: str, names: list[str] | None = None) -> dict:
     folder, which the runner checks while CalculiX runs (it ends CalculiX's process group within a second) and
     before meshing and each solve, in any process (the local pool of this or another server, a SLURM job); and
     scancel for SLURM jobs, queued or running. A study not started yet ends as cancelled when it would start.
-    Returns their states (after waiting up to 10 s for them to stop)."""
+    Returns their states (after waiting up to 10 s for them to stop). The flags and scancel: llmt-runtime's
+    cancel_request (2026.11.09.8); the local pool's side stays here."""
+    from llmt_runtime.jobs import ACTIVE, QUEUED
+
+    from .runtime import RT
     folder = Path(request).expanduser()
     try:
         meta = json.loads((folder / "request.json").read_text())
     except (OSError, json.JSONDecodeError):
         return {"error": f"no request {folder}"}
-    want = list(names) if names else list(meta.get("names", []))
-    unknown = [n for n in want if n not in meta.get("names", [])]
-    if unknown:
-        return {"error": f"no studies {unknown} in this request ({meta.get('names', [])})"}
-    todo = [n for n in want if not (folder / n / f"{n}.json").is_file()]
-    for n in todo:
-        (folder / n).mkdir(parents=True, exist_ok=True)
-        (folder / n / "cancel").write_text(str(time.time()))
-    slurm = [n for n in todo if n in meta.get("slurm", [])]
-    ids = []
-    for n in slurm:
-        try:
-            ids.append(json.loads((folder / n / "job.json").read_text())["job_id"])
-        except (OSError, json.JSONDecodeError, KeyError):
-            pass
-    err = executor.scancel(ids)
+    c = RT.jobs.cancel_request(folder, meta, names)
+    if "want" not in c:                      # unknown names
+        return c
+    want, todo, slurm, ids = c["want"], c["todo"], c["slurm"], c["cancelled_jobs"]
     out = {"request": str(folder), "translator": __version__, "cancelled_jobs": ids,
-           "already_finished": [n for n in want if n not in todo]}
-    if err:
-        out["error"] = err
+           "already_finished": c["already_finished"]}
+    if c.get("error"):
+        out["error"] = c["error"]
     local = [n for n in todo if n not in slurm]
     here = _POOL.jobs.get(str(folder), {})
     t_end = _until(10)                       # give CalculiX and SLURM a moment to stop
     while time.time() < t_end:
         q = executor.squeue(ids) if ids else {}
+        if q is not None:                    # ended jobs squeue still lists (MinJobAge, in their final state): gone
+            q = {i: v for i, v in q.items() if v["state"] in QUEUED + ACTIVE}
         if (q is not None and not q) and all((folder / n / f"{n}.json").is_file() or (n in here and here[n].ready())
                                              or n not in here for n in local):
             break
