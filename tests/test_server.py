@@ -1,6 +1,8 @@
 """The MCP server: stale servers after a deploy (llm-translators docs/SHARED.md) and every tool answering within
-its time (docs/EXECUTION.md: the router counts on an answer within 50 s).
-Version: 2026.11.09.8
+its time (docs/EXECUTION.md: the router counts on an answer within 50 s). Since 2026.11.09.10 this is llmt-runtime's
+server.Server (mcp_server.GUARD): patches go to GUARD's methods and attributes, or to llmt_runtime.server, where the
+module-level names are only wrappers GUARD does not call.
+Version: 2026.11.09.10
 """
 import asyncio
 import json
@@ -13,6 +15,8 @@ import pytest
 mcp = pytest.importorskip("mcp")
 from fea_translator import mcp_server as S  # noqa: E402
 
+import llmt_runtime.server as RS  # noqa: E402
+from llmt_runtime import slurm as _slurm  # noqa: E402
 from llmt_runtime.testing import fake_slurm  # noqa: E402
 ROOT = Path(__file__).parents[1]
 
@@ -48,8 +52,10 @@ def test_stale_reason_shared_and_personal(tmp_path):
 def stale(tmp_path, monkeypatch):
     monkeypatch.setenv("FEAT_OUT", str(tmp_path))
     exits = []
-    monkeypatch.setattr(S, "_stale", lambda: S._STATE["why"])
-    monkeypatch.setattr(S, "_exit_soon", lambda why, delay: exits.append(why) or S._STATE.update(exiting=True))
+    # GUARD.enter_call and GUARD.watch call GUARD.stale and GUARD.exit_soon, not mcp_server's _stale/_exit_soon
+    # wrappers (2026.11.09.10): patch the instance (set before the state items, so undone after them)
+    monkeypatch.setattr(S.GUARD, "stale", lambda: S._STATE["why"])
+    monkeypatch.setattr(S.GUARD, "exit_soon", lambda why, delay: exits.append(why) or S._STATE.update(exiting=True))
     monkeypatch.setitem(S._STATE, "why", "release r2 is installed; this server runs r1 (1.0)")
     monkeypatch.setitem(S._STATE, "exiting", False)
     monkeypatch.setitem(S._STATE, "shared", True)
@@ -91,7 +97,8 @@ def test_tests_and_scripts_in_a_stale_release_run_normally(stale, monkeypatch):
 
 
 def test_an_idle_stale_server_exits_by_itself(stale, monkeypatch):
-    S._watch_install(period=0.2)
+    monkeypatch.setattr(S.GUARD, "period", 0.2)   # GUARD.watch reads it at each look (the thread outlives the test)
+    S._watch_install()
     t_end = time.time() + 5
     while time.time() < t_end and not stale:
         time.sleep(0.1)
@@ -118,7 +125,9 @@ def test_every_tool_answers_within_the_call_budget(tmp_path, monkeypatch):
     st = dict(bench.cases("ref")["axial_bar"], queue=True)
     out = asyncio.run(S.run_studies({"bar": st}, solver="ref", wait_s=0))
     assert out["pending"] == ["bar"]
-    monkeypatch.setattr(S, "BUDGET_S", 4.0)
+    # the budget (48 s) is bound when GUARD.tool decorates the tools, so S.BUDGET_S no longer reaches them
+    # (2026.11.09.10): the runtime's wrapper opens llmt_runtime.server.deadline(budget) at each call; 4 s instead
+    monkeypatch.setattr(RS, "deadline", lambda seconds: _slurm.deadline(min(seconds, 4.0)))
     slow = tmp_path / "slowbin"
     slow.mkdir()
     (slow / "squeue").write_text("#!/bin/sh\nsleep 30\n")      # a controller that does not answer

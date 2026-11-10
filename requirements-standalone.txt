@@ -1,4 +1,4 @@
 # fea-translator outside llm-translators, without an llmt-runtime checkout next to it:
 #   pip install -r requirements-standalone.txt && pip install -e ".[mesh,mcp,test]"
 # (inside llm-translators, llmt installs the umbrella's pinned llmt-runtime instead: this file decides nothing there)
-llmt-runtime @ git+https://github.com/feranick/llmt-runtime@2026.11.09.4
+llmt-runtime @ git+https://github.com/feranick/llmt-runtime@2026.11.09.5

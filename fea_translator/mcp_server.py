@@ -1,5 +1,5 @@
 """mcp_server.py — MCP server: lets LLM-based tools run FEA studies with Gmsh and CalculiX.
-Version: 2026.11.07.2
+Version: 2026.11.09.10
 
 Tools (all JSON):
   study_format      the study format: analyses, materials, boundary conditions, face selectors. Read it first.
@@ -25,26 +25,29 @@ Time: every tool answers within its wait (at most 50 s): tools run in a worker t
       bounds SLURM commands and submissions; CAD (part sizes) and meshing (get_deck) run in worker processes,
       solves in the worker pool or in SLURM jobs.
 Stale: a server keeps the code it started with. When a newer release is installed (shared install: <prefix>/current
-      points elsewhere; checkout: __init__.py has another version), a call that finds the server idle is refused
-      with STALE_SERVER (llm-translators' router repeats it on a new server) and the server exits; an idle stale
-      server exits within ~20 s by itself. Busy servers answer (old code, with a server_stale note) and exit once
-      idle. Only a server started by main() refuses or exits (tests and run-study in a release that is not yet
-      current run normally). FEAT_EXIT_WHEN_STALE=1 always, 0 never; default: shared installs only.
+      points elsewhere; checkout: __init__.py, feat's or llmt-runtime's, has another version), a call that finds the
+      server idle is refused with STALE_SERVER (llm-translators' router repeats it on a new server) and the server
+      exits; an idle stale server exits by itself within about two periods (FEAT_STALE_CHECK_S, default 10 s). Busy
+      servers answer (old code, with a server_stale note) and exit once idle. Only a server started by main()
+      refuses or exits (tests and run-study in a release that is not yet current run normally).
+      FEAT_EXIT_WHEN_STALE=1 always, 0 never; default: shared installs only.
+
+Since 2026.11.09.10 the stale handling and the tool wrapper are llmt-runtime's (llmt_runtime.server.Server: GUARD
+below), as are the server's log (<FEAT_OUT>/.server/<time>_<host>_<pid>.log: calls, failures with their traceback,
+the exit) and the signal handlers (SIGTERM/SIGHUP/SIGINT stop the workers first). The names below (stale_reason,
+_STATE, _stale, _may_exit, _exit_soon, _enter_call, _leave_call, _watch_install, STALE_MARK, BUDGET_S) are thin
+wrappers over GUARD for tests and scripts.
 """
-from __future__ import annotations
-
+# No `from __future__ import annotations` here (since 2026.11.09.10): the tools' wrapper is defined in
+# llmt_runtime.server, and MCP SDK 1.x evaluates string annotations in the wrapper's globals (that module's), where
+# `Image` is unknown; real annotation objects need no evaluation (all valid at run time on Python >= 3.10).
 import argparse
-import functools
-import os
-import re
-import sys
-import threading
-import time
-from pathlib import Path
 
-import anyio.to_thread
+from llmt_runtime import server as _rt_server
+from llmt_runtime.server import Server
 
-from . import api, executor
+from . import api
+from .runtime import RT
 
 try:  # MCP Python SDK 2.x
     from mcp.server.mcpserver import Image
@@ -57,7 +60,9 @@ except ImportError:  # 1.x
     from mcp.server.fastmcp.exceptions import ToolError
     _V2 = False
 
-BUDGET_S = 48.0   # a call's deadline: the router (and the Claude app) count on an answer within 50 s
+# a call's deadline: the router (and the Claude app) count on an answer within 50 s. llmt-runtime's (48 s), bound when
+# GUARD.tool decorates each tool: changing this name later changes nothing (tests patch llmt_runtime.server.deadline)
+BUDGET_S = _rt_server.BUDGET_S
 
 INSTRUCTIONS = """fea-translator runs finite-element analyses of one solid part: linear static (stresses,
 displacements, reactions, safety factor), modal (natural frequencies), linear buckling (load factors)
@@ -98,50 +103,7 @@ server = _Server("fea-translator", instructions=INSTRUCTIONS)
 
 
 # ---- a stale server: a newer version installed since this process started (llm-translators docs/SHARED.md) ----
-STALE_MARK = "STALE_SERVER"
-VERSION_RE = re.compile(r'^__version__\s*=\s*"([^"]+)"', re.M)
-_STATE = {"inflight": 0, "exiting": False, "checked": 0.0, "why": None, "shared": False, "serving": False}
-_LOCK = threading.Lock()
-
-
-def stale_reason(pkg_dir: Path, running: str) -> tuple[str | None, bool]:
-    """(why this process runs old code or None, shared install?). Shared install (a release under
-    <prefix>/releases with RELEASE.json): <prefix>/current now points to another release. Otherwise: the
-    package's __init__.py on disk carries another version (a checkout or editable install updated in place)."""
-    rel = pkg_dir.parent.parent
-    if (rel / "RELEASE.json").is_file() and rel.parent.name == "releases":
-        cur = rel.parent.parent / "current"
-        try:
-            if cur.exists() and cur.resolve() != rel.resolve():
-                return f"release {cur.resolve().name} is installed; this server runs {rel.name} ({running})", True
-        except OSError:
-            pass
-        return None, True
-    try:
-        m = VERSION_RE.search((pkg_dir / "__init__.py").read_text())
-    except OSError:
-        return None, False
-    if m and m.group(1) != running:
-        return f"version {m.group(1)} is installed; this server runs {running}", False
-    return None, False
-
-
-def _stale() -> str | None:
-    """stale_reason for this process, checked at most every 2 s."""
-    now = time.time()
-    if now - _STATE["checked"] > 2.0:
-        _STATE["why"], _STATE["shared"] = stale_reason(Path(api.__file__).resolve().parent, api.__version__)
-        _STATE["checked"] = now
-    return _STATE["why"]
-
-
-def _may_exit() -> bool:
-    """Only a server started by main() (never tools called in-process: tests, scripts, llmt deploy --test before
-    current is switched). Then FEAT_EXIT_WHEN_STALE: 1 always, 0 never; default: in a shared install."""
-    if not _STATE["serving"]:
-        return False
-    v = os.environ.get("FEAT_EXIT_WHEN_STALE", "").strip()
-    return v == "1" or (v != "0" and _STATE["shared"])
+# llmt-runtime's since 2026.11.09.10: GUARD holds the state, the checks, the exit and the tool wrapper.
 
 
 def _pool_busy() -> bool:
@@ -149,80 +111,51 @@ def _pool_busy() -> bool:
     return any(not r.ready() for jobs in api._POOL.jobs.values() for r in jobs.values()) or api.aux_busy()
 
 
-def _exit_soon(why: str, delay: float) -> None:
-    """Exits in `delay` s (an answer in flight reaches the caller first). Caller holds _LOCK."""
-    if _STATE["exiting"]:
-        return
-    _STATE["exiting"] = True
-    sys.stderr.write(f"feat: {STALE_MARK}: exiting to pick up the new code: {why}\n")
-    sys.stderr.flush()
+GUARD = Server(RT, api.__file__, busy=_pool_busy, shutdown=api.shutdown_workers)   # period: FEAT_STALE_CHECK_S (10 s)
 
-    def go():
-        time.sleep(delay)
-        api.shutdown_workers()   # os._exit skips atexit: every pool and worker process is stopped here
-        os._exit(0)
-    threading.Thread(target=go, daemon=True, name="feat-exit").start()
+STALE_MARK = _rt_server.STALE_MARK
+stale_reason = _rt_server.stale_reason  # (pkg_dir, running[, runtime_dir, runtime_running]) -> (why or None, shared?)
+_STATE = GUARD.state                    # inflight, background, exiting, checked, why, shared, serving
+_LOCK = GUARD.lock
+
+
+def _stale() -> str | None:
+    """stale_reason for this process (feat's and llmt-runtime's versions), checked at most every 2 s."""
+    return GUARD.stale()
+
+
+def _may_exit() -> bool:
+    """Only a server started by main() (never tools called in-process: tests, scripts, llmt deploy --test before
+    current is switched). Then FEAT_EXIT_WHEN_STALE: 1 always, 0 never; default: in a shared install."""
+    return GUARD.may_exit()
+
+
+def _exit_soon(why: str, delay: float) -> None:
+    """Exits in `delay` s after stopping every worker (api.shutdown_workers, at most SHUTDOWN_S: os._exit skips
+    atexit). GUARD's own calls hold its lock."""
+    GUARD.exit_soon(why, delay)
 
 
 def _enter_call() -> str | None:
     """Counts a call in. Returns a STALE_MARK message (the call is refused) when this server is stale, may exit
     and has nothing else running; otherwise None."""
-    with _LOCK:
-        why = _stale()
-        if why and _may_exit() and (_STATE["exiting"] or (not _STATE["inflight"] and not _pool_busy())):
-            _exit_soon(why, 1.0)
-            return (f"{STALE_MARK}: {why}. This server is exiting so that the next one runs the installed version: "
-                    "call again.")
-        _STATE["inflight"] += 1
-        return None
+    return GUARD.enter_call()
 
 
 def _leave_call() -> None:
-    with _LOCK:
-        _STATE["inflight"] -= 1
+    GUARD.leave_call()
 
 
-def _watch_install(period: float = 10.0) -> None:
-    """Exits this server when it is stale, may exit and is idle (no calls, no pool studies): within ~20 s."""
-    def loop():
-        while True:
-            time.sleep(period)
-            with _LOCK:
-                if _stale() and _may_exit() and not _STATE["inflight"] and not _pool_busy():
-                    _exit_soon(_STATE["why"], 0.0)
-    threading.Thread(target=loop, daemon=True, name="feat-watch-install").start()
-
-
-def _tool(fn):
-    """Every tool: refused with STALE_SERVER when the server is stale and idle; otherwise run in a worker thread
-    (a blocking call must not stop the server's other requests) under a deadline of BUDGET_S, so it answers in
-    time; errors come back with their text (SDK 2.x hides the text of other exceptions)."""
-    def bounded(*args, **kwargs):
-        with executor.deadline(BUDGET_S):
-            return fn(*args, **kwargs)
-
-    @functools.wraps(fn)
-    async def wrap(*args, **kwargs):
-        refused = _enter_call()
-        if refused:
-            raise ToolError(refused)
-        try:
-            r = await anyio.to_thread.run_sync(functools.partial(bounded, *args, **kwargs))
-        except ToolError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
-        finally:
-            _leave_call()
-        if _STATE["why"] and isinstance(r, dict):
-            r = {**r, "server_stale": f"{_STATE['why']}: this answer comes from the old code"
-                                      + ("; the server restarts when idle" if _may_exit() else "; restart the MCP server")}
-        return r
-    return wrap
+def _watch_install(period: float | None = None) -> None:
+    """Exits this server when it is stale, may exit and is idle (no calls, no pool studies), checking every
+    `period` s (default GUARD.period: FEAT_STALE_CHECK_S, 10 s). GUARD.serve() starts it."""
+    if period is not None:
+        GUARD.period = float(period)
+    GUARD.watch()
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def study_format() -> dict:
     """The study format: analyses, materials, boundary-condition kinds with their parameters,
     face selectors, conventions, an example; and which solver and mesher are installed."""
@@ -230,7 +163,7 @@ def study_format() -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def validate_studies(studies: dict) -> dict:
     """Static checks of studies given as {name: study}. Returns per study ok, errors, warnings, and for a valid
     study "estimate": {minutes, procs, mem_mb} (expected run time, at most its time limit; threads; memory)."""
@@ -238,7 +171,7 @@ def validate_studies(studies: dict) -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def run_studies(studies: dict, solver: str = "auto", wait_s: float = 45, request_name: str | None = None) -> dict:
     """Meshes, solves and checks each study. Per study: results (max displacement, von Mises peaks
     with and without the support/load regions, safety factors, reactions, frequencies, buckling
@@ -256,7 +189,7 @@ def run_studies(studies: dict, solver: str = "auto", wait_s: float = 45, request
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def study_status(request: str, wait_s: float = 45) -> dict:
     """The studies of a run_studies request (its 'request' path): finished ones with their results,
     the others in 'pending' with progress and time left. Waits up to wait_s seconds (at most 50) for
@@ -265,7 +198,7 @@ def study_status(request: str, wait_s: float = 45) -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def get_deck(study: dict, name: str = "study") -> dict:
     """Meshes the part (a joint: every part) and returns the CalculiX input deck (.inp) of one study and its mesh
     size (nodes, elements; a joint: per part, with the selection, bolts, gaskets' gap and law), without solving:
@@ -275,7 +208,7 @@ def get_deck(study: dict, name: str = "study") -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def run_benchmarks(names: list[str] | None = None, solver: str = "auto", wait_s: float = 30) -> dict:
     """Runs the benchmark studies with closed-form answers (axial bar, cantilever, natural frequency,
     Euler column, conduction, Lame ring, plate with a hole, electrical cases) as one request, and
@@ -285,7 +218,7 @@ def run_benchmarks(names: list[str] | None = None, solver: str = "auto", wait_s:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def bench_status(bench: str, wait_s: float = 30) -> dict:
     """A run_benchmarks request (its 'bench' path): passed, failed, skipped and pending cases, with
     progress for the pending ones. Waits up to wait_s seconds (at most 50)."""
@@ -293,14 +226,14 @@ def bench_status(bench: str, wait_s: float = 30) -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def get_file(path: str, max_mb: float = 20) -> dict:
     """A file written by run_studies (a path from its result) as base64."""
     return api.read_file(path, max_mb)
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def jobs(limit: int = 20, active: bool = False) -> dict:
     """Recent requests that have SLURM jobs, with each study's state (queued, running, done, timed_out,
     out_of_memory, cancelled, failed), job id and expected time; the translator's queue and the machine's
@@ -310,7 +243,7 @@ def jobs(limit: int = 20, active: bool = False) -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def get_image(path: str) -> Image:
     """A PNG written by run_studies (a result's images.<name>.path) or render_images, as an image you can see and
     show: fields on the (deformed) part, mode shapes, the setup view, section cuts."""
@@ -318,7 +251,7 @@ def get_image(path: str) -> Image:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def render_images(study_folder: str, images: list | bool = True, wait_s: float = 45) -> dict:
     """New pictures of a finished study without solving again: study_folder is <request>/<study name> (the folder
     holding <name>.json and state.npz). images: true (the defaults) or [{name, field | mode: n | setup: true,
@@ -330,7 +263,7 @@ def render_images(study_folder: str, images: list | bool = True, wait_s: float =
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def extend(request: str, hours: float, names: list[str] | None = None) -> dict:
     """More time for a request's running studies (or the named ones): each CalculiX run's time limit moves back by
     `hours` within seconds, and its SLURM job's limit is raised by as much (SLURM may refuse: the answer says so,
@@ -339,7 +272,7 @@ def extend(request: str, hours: float, names: list[str] | None = None) -> dict:
 
 
 @server.tool()
-@_tool
+@GUARD.tool(ToolError)
 def cancel(request: str, names: list[str] | None = None) -> dict:
     """Stops a request's studies (or the named ones), wherever they run: SLURM jobs are cancelled, and studies in a
     local worker pool (of any server) stop within a second (CalculiX and its threads end). Returns their states."""
@@ -351,8 +284,7 @@ def main() -> None:
     ap.add_argument("--http", type=int, help="serve MCP over streamable HTTP on this port (default: stdio)")
     ap.add_argument("--host", default="127.0.0.1")
     a = ap.parse_args()
-    _STATE["serving"] = True
-    _watch_install()
+    GUARD.serve()     # may refuse stale calls and exit; the install watch, the log in $FEAT_OUT/.server, signals
     if a.http is None:
         server.run()
     elif _V2:

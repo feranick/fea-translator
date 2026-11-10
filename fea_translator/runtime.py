@@ -1,5 +1,5 @@
 """runtime.py — feat's llmt-runtime: the executor code the translators share, with feat's settings and hooks.
-Version: 2026.11.09.8
+Version: 2026.11.09.10
 
     RT          llmt_runtime.Runtime for feat (FEAT_ settings, the `feat` CLI, threads: --cpus-per-task)
     RUNTIME_VERSION   llmt-runtime's version (tool_status().executor.runtime)
@@ -8,7 +8,8 @@ Phase 1 (2026.11.09.6): workers, memory and out of memory, ended_state, version 
 come from llmt-runtime. Phase 2 (2026.11.09.8): the SLURM layer (settings, caps, time limits, job.sh, submission, states,
 the queue, jobs, cancel, extend) is llmt-runtime's too, with feat's sizing as hooks (procs_for, mem_auto,
 time_limit_min, solves_of, job_extra, oom_advice, the progress of running jobs, the running solve's deadline).
-The MCP server's stale handling stays in mcp_server.py until phase 3.
+Phase 3 (2026.11.09.10): the MCP server's stale handling, exit, log, signal handlers and tool wrapper are
+llmt_runtime.server.Server (mcp_server.GUARD, built on RT: FEAT_EXIT_WHEN_STALE, FEAT_STALE_CHECK_S, FEAT_OUT/.server).
 
 The hooks are small wrappers that import executor and api when called: executor imports RT from here.
 

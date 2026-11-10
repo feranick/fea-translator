@@ -1,7 +1,9 @@
-"""feat on llmt-runtime (2026.11.09.6, phase 1; 2026.11.09.8, phase 2: the SLURM layer): the shared pieces are the
-runtime's, configured for feat (runtime.RT and its hooks).
-Version: 2026.11.09.8
+"""feat on llmt-runtime (2026.11.09.6, phase 1; 2026.11.09.8, phase 2: the SLURM layer; 2026.11.09.10, phase 3: the MCP
+server's stale handling and tool wrapper): the shared pieces are the runtime's, configured for feat (runtime.RT and its
+hooks; mcp_server.GUARD).
+Version: 2026.11.09.10
 """
+import asyncio
 import json
 import os
 import signal
@@ -241,3 +243,88 @@ def test_extend_through_the_runtime(slurm, monkeypatch):
     assert json.loads((req / "s" / "extended.json").read_text())["total_s"] == 3600
     assert not (req / "s" / "extend").exists() and list((req / "s").glob("extend.applied.*"))
     runner.EXTENDED["s"] = 0.0
+
+
+# ---- 2026.11.09.10, phase 3: the MCP server's stale handling, exit, log and tool wrapper are llmt-runtime's
+# server.Server (mcp_server.GUARD)
+
+def _mcp_server():
+    pytest.importorskip("mcp")
+    from fea_translator import mcp_server
+    return mcp_server
+
+
+def _fake_pkg(folder: Path, version: str) -> Path:
+    """A checkout's fea_translator/ whose __init__.py carries `version`."""
+    pkg = folder / "fea_translator"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text(f'__version__ = "{version}"\n')
+    return pkg
+
+
+def test_server_guard_configured_for_feat(monkeypatch):
+    srv = _mcp_server()
+    from llmt_runtime import server as RS
+    g = srv.GUARD
+    assert isinstance(g, RS.Server) and g.rt is RT and g.pkg_dir == Path(api.__file__).resolve().parent
+    assert g.busy is srv._pool_busy and g.shutdown is api.shutdown_workers
+    assert srv._STATE is g.state and srv._LOCK is g.lock and srv.stale_reason is RS.stale_reason
+    assert srv.STALE_MARK == RS.STALE_MARK == "STALE_SERVER" and srv.BUDGET_S == RS.BUDGET_S == 48.0
+    monkeypatch.setenv("FEAT_STALE_CHECK_S", "3")       # read when a Server is made (GUARD: at import)
+    assert RS.Server(RT, api.__file__).period == 3.0
+    monkeypatch.delenv("FEAT_STALE_CHECK_S")
+    assert RS.Server(RT, api.__file__).period == 10.0   # feat's period before the runtime
+    assert not g.state["serving"]                       # only main() (GUARD.serve) may refuse calls or exit
+
+
+def test_tool_errors_come_back_as_tool_error_with_their_text(monkeypatch):
+    srv = _mcp_server()
+
+    def boom(*a, **kw):
+        raise ValueError("no request run_x")
+    monkeypatch.setattr(api, "cancel", boom)
+    with pytest.raises(srv.ToolError, match=r"^ValueError: no request run_x"):
+        asyncio.run(srv.cancel("run_x"))
+
+    def refuse(*a, **kw):
+        raise srv.ToolError("as it is")
+    monkeypatch.setattr(api, "cancel", refuse)          # a ToolError passes through unchanged
+    with pytest.raises(srv.ToolError, match=r"^as it is$"):
+        asyncio.run(srv.cancel("run_x"))
+    assert srv._STATE["inflight"] == 0
+
+
+@pytest.fixture()
+def stale_checkout(tmp_path, monkeypatch):
+    """GUARD watching a checkout whose __init__.py carries another version, serving (as after main()'s GUARD.serve(),
+    without its log, signals or watch), with its exit recorded instead of taken and no studies in the pool."""
+    srv = _mcp_server()
+    monkeypatch.setenv("FEAT_OUT", str(tmp_path / "out"))
+    monkeypatch.delenv("FEAT_EXIT_WHEN_STALE", raising=False)
+    monkeypatch.setattr(srv.GUARD, "pkg_dir", _fake_pkg(tmp_path / "checkout", "1999.01.01.1"))
+    monkeypatch.setattr(srv.GUARD, "busy", lambda: False)  # (another test's pool studies would make it busy)
+    exits = []
+    monkeypatch.setattr(srv.GUARD, "exit_soon",
+                        lambda why, delay: exits.append((why, delay)) or srv._STATE.update(exiting=True))
+    for k, v in (("checked", 0.0), ("why", None), ("shared", False), ("exiting", False), ("serving", True)):
+        monkeypatch.setitem(srv._STATE, k, v)             # set last: undone first, before the patches above
+    return srv, exits
+
+
+def test_stale_checkout_refused_when_idle_with_exit_when_stale(stale_checkout, monkeypatch):
+    srv, exits = stale_checkout
+    why = f"version 1999.01.01.1 is installed; this server runs {api.__version__}"
+    out = asyncio.run(srv.jobs(limit=1))                # a checkout, by default: answers, with the note
+    assert "requests" in out and not exits
+    assert out["server_stale"] == f"{why}: this answer comes from the old code; restart the MCP server"
+    monkeypatch.setenv("FEAT_EXIT_WHEN_STALE", "1")
+    monkeypatch.setattr(srv.GUARD, "busy", lambda: True)   # a study in the pool: answers, exits once idle
+    out = asyncio.run(srv.jobs(limit=1))
+    assert out["server_stale"] == f"{why}: this answer comes from the old code; the server restarts when idle"
+    assert not exits
+    monkeypatch.setattr(srv.GUARD, "busy", lambda: False)  # idle: refused (the router repeats it), and exits
+    with pytest.raises(srv.ToolError) as e:
+        asyncio.run(srv.jobs(limit=1))
+    assert str(e.value) == (f"STALE_SERVER: {why}. This server is exiting so that the next one runs the installed "
+                            "version: call again.")
+    assert exits == [(why, 1.0)] and srv._STATE["inflight"] == 0
