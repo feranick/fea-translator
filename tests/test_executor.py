@@ -2,7 +2,7 @@
 sacct, sinfo and scontrol (llmt-runtime's merged fake: llmt_runtime.testing): routing, job scripts, submit -> running
 -> done collected by a new process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the
 status key.
-Version: 2026.11.18.1
+Version: 2026.11.18.2
 """
 import json
 import os
@@ -698,3 +698,21 @@ def test_run_after_submits_a_dependency_and_waits(slurm, monkeypatch):
     r2 = api.run({"c": _bar(queue=True, run={"after": "c"})}, "ref", wait=0)
     assert r2["studies"]["c"]["ok"] is False and any("cannot wait for itself" in e for e in r2["studies"]["c"]["errors"])
     api.cancel(r["request"])
+
+
+def test_run_after_is_always_a_slurm_job_and_needs_slurm(slurm, monkeypatch):
+    """llmt-runtime 2026.11.18.2: a short study with run.after (under FEAT_SLURM_MIN_MINUTES, no queue) is a SLURM job
+    (the local pool would start it at once); run.after is refused with FEAT_EXECUTOR=local and with queue: false."""
+    short = _bar(run={"after": "a"})                     # no queue
+    assert executor.use_slurm(short, 0.1) and not executor.use_slurm(_bar(), 0.1)
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    r = api.run({"a": _bar(queue=True), "b": short}, "ref", wait=0)
+    req = Path(r["request"])
+    meta = json.loads((req / "request.json").read_text())
+    assert "b" in meta["slurm"] and (req / "b" / "job.json").is_file()
+    api.cancel(r["request"])
+    no = api.validate({"a": _bar(), "b": _bar(queue=False, run={"after": "a"})})["b"]
+    assert not no["ok"] and any("queue: false" in e for e in no["errors"])
+    monkeypatch.setenv("FEAT_EXECUTOR", "local")
+    loc = api.validate({"a": _bar(), "b": _bar(run={"after": "a"})})["b"]
+    assert not loc["ok"] and any("run.after needs SLURM" in e for e in loc["errors"])
