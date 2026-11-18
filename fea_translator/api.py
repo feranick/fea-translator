@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.10.1
+Version: 2026.11.18.1
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -85,11 +85,26 @@ def study_format() -> dict:
     return {**_format(), "translator": __version__, "status": tool_status()}
 
 
+def _after_problems(request, name: str, study: dict, studies: dict) -> list[str]:
+    """run.after / run.after_mode (llmt-runtime's after_problems): the runs waited for exist on this machine, no cycle,
+    not itself; [] for a study without them."""
+    r = study.get("run") if isinstance(study, dict) else None
+    if not isinstance(r, dict) or not {"after", "after_mode"} & set(r):
+        return []
+    from .runtime import RT
+    return RT.jobs.after_problems(request, name, study, studies)
+
+
 def validate(studies: dict) -> dict:
     """Static checks; each valid study also gets "estimate": {minutes, procs, mem_mb} (llm-translators
-    docs/EXECUTION.md, "Estimates in validation"), the sizing its SLURM job would get."""
+    docs/EXECUTION.md, "Estimates in validation"), the sizing its SLURM job would get. run.after is checked
+    against the request's other studies and this machine's runs."""
     out = _validate(studies)
     for name, v in out.items():
+        probs = _after_problems(None, name, studies.get(name), studies) if isinstance(studies, dict) else []
+        if probs:
+            v["ok"] = False
+            v["errors"] = list(v.get("errors", [])) + probs
         if v.get("ok"):
             try:
                 v["estimate"] = estimate(studies[name])
@@ -799,6 +814,9 @@ def start(studies: dict, solver: str | None = None, prefix: str = "run", request
     invalid, jobs = {}, []
     for n, st in studies.items():
         v = validate_study(st)
+        probs = _after_problems(folder, n, st, studies)   # run.after: before any study is submitted
+        if probs:
+            v = {**v, "ok": False, "errors": list(v.get("errors", [])) + probs}
         if not v["ok"]:
             invalid[n] = {"ok": False, "why": "invalid study", "errors": v["errors"]}
         else:

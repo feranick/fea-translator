@@ -2,7 +2,7 @@
 sacct, sinfo and scontrol (llmt-runtime's merged fake: llmt_runtime.testing): routing, job scripts, submit -> running
 -> done collected by a new process, queued, every failure state from sacct and from job.log, jobs(), cancel(), the
 status key.
-Version: 2026.11.10.1
+Version: 2026.11.18.1
 """
 import json
 import os
@@ -661,3 +661,40 @@ def test_extend_skips_or_explains_slurm(slurm, monkeypatch):
     monkeypatch.setenv("FAKE_SCONTROL_DENY", "1")
     r = api.extend(str(req), 2)["studies"]["a"]["slurm_time_limit"]
     assert r.startswith("not raised (Access/permission denied for JobId=77)") and "only an admin" in r and "0.7 h" in r
+
+
+# ---- 2026.11.18.1: run.after (llmt-runtime's: dependency, gate, waiting state); feat checks the keys and validates ----
+
+def test_run_after_validation(slurm):
+    a, b = _bar(queue=True), _bar(queue=True, run={"after": "a"})
+    v = api.validate({"a": a, "b": b})
+    assert v["b"]["ok"], v["b"]
+    assert api.validate({"a": a, "b": _bar(run={"after": "a", "after_mode": "ok"})})["b"]["ok"]
+    assert api.validate({"a": a, "b": _bar(run={"after": ["a"]})})["b"]["ok"]
+    bad = api.validate({"a": a, "b": _bar(run={"after": "zz"})})["b"]
+    assert not bad["ok"] and any("no study 'zz' in this request" in e for e in bad["errors"])
+    me = api.validate({"b": _bar(run={"after": "b"})})["b"]
+    assert not me["ok"] and any("cannot wait for itself" in e for e in me["errors"])
+    mode = api.validate({"a": a, "b": _bar(run={"after": "a", "after_mode": "x"})})["b"]
+    assert not mode["ok"] and any("run.after_mode" in e for e in mode["errors"])
+    gone = api.validate({"g": _bar(run={"after": "run_nothing/x"})})["g"]
+    assert not gone["ok"] and any("no study x" in e for e in gone["errors"])
+    assert not any("unknown keys" in e for e in v["b"].get("errors", []))
+    from fea_translator.study import RUN_KEYS
+    assert "after" in RUN_KEYS and "after_mode" in RUN_KEYS
+
+
+def test_run_after_submits_a_dependency_and_waits(slurm, monkeypatch):
+    monkeypatch.setenv("FAKE_DEPENDENCIES", "1")
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")      # a stays queued, so b waits for it
+    r = api.run({"a": _bar(queue=True), "b": _bar(queue=True, run={"after": "a"})}, "ref", wait=0)
+    req = Path(r["request"])
+    ja, jb = (json.loads((req / n / "job.json").read_text()) for n in ("a", "b"))
+    assert jb["run_after"] and jb["run_after"][0]["name"] == "a" and jb["after_mode"] == "any"
+    assert f"--dependency=afterany:{ja['job_id']}" in jb["command"]
+    st = api.jobs()["requests"][0]["studies"]
+    assert st["b"]["state"] == "waiting", st
+    # an invalid run.after at submission: that study is invalid, the others run
+    r2 = api.run({"c": _bar(queue=True, run={"after": "c"})}, "ref", wait=0)
+    assert r2["studies"]["c"]["ok"] is False and any("cannot wait for itself" in e for e in r2["studies"]["c"]["errors"])
+    api.cancel(r["request"])

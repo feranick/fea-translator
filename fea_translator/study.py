@@ -1,5 +1,5 @@
 """study.py — the study format: analyses, materials, boundary conditions, face selectors, validation.
-Version: 2026.11.10.2
+Version: 2026.11.18.1
 
 A study file is {name: study}; a study is one FEA run on one solid part:
 
@@ -174,10 +174,14 @@ def study_format() -> dict:
                            "procs": "CalculiX threads for this study (default FEAT_PROCS, 1; modal and buckling always 1)",
                            "queue": "true: always a SLURM job; false: always local (with FEAT_EXECUTOR=slurm; "
                                     "otherwise studies estimated at FEAT_SLURM_MIN_MINUTES (1) or more go to SLURM)",
-                           "run": "{timeout_s, mem ('12G'), procs, queue}: this study's solver time limit, SLURM memory, "
+                           "run": "{timeout_s, mem ('12G'), procs, queue, after, after_mode}: this study's solver time limit, SLURM memory, "
                                   "threads and queue, overriding the machine's defaults within the caps in status; "
                                   "threads multiply the direct solver's memory: with a mem below feat's estimate for "
-                                  "the threads (validation's memory.estimate_gb) the study runs on 1 thread",
+                                  "the threads (validation's memory.estimate_gb) the study runs on 1 thread; "
+                                  "after: '<request>/<study>' | '<study>' (same request) | a list: start only when those "
+                                  "runs of this machine have ended (a SLURM dependency; the study shows 'waiting'), "
+                                  "after_mode: 'any' (default: however they ended) | 'ok' (only if they all ended ok, "
+                                  "else this study is cancelled)",
                            "mesh": "{size, order (1|2), refine: [{at, r, size}]}", "bcs": "list of boundary conditions",
                            "probes": "[{name, faces}]: mean and largest displacement (or temperature) there",
                            "stress_probes": "[{name, at, r}]: peak and mean von Mises within a sphere (a local peak)",
@@ -273,7 +277,7 @@ def bc_name(i: int, bc: dict) -> str:
     return str(bc.get("name") or f"{bc.get('kind', 'bc')}{i + 1}")
 
 
-RUN_KEYS = ("timeout_s", "mem", "procs", "queue")
+RUN_KEYS = ("timeout_s", "mem", "procs", "queue", "after", "after_mode")   # run.after: llmt-runtime's
 
 
 def _run_errors(st: dict) -> list[str]:
@@ -289,7 +293,7 @@ def _run_errors(st: dict) -> list[str]:
         return errs
     r = st["run"]
     if not isinstance(r, dict):
-        return errs + ["run: an object {timeout_s, mem, procs, queue} (all optional)"]
+        return errs + ["run: an object {timeout_s, mem, procs, queue, after, after_mode} (all optional)"]
     extra = set(r) - set(RUN_KEYS)
     if extra:
         errs.append(f"run: unknown keys {sorted(extra)} (allowed: {', '.join(RUN_KEYS)})")
