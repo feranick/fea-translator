@@ -1,7 +1,7 @@
 """Worker processes end with the server (workers.py, api.shutdown_workers): on the stale-server exit (os._exit skips
 atexit) and when the server is killed (kill -9). carbonio, 2026.11.02: orphaned spawn workers and a resource_tracker
 from three releases kept them 'in use' for llmt gc.
-Version: 2026.11.09.6
+Version: 2026.11.18.3
 """
 import json
 import os
@@ -144,3 +144,53 @@ def test_watch_parent_ends_an_orphan_and_its_calculix(tmp_path):
     os.kill(p.pid, signal.SIGKILL)
     p.wait(timeout=30)
     assert _all_gone([worker, child]) == []
+
+
+# ---- 2026.11.18.3: worker processes through llmt-runtime's make_pool / make_executor / make_process ----------------
+
+def _refuse(*a, **k):
+    from llmt_runtime.workers import WorkersNotPermitted
+    raise WorkersNotPermitted(PermissionError(1, "Operation not permitted"))
+
+
+def test_refused_workers_are_said_and_the_server_stays_up(tmp_path, monkeypatch):
+    """The Gemini Mac app's Local MCP with a customized sandbox refuses multiprocessing's semaphores (b3dt,
+    2026.11.18): a local run answers with the runtime's text, nothing is half-submitted, and the next call works."""
+    import asyncio
+
+    from fea_translator import api, bench, executor
+    from fea_translator import mcp_server as M
+    monkeypatch.setenv("FEAT_OUT", str(tmp_path))
+    monkeypatch.setenv("FEAT_EXECUTOR", "local")
+    monkeypatch.setattr(api, "make_pool", _refuse)
+    monkeypatch.setattr(api._POOL, "pool", None)
+    monkeypatch.setattr(M.GUARD, "stale", lambda: None)
+    bar = bench.cases("ref")["axial_bar"]
+    with pytest.raises(M.ToolError, match="worker processes are not permitted here"):
+        asyncio.run(M.server.call_tool("run_studies", {"studies": {"bar": bar}, "solver": "ref", "wait_s": 1}))
+    assert not list(tmp_path.glob("run_*/request.json"))               # nothing recorded or submitted
+    r = asyncio.run(M.server.call_tool("validate_studies", {"studies": {"bar": bar}}))   # the server answers on
+    assert '"ok": true' in str(r)
+    monkeypatch.setattr(api, "make_process", _refuse)                     # get_deck's meshing process
+    with pytest.raises(Exception, match="worker processes are not permitted here"):
+        api.deck(bar, "bar", wait=5)
+    monkeypatch.setattr(api, "make_pool", _refuse)                        # rendering's pool
+    monkeypatch.setitem(api._AUX, "pool", None)
+    with pytest.raises(Exception, match="worker processes are not permitted here"):
+        api.in_worker("rendering", "render_images", {"study_folder": "x"}, 1)
+
+
+def test_refused_volume_estimate_is_left_out(monkeypatch):
+    """Validation's part-volume estimate is advice: refused workers leave it out with a warning; validation goes on."""
+    from fea_translator import api, executor
+    monkeypatch.setattr(executor, "make_executor", _refuse)
+    monkeypatch.setitem(executor._VPOOL, "ex", None)
+    monkeypatch.setitem(executor.VOLUME_REFUSED, "why", None)
+    monkeypatch.setattr(executor, "remaining", lambda: 40.0)              # inside an MCP call
+    monkeypatch.setattr(executor, "_VOLUMES", {})
+    st = {"analysis": "static", "material": "steel", "part": {"step": "/nonexistent/part.step"},
+          "bcs": [{"kind": "fixed", "faces": {"nx": -1}}, {"kind": "force", "faces": {"nx": 1}, "fx": 1}]}
+    assert executor._part_volume(st["part"]) is None
+    assert "worker processes are not permitted here" in executor.VOLUME_REFUSED["why"]
+    v = api.validate({"s": st})["s"]
+    assert any("no size estimate for parts given as goals or STEP files" in w for w in v.get("warnings", []))

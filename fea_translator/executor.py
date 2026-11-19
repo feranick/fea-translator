@@ -1,5 +1,5 @@
 """executor.py — where studies run: the local worker pool, or SLURM jobs (llm-translators docs/EXECUTION.md).
-Version: 2026.11.10.1
+Version: 2026.11.18.3
 
 From 2026.11.09.8 the SLURM layer is llmt-runtime's (llmt_runtime.slurm and llmt_runtime.jobs, configured by
 runtime.RT): the settings, caps and the node's memory, the machine (cluster nodes, this node, pinning, cores), time
@@ -46,6 +46,7 @@ from pathlib import Path
 
 from llmt_runtime import jobs as J
 from llmt_runtime import slurm as S
+from llmt_runtime.workers import WorkersNotPermitted, make_executor
 
 from .runtime import RT
 
@@ -351,8 +352,13 @@ def _part_volume(part: dict) -> tuple[float, float, float] | None:
         return _VOLUMES[key]
     fut = _PENDING.get(key)
     if fut is None:
+        if VOLUME_REFUSED["why"]:
+            return None
         try:
             fut = _volume_pool().submit(_volume_of, part)
+        except WorkersNotPermitted as exc:   # a sandboxed MCP client: the estimate is advice, left out (said once
+            VOLUME_REFUSED["why"] = str(exc)  # in validation's warnings); validation itself goes on
+            return None
         except Exception:  # noqa: BLE001 (a broken pool: no estimate this time; a new pool next time)
             _VPOOL["ex"] = None
             return None
@@ -371,15 +377,15 @@ def _part_volume(part: dict) -> tuple[float, float, float] | None:
         return _VOLUMES.get(key)
 
 
+VOLUME_REFUSED: dict = {"why": None}   # the volume executor was refused (WorkersNotPermitted): not asked again
+
+
 def _volume_pool():
     if _VPOOL["ex"] is None:
         import atexit
-        import multiprocessing as mp
-        from concurrent.futures import ProcessPoolExecutor
 
         from .workers import watch_parent
-        _VPOOL["ex"] = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"),
-                                           initializer=watch_parent, initargs=(os.getpid(),))
+        _VPOOL["ex"] = make_executor(1, initializer=watch_parent, initargs=(os.getpid(),))
         atexit.register(_close_volume_pool)
     return _VPOOL["ex"]
 

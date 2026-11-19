@@ -1,5 +1,5 @@
 """api.py — what other programs and the MCP server call. JSON in, JSON out.
-Version: 2026.11.18.1
+Version: 2026.11.18.3
 
     study_format()                   the study format, for the caller to read
     validate(studies)                static checks, no meshing
@@ -33,11 +33,12 @@ from __future__ import annotations
 
 import base64
 import json
-import multiprocessing as mp
 import os
 import time
 import uuid
 from pathlib import Path
+
+from llmt_runtime.workers import make_pool, make_process  # WorkersNotPermitted where a sandbox refuses
 
 from . import __version__, executor
 from .workers import watch_parent
@@ -112,6 +113,9 @@ def validate(studies: dict) -> dict:
                 v["memory"] = mp
                 if mp.get("note"):
                     v.setdefault("warnings", []).append(mp["note"])
+                if executor.VOLUME_REFUSED["why"]:
+                    v.setdefault("warnings", []).append(
+                        f"no size estimate for parts given as goals or STEP files: {executor.VOLUME_REFUSED['why']}")
             except Exception:  # noqa: BLE001 (an estimate is advice; validation stands without it)
                 pass
     return out
@@ -182,8 +186,8 @@ class _Pool:
 
     def start(self):
         if self.pool is None:   # every worker ends with this server (workers.watch_parent)
-            self.pool = mp.get_context("spawn").Pool(int(os.environ.get("FEAT_WORKERS", "2")), maxtasksperchild=20,
-                                                     initializer=watch_parent, initargs=(os.getpid(),))
+            self.pool = make_pool(int(os.environ.get("FEAT_WORKERS", "2")), maxtasksperchild=20,
+                                  initializer=watch_parent, initargs=(os.getpid(),))
         return self.pool
 
     def submit(self, folder: Path, jobs: list[dict]) -> None:
@@ -232,8 +236,8 @@ _AUX: dict = {"pool": None, "pending": {}}
 
 def _aux_pool():
     if _AUX["pool"] is None:
-        _AUX["pool"] = mp.get_context("spawn").Pool(int(os.environ.get("FEAT_AUX_WORKERS", "2") or 2), maxtasksperchild=20,
-                                                    initializer=watch_parent, initargs=(os.getpid(),))
+        _AUX["pool"] = make_pool(int(os.environ.get("FEAT_AUX_WORKERS", "2") or 2), maxtasksperchild=20,
+                                 initializer=watch_parent, initargs=(os.getpid(),))
     return _AUX["pool"]
 
 
@@ -824,6 +828,9 @@ def start(studies: dict, solver: str | None = None, prefix: str = "run", request
     # SLURM unless the study is short (its estimate, as validate_studies reports it, below FEAT_SLURM_MIN_MINUTES):
     # a SLURM job can be cancelled and runs on, whatever happens to this server
     slurm = [j["name"] for j in jobs if executor.use_slurm(j["study"], _route_minutes(j["study"], s))]
+    if any(j["name"] not in slurm for j in jobs):
+        _POOL.start()   # local runs: the pool first, so that WorkersNotPermitted (a sandboxed MCP client) is the
+        # call's answer before any request is recorded or job submitted
     from llmt_runtime import requests as R
 
     from .runtime import RT
@@ -1031,9 +1038,8 @@ def deck(study: dict, name: str = "study", wait: float | None = None) -> dict:
     folder = _request_dir("deck")
     if wait is None:
         return _deck_into(study, name, folder)
-    proc = mp.get_context("spawn").Process(target=_deck_job, args=(study, name, str(folder), str(out_root()), os.getpid()),
-                                           daemon=True, name="feat-deck")
-    proc.start()
+    proc = make_process(_deck_job, (study, name, str(folder), str(out_root()), os.getpid()), daemon=True,
+                        name="feat-deck")
     _DECK["proc"] = proc
     t_end = _until(wait)
     res = folder / "deck.json"
